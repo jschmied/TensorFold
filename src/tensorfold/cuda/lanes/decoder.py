@@ -4,7 +4,8 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Sequence
+from collections import deque
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -60,6 +61,16 @@ def save_point(n: int, grid: int) -> int:
     return (n - 1) // grid * grid
 
 
+def fit_line(points: Sequence[tuple[int, float]]) -> tuple[float, float]:
+    """(a, b) of seconds = a + b x rows by least squares; through zero while every point has the same rows."""
+
+    xs, ys = np.array([p[0] for p in points], float), np.array([p[1] for p in points], float)
+    if np.ptp(xs) == 0:
+        return 0.0, float(ys.sum() / xs.sum())
+    b, a = np.polyfit(xs, ys, 1)
+    return float(a), float(b)
+
+
 def save_points(n: int, stops: Sequence[int], grid: int, cached: int) -> list[int]:
     """The prompt's save point and each stop inside it (a message start) on the grid below it, past ``cached``."""
 
@@ -85,6 +96,8 @@ class LaneDecoder:
         grammars: Any = None,
         eos: Sequence[int] = (),
         prefill_rows: int = 2048,
+        decode_share: float | None = None,
+        clock: Callable[[], float] = time.perf_counter,
     ) -> None:
         self.local = Lanes(
             forward, lanes, capacity, pool=pool, cache=cache, drafter=drafter, depth=depth, grammars=grammars
@@ -94,6 +107,12 @@ class LaneDecoder:
         self.pool, self.cache, self.drafter, self.admission = pool, cache, drafter, admission
         self.eos = tuple(int(t) for t in eos)
         self.prefill_rows = max(1, int(prefill_rows))
+        if decode_share is not None and not 0 < decode_share < 1:
+            raise ValueError(f"decode_share {decode_share}: the share of a round decoding lanes keep, in (0, 1)")
+        # with a share, prompt rows beside decoding lanes stop where they would take more than the rest of a round
+        self.decode_share, self.clock = decode_share, clock
+        self.decode_s: dict[int, float] = {}  # a round of n windows and no prompt rows, by n
+        self.fills: deque[tuple[int, float]] = deque(maxlen=8)  # (prompt rows, seconds they added to a round)
         self.grid = max(1, int(getattr(forward, "grid", 1) or 1))
         self.slack = 1 + (int(drafter.block) if drafter is not None else 0)  # rows a window writes past the reply
         self.streams: dict[int, Stream] = {}  # decoding
@@ -234,7 +253,7 @@ class LaneDecoder:
 
         if self.broken is not None:
             raise RuntimeError("an earlier round failed on two ranks") from self.broken
-        pieces, saves, finals = self._pieces()
+        pieces, saves, finals = self._pieces(self._budget())
         windows, count = self._windows()
         if not (self.commits or pieces or saves or finals or windows):
             return []
@@ -252,9 +271,10 @@ class LaneDecoder:
             len(windows),
             *[v for w in windows for v in w],
         ]
-        t0 = time.perf_counter()
+        t0 = self.clock()
         res = self._send(ROUND, msg)
-        took = time.perf_counter() - t0
+        took = self.clock() - t0
+        self._learn(sum(e - s for _, s, e in pieces), len(windows), took)
         self.rounds += 1
         by_lane = {p.lane: p for p in self.plans.values()}
         for lane, _, _ in pieces:
@@ -271,10 +291,35 @@ class LaneDecoder:
                     done.append(s)
         return done
 
-    def _pieces(self) -> tuple[list, list, list]:
-        """Foreground prompts first, then oldest, within ``prefill_rows``; a piece stops at its prompt's save points."""
+    def _budget(self) -> int:
+        """Prompt rows this round: ``prefill_rows``, or beside decoding lanes what ``decode_share`` leaves them."""
 
-        pieces, saves, finals, budget = [], [], [], self.prefill_rows
+        n = len(self.streams)
+        if self.decode_share is None or not n or not self.filling:
+            return self.prefill_rows
+        if n not in self.decode_s:
+            return 0  # one round of windows alone times them
+        if not self.fills:
+            return self.prefill_rows
+        a, b = fit_line(self.fills)
+        if b <= 0:
+            return self.prefill_rows
+        spare = (1 / self.decode_share - 1) * self.decode_s[n]
+        return max(1, min(self.prefill_rows, int((spare - a) / b)))
+
+    def _learn(self, rows: int, windows: int, took: float) -> None:
+        if self.decode_share is None:
+            return
+        if windows and not rows:
+            was = self.decode_s.get(windows)
+            self.decode_s[windows] = took if was is None else 0.75 * was + 0.25 * took
+        elif windows and windows in self.decode_s:
+            self.fills.append((rows, took - self.decode_s[windows]))
+
+    def _pieces(self, budget: int) -> tuple[list, list, list]:
+        """Foreground prompts first, then oldest, within ``budget`` rows; a piece stops at its prompt's save points."""
+
+        pieces, saves, finals = [], [], []
         for s in sorted(self.filling, key=lambda x: x.background):
             p = self.plans[s.sid]
             last = len(s.prompt) - 1

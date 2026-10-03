@@ -42,6 +42,7 @@ class Pair:
         prefill_rows: int = 24,
         admission=None,
         grammars=None,
+        **timing,
     ) -> None:
         def side(rank):
             pool = PagePool(PLANES, pool_pages, page) if pool_pages else None
@@ -73,6 +74,7 @@ class Pair:
             prefill_rows=prefill_rows,
             admission=admission,
             grammars=grammars,
+            **timing,
         )
         self.lanes = lanes
         self.checks = 0
@@ -246,6 +248,48 @@ def test_long_prompts_prefill_in_pieces_beside_decoding():
     assert out == [serial(short, 30), serial(long, 10)]
     fills = [c for c in pair.decoder.forward.calls if c[0] == "prefill"]
     assert len(fills) >= 120 // 16 and all(sum(e - s for _, s, e in c[1]) <= 16 for c in fills)
+
+
+class Clock:
+    """Rank 0's forward as time: a window call 30 ms, a prefill call 5 ms plus 1 ms a row."""
+
+    def __init__(self, forward) -> None:
+        self.now = 0.0
+        prefill, window = forward.prefill, forward.window
+
+        def timed_prefill(pieces):
+            self.now += 0.005 + 0.001 * sum(len(p.ids) for p in pieces)
+            return prefill(pieces)
+
+        def timed_window(rows, *a, **kw):
+            self.now += 0.030
+            return window(rows, *a, **kw)
+
+        forward.prefill, forward.window = timed_prefill, timed_window
+
+    def __call__(self) -> float:
+        return self.now
+
+
+@pytest.mark.parametrize("share,most", [(None, 64), (0.5, 25), (0.8, 2)])  # (30 / share - 30 - 5) / 1 rows
+def test_a_decode_share_bounds_the_prompt_rows_beside_decoding_lanes(share, most):
+    short, long = prompts(1, 10)[0], prompts(2, 200)[1]
+    pair = Pair(lanes=2, prefill_rows=64, decode_share=share)
+    pair.decoder.clock = Clock(pair.decoder.forward)
+    out = pair.run([stream(short, 60), stream(long, 10)], arrive={})
+    assert out == [serial(short, 60), serial(long, 10)]
+    calls = pair.decoder.forward.calls
+    beside = [sum(e - s for _, s, e in c[1]) for i, c in enumerate(calls[:-1]) if c[0] == "prefill"
+              and calls[i + 1][0] == "window" and calls[i + 1][1][0][0] == 0]
+    # round 0 (no decoding yet), one untimed piece, one proportional guess, then the fitted line
+    assert len(beside) >= 4 and max(beside[3:]) <= most
+    if share is not None:
+        assert max(beside[3:]) >= most - 1
+
+
+def test_a_decode_share_outside_zero_to_one_is_refused():
+    with pytest.raises(ValueError, match="decode_share"):
+        Pair(decode_share=1.0)
 
 
 def test_a_grid_family_keeps_states_on_its_grid():
