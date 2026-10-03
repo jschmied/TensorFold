@@ -253,10 +253,11 @@ class LaneDecoder:
 
         if self.broken is not None:
             raise RuntimeError("an earlier round failed on two ranks") from self.broken
+        gone = self._cancelled()
         pieces, saves, finals = self._pieces(self._budget())
         windows, count = self._windows()
         if not (self.commits or pieces or saves or finals or windows):
-            return []
+            return gone
         commits, self.commits = self.commits, []
         msg = [
             len(commits),
@@ -279,7 +280,7 @@ class LaneDecoder:
         by_lane = {p.lane: p for p in self.plans.values()}
         for lane, _, _ in pieces:
             by_lane[lane].stream.prefill_s += took
-        done = []
+        done = gone
         for lane, exc in res.errors.items():
             s = by_lane[lane].stream
             s.error, s.done = exc, True
@@ -290,6 +291,15 @@ class LaneDecoder:
                 if s.done:
                     done.append(s)
         return done
+
+    def _cancelled(self) -> list[Stream]:
+        """Streams whose client left end before the round is planned: a prompt stops filling at once."""
+
+        gone = [s for s in (*self.filling, *self.streams.values())
+                if not s.done and s.cancelled is not None and s.cancelled()]
+        for s in gone:
+            s.done, s.finished = True, time.perf_counter() if s.started else 0.0
+        return gone
 
     def _budget(self) -> int:
         """Prompt rows this round: ``prefill_rows``, or beside decoding lanes what ``decode_share`` leaves them."""
@@ -321,6 +331,8 @@ class LaneDecoder:
 
         pieces, saves, finals = [], [], []
         for s in sorted(self.filling, key=lambda x: x.background):
+            if s.done:
+                continue
             p = self.plans[s.sid]
             last = len(s.prompt) - 1
             target = p.points[0] if p.points else last

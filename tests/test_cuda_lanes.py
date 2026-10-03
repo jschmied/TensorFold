@@ -349,6 +349,51 @@ def test_a_cancelled_stream_frees_its_lane_for_the_next():
     assert len(out[0]) <= 7 and out[1] == serial(ps[1], 10)
 
 
+def test_a_request_cancelled_while_its_prompt_fills_stops_prefilling_and_frees_its_lane():
+    long, short = prompts(2, 200)[1], prompts(1)[0]
+    pair = Pair(lanes=1, prefill_rows=16)
+    gone = [False]
+    s = stream(long, 10, cancelled=lambda: gone[0])
+    pair.decoder.admit(s)
+    for _ in range(3):
+        pair.decoder.finish(pair.decoder.round())
+        pair.check()
+    gone[0] = True
+    done = pair.decoder.round()
+    assert done == [s] and s.done and s.out == [] and s.error is None and s.stats()["decode_s"] == 0
+    pair.decoder.finish(done)
+    rows = sum(e - b for c in pair.decoder.forward.calls if c[0] == "prefill" for _, b, e in c[1])
+    assert rows == 3 * 16  # nothing past the rounds before the cancel
+    assert pair.run([stream(short, 10)]) == [serial(short, 10)]
+
+
+def test_the_scheduler_ends_a_cancelled_request_before_or_during_its_prefill():
+    import threading
+
+    from tensorfold.cuda.scheduler import Scheduler
+
+    long, short = prompts(2, 200)[1], prompts(1)[0]
+    pair = Pair(lanes=2, prefill_rows=16)
+    sched = Scheduler(pair.decoder, max_streams=2)
+    before = sched.submit(long, 10, None, True, lambda new: None, cancelled=lambda: True)
+    assert before["rounds"] == 0 and not pair.decoder.forward.calls  # never admitted
+    gone = threading.Event()
+    filled = []
+
+    def watch():
+        filled.append(sum(1 for c in pair.decoder.forward.calls if c[0] == "prefill"))
+        if len(filled) > 2:
+            gone.set()
+        return gone.is_set()
+
+    during = sched.submit(long, 10, None, True, lambda new: None, cancelled=watch)
+    got = []
+    sched.submit(short, 10, None, True, lambda new: got.extend(new))
+    sched.close()
+    assert during["rounds"] == 0 and max(filled) < 200 // 16 and got == serial(short, 10)
+    same_state(pair.decoder.local, pair.follower)
+
+
 def test_a_yielded_background_stream_replays_to_the_same_reply():
     p = prompts(1)[0]
     want = serial(p, 30)

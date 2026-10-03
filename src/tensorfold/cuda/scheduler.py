@@ -68,7 +68,8 @@ class Scheduler:
 
     def submit(self, prompt: list[int], count: int, sampling: Any, draft: bool,
                emit: Callable[[list[int]], bool | None], stop_eos: bool = True, *, vision: Any = None,
-               constraint: Any = None, background: bool = False, probabilities: Any = None) -> dict:
+               constraint: Any = None, background: bool = False, probabilities: Any = None,
+               cancelled: Callable[[], bool] | None = None) -> dict:
         """Decode one request; ``emit`` runs on the calling thread and returns True to stop. Returns its stats."""
 
         box: queue.Queue = queue.Queue()
@@ -76,6 +77,7 @@ class Scheduler:
                         constraint=constraint, background=background, probabilities=probabilities)
         cancel = [False]
         stream.emit = lambda new: (box.put(("tokens", new)), cancel[0])[1]
+        stream.cancelled = cancelled  # read on the decoding thread before each round, so a prompt stops filling too
         self.waiting.put((stream, box))
         while True:
             kind, value = box.get()
@@ -127,6 +129,10 @@ class Scheduler:
                 except queue.Empty:
                     break
             self.boxes[id(stream)] = box
+            if stream.cancelled is not None and stream.cancelled():  # the client left while it waited
+                stream.done = True
+                done.append(stream)
+                continue
             try:
                 self.decoder.admit(stream)
             except NoRoom as exc:

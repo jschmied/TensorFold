@@ -18,6 +18,7 @@ class Stream:
     stop_eos: bool = True                         # False: an end token does not end it (ignore_eos)
     vision: Any = None
     emit: Callable[[list[int]], bool | None] | None = None
+    cancelled: Callable[[], bool] | None = None   # True once the client left: no round runs it again, prompt or reply
     sid: int = 0
     st: Any = None                                # the committed model state
     snap: Any = None                              # the drafter's context
@@ -81,7 +82,7 @@ class Stream:
         """This stream again from its prompt, for later (as the Mac replays): what it sent is owed, not sent again."""
 
         return Stream(self.prompt, self.count, self.sampling, draft=self.draft, stop_eos=self.stop_eos, emit=self.emit,
-                      background=self.background, probabilities=self.probabilities,
+                      background=self.background, probabilities=self.probabilities, cancelled=self.cancelled,
                       carry=self.stats(), owed=[*self.out, *self.owed])
 
 
