@@ -323,8 +323,8 @@ try:
 
         PER: tl.constexpr = (K // 16) // SK             # quantization blocks per slice
         SUB: tl.constexpr = SBN // BLOCK_N              # programs per stored N tile
-        pid_n = tl.program_id(1)
-        rm = tl.program_id(0) * BM + tl.arange(0, BM)
+        pid_n = tl.program_id(0)
+        rm = tl.program_id(1) * BM + tl.arange(0, BM)
         rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         m_ok = rm < M
         n_ok = rn < N
@@ -416,7 +416,8 @@ def matmul(x: torch.Tensor, fp: FP4, *, out: torch.Tensor | None = None, f32: bo
     bn = block_n or BN
     if fp.scale2 is None:                        # the pattern form: its fp32 scales already carry the factor
         fp.scale2 = torch.ones(fp.n, dtype=torch.float32, device=x.device)
-    grid = (triton.cdiv(m, bm), fp.n // bn, 1 if fuse else sk)
+    # column tiles fastest: a row tile's programs run together and share its rows of x in L2
+    grid = (fp.n // bn, triton.cdiv(m, bm), 1 if fuse else sk)
     _fp4mm[grid](x, fp.weight, fp.scale, fp.scale2, out, part if sk > 1 and not fuse else out, m, x.stride(0),
                  N=fp.n, K=k, SK=sk, BM=bm, SBN=BN, BLOCK_N=bn, GPI=g, F32=f32, PACKED=fp.packed, FUSE=fuse,
                  num_warps=num_warps or c_warps, num_stages=num_stages)

@@ -71,8 +71,8 @@ if HAS_TRITON:
         takes one K slice (``_reduce`` adds them), or with FUSE all of them, each slice run as its own program runs
         it and the slices added in ``_reduce``'s order: the same bits without the partial sums' round trip."""
 
-        pid_n = tl.program_id(1)
-        rm = tl.program_id(0) * BM + tl.arange(0, BM)
+        pid_n = tl.program_id(0)
+        rm = tl.program_id(1) * BM + tl.arange(0, BM)
         rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         m_ok = rm < M
         n_ok = rn < N
@@ -125,7 +125,8 @@ def matmul(x: torch.Tensor, b: B16, *, out: torch.Tensor | None = None, f32: boo
     fuse = sk > 1 and m >= FUSED_ROWS
     part = torch.empty((sk, m, b.n), dtype=torch.float32, device=x.device) if sk > 1 and not fuse else out
     bm = 128 if m > 128 else 16
-    grid = (triton.cdiv(m, bm), -(-b.n // block_n), 1 if fuse else sk)
+    # column tiles fastest: a row tile's programs run together and share its rows of x in L2
+    grid = (-(-b.n // block_n), triton.cdiv(m, bm), 1 if fuse else sk)
     _b16mm[grid](x, b.weight, out, part, m, x.stride(0), N=b.n, K=k, SK=sk, BM=bm,
                  BLOCK_N=block_n, BK=bk, F32=f32, FUSE=fuse, num_warps=num_warps, num_stages=num_stages)
     if sk > 1 and not fuse:
