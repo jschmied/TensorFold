@@ -269,6 +269,7 @@ def attn_block(layer: LayerW, w: Weights, segs: Sequence[Seg], b: Buffers, R: in
 def ple_block(layer: LayerW, w: Weights, segs: Sequence[Seg], b: Buffers, R: int) -> None:
     """h += the n-gram embedding branch, each stream through its own conv tail (rows staged by ``stage``)."""
 
+    finish_staging(b)
     c = w.cfg
     p = layer.ple
     assert p is not None                             # ple_block only runs on a layer that carries one
@@ -442,6 +443,27 @@ def candidates(w: Weights, b: Buffers, logits: torch.Tensor, R: int, *, id_map: 
 
 
 STAGE_AHEAD = "TF_FLASH_STAGE_AHEAD"
+STAGE_DEFER = "TF_FLASH_STAGE_DEFER"
+DEFER_ROWS = 256                     # prompt passes from this many rows read their n-gram rows behind the first layers
+_defer_pool = None
+
+
+def stage_defer() -> bool:
+    """Whether a prompt pass's n-gram rows are read on a thread while its first layers run (TF_FLASH_STAGE_DEFER=0: no)."""
+
+    return os.environ.get(STAGE_DEFER, "1").strip().lower() not in ("0", "off", "false", "no")
+
+
+def finish_staging(b: Buffers) -> None:
+    """Copy a deferred pass's n-gram rows into the staging buffers once read, then mark the staging copies issued."""
+
+    pending = getattr(b, "ple_defer", None)
+    if not pending:
+        return
+    b.ple_defer = None
+    for p, ids, at, read in pending:
+        stage_ple_rows(p, b, ids, at=at, got=read.result())
+    b.staged.record()
 
 
 def stage_ahead() -> bool:
@@ -462,6 +484,10 @@ def stage(w: Weights, b: Buffers, windows: Sequence[tuple[State, Sequence[int]]]
     R = segs[-1][2]
     if R > b.rows:
         raise ValueError(f"window of {R} rows, buffers hold {b.rows}")
+    if getattr(b, "ple_defer", None):    # a pass that stopped before its n-gram layer: its reads end before reuse
+        for *_, read in b.ple_defer:
+            read.result()
+        b.ple_defer = None
     lookups = []                         # (layer's PLE, row ids [rows, heads], first staging row)
     for layer in w.layers:
         if layer.ple is not None:
@@ -471,8 +497,19 @@ def stage(w: Weights, b: Buffers, windows: Sequence[tuple[State, Sequence[int]]]
                 ids = p.ngram.ids(st.ple_history, toks)
                 st.ple_last = (st.ple_history, toks)
                 lookups.append((p, ids, a0 * (ids.size // len(toks))))
+    # a prompt pass reads its rows on a thread while its first layers run; ``ple_block`` copies them in
+    defer = (b.prefill and w.x3 is None and lookups and R >= DEFER_ROWS and stage_defer()
+             and not torch.cuda.is_current_stream_capturing())
+    reads = None
+    if defer:
+        global _defer_pool
+        if _defer_pool is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            _defer_pool = ThreadPoolExecutor(1, thread_name_prefix="ngram-defer")
+        reads = [_defer_pool.submit(p.table.gather, ids) for p, ids, _ in lookups]
     # the table reads before the wait, which ends once the GPU has run the previous step: their faults overlap it
-    ahead = [p.table.gather(ids) for p, ids, _ in lookups] if w.x3 is None and stage_ahead() else None
+    ahead = [p.table.gather(ids) for p, ids, _ in lookups] if w.x3 is None and stage_ahead() and not defer else None
     b.staged.synchronize()               # the previous step's copies out of the pinned buffers are done
     b.ids_host[:R].numpy()[:] = np.asarray([t for _, tokens in windows for t in tokens], dtype=np.int32)
     b.ids[:R].copy_(b.ids_host[:R], non_blocking=True)
@@ -481,9 +518,12 @@ def stage(w: Weights, b: Buffers, windows: Sequence[tuple[State, Sequence[int]]]
             from .exl3_pack import stage_ple
 
             stage_ple(p.table, w.x3, ids, at=at)
-        else:
+        elif not defer:
             stage_ple_rows(p, b, ids, at=at, got=None if ahead is None else ahead[i])
-    b.staged.record()
+    if defer:
+        b.ple_defer = [(p, ids, at, read) for (p, ids, at), read in zip(lookups, reads)]
+    else:
+        b.staged.record()
     return segs
 
 
