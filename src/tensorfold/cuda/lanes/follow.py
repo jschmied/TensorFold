@@ -7,9 +7,11 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
+
 from ..drafting import Proposals
 from ..sessions import TieredCache
-from .forward import Candidates, Piece, Rows, chain, check
+from .forward import Candidates, Piece, Rows, chain, check, split
 from .link import ADMIT, AGREED, DONE, EVICT, ROUND, SAMPLING_WORDS, STOP, Link, unpack_sampling
 
 
@@ -89,6 +91,7 @@ class Lanes:
         check(forward)
         self.forward, self.capacity = forward, int(capacity)
         self._counts = _takes(forward.window, "counts")
+        self._mixed = callable(getattr(forward, "mixed", None))
         self.pool, self.cache, self.drafter, self.depth, self.grammars = pool, cache, drafter, depth, grammars
         self.lanes: list[Lane | None] = [None] * int(lanes)
         self._kept: tuple | None = None
@@ -233,14 +236,26 @@ class Lanes:
         res = Result()
         for lane, kept, bonus in commits:
             self._commit(lane, kept, bonus, res)
-        if pieces:
-            run = []
-            for lane, start, end in pieces:
-                if self.tables is not None:
-                    self.tables[lane].ensure(end)
-                ids = tuple(self.lanes[lane].prompt[start:end])
-                self.lanes[lane].history.extend(ids)
-                run.append(Piece(lane, start, ids))
+        run = []
+        for lane, start, end in pieces:
+            if self.tables is not None:
+                self.tables[lane].ensure(end)
+            ids = tuple(self.lanes[lane].prompt[start:end])
+            self.lanes[lane].history.extend(ids)
+            run.append(Piece(lane, start, ids))
+        # lanes already decoding share the prompt pieces' forward (weights read once); a lane whose prompt ends in
+        # this round drafts and runs its window after its save point and end-of-prompt hook, as without ``mixed``
+        busy = {p.lane for p in run} | {lane for (lane,) in saves} | {lane for (lane,) in finals}
+        early = [w for w in windows if w[0] not in busy] if run and self._mixed else []
+        got: dict[int, tuple[Rows, Candidates]] = {}
+        if early:
+            rows, masks, needs = self._window_rows(early, res)
+            if rows:
+                cand = self._call(self.forward.mixed, rows, masks, needs, count, run)
+                got.update((r.lane, (r, c)) for r, c in zip(rows, split(cand, rows)))
+            else:
+                self.forward.prefill(run)
+        elif run:
             self.forward.prefill(run)
         for (lane,) in saves:
             self._save(lane)
@@ -250,9 +265,26 @@ class Lanes:
                 p = self.lanes[lane].prompt
                 end = len(p) - 1
                 self.forward.finish_prompt(lane, end, tuple(p[max(0, end - tail) : end]))
-        if windows:
-            self._windows(windows, count, res)
+        late = [w for w in windows if w not in early]
+        if late:
+            rows, masks, needs = self._window_rows(late, res)
+            if rows:
+                cand = self._call(self.forward.window, rows, masks, needs, count)
+                got.update((r.lane, (r, c)) for r, c in zip(rows, split(cand, rows)))
+        order = [got[w[0]] for w in windows if w[0] in got]  # the round's own window order
+        res.rows = [r for r, _ in order]
+        if order:
+            ids, values = np.concatenate([c.ids for _, c in order]), np.concatenate([c.values for _, c in order])
+            res.cand = Candidates(ids, values)
         return res
+
+    def _call(self, fn: Any, rows: list[Rows], masks: list, needs: list[int], count: int, *pre: Any) -> Candidates:
+        """``window`` (or ``mixed``, the prompt pieces first) on these windows, with their counts if it takes them."""
+
+        masks = masks if any(m is not None for m in masks) else None
+        if self._counts:  # each window's own need: one nucleus request does not widen every lane's rows
+            return fn(*pre, rows, count, masks, counts=needs)
+        return fn(*pre, rows, count, masks)
 
     def _commit(self, lane: int, kept: int, bonus: int, res: Result) -> None:
         s = self.lanes[lane]
@@ -279,7 +311,9 @@ class Lanes:
         pages = self.tables[lane].share(len(s.history)) if self.tables is not None else None
         self.cache.add(list(s.history), Held(self.forward.snapshot(lane), pages, tokens=len(s.history)), None)
 
-    def _windows(self, specs: Sequence[tuple[int, ...]], count: int, res: Result) -> None:
+    def _window_rows(self, specs: Sequence[tuple[int, ...]], res: Result) -> tuple[list[Rows], list, list[int]]:
+        """Each decoding lane's verify window: its pending token and drafts, grammar-cut; masks and candidate needs."""
+
         drafts: dict[int, list[int]] = {}
         deep = [w for w in specs if w[3] > 0 and w[0] not in res.errors]
         if deep and self.drafter is not None:
@@ -315,13 +349,7 @@ class Lanes:
             rows.append(r)
             masks.append(mask)
             needs.append(need)
-        res.rows = rows
-        if rows:
-            masks = masks if any(m is not None for m in masks) else None
-            if self._counts:  # each window's own need: one nucleus request does not widen every lane's rows
-                res.cand = self.forward.window(rows, count, masks, counts=needs)
-            else:
-                res.cand = self.forward.window(rows, count, masks)
+        return rows, masks, needs
 
     # -- views ---------------------------------------------------------------------------------------------------
     def state(self) -> tuple:

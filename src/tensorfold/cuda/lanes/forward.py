@@ -64,6 +64,8 @@ class LaneForward(Protocol):
     def window(self, rows: Sequence[Rows], count: int, masks: Sequence[Any] | None = None) -> Candidates:
         """Every window in one forward, rows in order; ``masks[i]`` (a ``grammar.Window``) masks window i's rows."""
 
+    # Optional ``mixed(pieces, rows, count, masks, counts=...)``: ``prefill(pieces)`` and ``window(rows, ...)`` in one
+    # forward (a MoE reads its experts once); the rows are lanes already decoding, never one of the pieces' lanes.
     # Optional ``counts=``: when ``window`` takes it, only the first ``counts[i]`` columns of window i's rows must be
     # its sorted top candidates; the decoder reads no further, so the rest may stay unset.
 

@@ -703,3 +703,42 @@ def test_a_failing_disk_never_stops_serving_and_every_page_comes_back(tmp_path):
     assert cache.dropped == len(p) - 1 and len(cache.entries) == 1
     pages = pair.decoder.pool.pages - pair.decoder.pool.free
     assert pages == len(cache.entries[0][1].pages)  # only the one kept state holds pages
+
+
+def mixed_pair(**kw):
+    """A pair whose forwards also take ``mixed``: the prompt pieces and the decoding lanes' windows in one call."""
+
+    pair = Pair(**kw)
+    calls = []
+    for lanes in (pair.decoder.local, pair.follower):
+        fwd = lanes.forward
+
+        def mixed(pieces, rows, count, masks=None, fwd=fwd, main=lanes is pair.decoder.local):
+            if main:
+                calls.append(({p.lane for p in pieces}, {r.lane for r in rows}))
+            fwd.prefill(pieces)
+            return fwd.window(rows, count, masks)
+
+        fwd.mixed = mixed
+        lanes._mixed = True
+    return pair, calls
+
+
+def test_decoding_lanes_share_the_prompt_pieces_forward_and_keep_their_bits():
+    p = prompts(3, length=90)
+    pair, calls = mixed_pair(lanes=3, prefill_rows=24, drafter=Pattern)
+    streams = [stream(p[0], 12), stream(p[1], 12), stream(p[2], 12)]
+    arrive = {id(streams[1]): 6, id(streams[2]): 12}  # later prompts prefill beside the decoding ones
+    drive(pair.decoder, streams, lanes=3, check=pair.check, arrive=arrive)
+    assert [s.out for s in streams] == [serial(q, 12) for q in p]
+    assert calls  # some rounds ran a prompt piece and decoding windows in one forward
+    assert all(not (pieces & rows) for pieces, rows in calls)  # never a lane's own piece and window together
+
+
+def test_a_lane_whose_prompt_ends_keeps_its_window_out_of_the_shared_forward():
+    p = prompts(2, length=60)
+    pair, calls = mixed_pair(lanes=2, prefill_rows=512, keep=2)  # each prompt prefills in one piece
+    a, b = stream(p[0], 10), stream(p[1], 10)
+    drive(pair.decoder, [a, b], lanes=2, check=pair.check, arrive={id(b): 3})
+    assert [a.out, b.out] == [serial(p[0], 10), serial(p[1], 10)]
+    assert calls and all(rows == {0} and pieces == {1} for pieces, rows in calls)
