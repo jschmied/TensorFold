@@ -192,6 +192,32 @@ class Pattern:
         return Proposals(tokens, conf)
 
 
+class Head:
+    """An MTP-like drafter with no context of its own: it drafts from the lane's state in the forward it is given."""
+
+    def __init__(self, block: int = 6) -> None:
+        self.block, self.forward = block, None
+
+    def attach(self, forward) -> None:
+        self.forward = forward
+
+    def reset(self, lane, prompt) -> None:
+        return None
+
+    def observe(self, lane, tokens) -> None:
+        return None
+
+    def propose(self, lanes, pendings, starts, depths, samplings) -> Proposals:
+        tokens = []
+        for lane, pending, start, most in zip(lanes, pendings, starts, depths):
+            ctx, out = [*self.forward._held(lane, start), pending], []
+            for _ in range(most):
+                out.append(greedy(ctx))
+                ctx.append(out[-1])
+            tokens.append(out)
+        return Proposals(tokens)
+
+
 class FailingTier:
     """A tier whose every write fails, as a full disk's would."""
 

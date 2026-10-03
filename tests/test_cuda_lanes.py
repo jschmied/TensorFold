@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from cuda_lane_fakes import PLANES, Codec, FakeForward, Mirror, Pattern, drive, same_state
+from cuda_lane_fakes import PLANES, Codec, FakeForward, Head, Mirror, Pattern, drive, same_state
 
 from tensorfold.cuda.admission import GIB, Admission
 from tensorfold.cuda.drafting import ExpectedRate, Lookup, StaticDepth, WindowCosts
@@ -270,6 +270,19 @@ def test_message_starts_keep_states_that_another_conversation_resumes():
     other = p[:20] + [9, 9, 9, 9, 9]  # the same system prompt, another conversation
     s = stream(other, 10, stops=[20])
     assert pair.run([s]) == [serial(other, 10)] and s.cached == 16
+
+
+@pytest.mark.parametrize("pool_pages", [64, None], ids=["pool", "no-pool"])
+def test_a_drafter_reads_its_own_ranks_model_state(pool_pages):
+    p = prompts(1)[0]
+    pair = Pair(lanes=1, pool_pages=pool_pages, drafter=Head)
+    assert pair.decoder.drafter.forward is pair.decoder.forward
+    assert pair.follower.drafter.forward is pair.follower.forward
+    a = stream(p, 30)
+    assert pair.run([a]) == [serial(p, 30)] and a.rounds * 5 <= len(a.out)  # the state drafts the greedy reply
+    longer = p + [3, 3]
+    b = stream(longer, 20)
+    assert pair.run([b]) == [serial(longer, 20)] and b.cached == len(p) - 1
 
 
 def test_the_replay_hook_gets_the_prompt_tail_and_resumes_exactly():

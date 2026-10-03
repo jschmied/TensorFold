@@ -28,6 +28,8 @@ class Drafter(Protocol):
 
     block: int
 
+    # Optional ``attach(forward)``: the rank's ``LaneForward``, once, before any lane; an MTP head reads its states
+
     def reset(self, lane: int, prompt: Sequence[int]) -> None: ...
 
     def observe(self, lane: int, tokens: Sequence[int]) -> None: ...

@@ -98,6 +98,8 @@ class Lanes:
         self.tables = [pool.table(capacity) for _ in range(lanes)] if pool is not None else None
         if self.tables is not None and callable(getattr(forward, "bind", None)):
             forward.bind(self.tables)
+        if drafter is not None and callable(getattr(drafter, "attach", None)):
+            drafter.attach(forward)  # a drafter on the model's state (an MTP head) reads this rank's forward
         if cache is not None:
             if pool is not None and cache.release is None:
                 cache.release = self._release
