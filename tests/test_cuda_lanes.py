@@ -260,6 +260,18 @@ def test_a_grid_family_keeps_states_on_its_grid():
     assert s.cached == 32 and s.out == serial(p + [4, 4], 10)
 
 
+def test_message_starts_keep_states_that_another_conversation_resumes():
+    p = prompts(1, 45)[0]
+    pair = Pair(lanes=1, grid=16, prefill_rows=64)
+    pair.run([stream(p, 5, stops=[20, 0, 99])])  # a message starting at 20; 0 and past the prompt mean nothing
+    fills = [c[1] for c in pair.decoder.forward.calls if c[0] == "prefill"]
+    assert fills == [((0, 0, 16),), ((0, 16, 32),), ((0, 32, 44),)]  # each stop on the grid below it
+    assert sorted(len(e[0]) for e in pair.decoder.cache.entries) == [16, 32]
+    other = p[:20] + [9, 9, 9, 9, 9]  # the same system prompt, another conversation
+    s = stream(other, 10, stops=[20])
+    assert pair.run([s]) == [serial(other, 10)] and s.cached == 16
+
+
 def test_the_replay_hook_gets_the_prompt_tail_and_resumes_exactly():
     p = prompts(1)[0]
     pair = Pair(lanes=1, replay_tail=8)

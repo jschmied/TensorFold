@@ -28,7 +28,7 @@ class Plan:
     stream: Stream
     lane: int
     done: int  # prompt tokens the lane's state holds
-    save_at: int | None  # the prompt position whose state the cache keeps, until it is reached
+    points: list[int]  # prompt positions whose states the cache keeps, ascending, until each is reached
     pos: int = 0  # decoding: the pending token's position
     pending: int = 0
 
@@ -58,6 +58,13 @@ def save_point(n: int, grid: int) -> int:
     """The last grid point before a prompt's last token: an identical prompt resumes there."""
 
     return (n - 1) // grid * grid
+
+
+def save_points(n: int, stops: Sequence[int], grid: int, cached: int) -> list[int]:
+    """The prompt's save point and each stop inside it (a message start) on the grid below it, past ``cached``."""
+
+    marks = {save_point(n, grid), *(int(x) // grid * grid for x in stops if 0 < int(x) < n)}
+    return sorted(x for x in marks if x > cached)
 
 
 class LaneDecoder:
@@ -180,9 +187,8 @@ class LaneDecoder:
             except Exception:
                 self.free.insert(0, lane)
                 raise
-        point = save_point(n, self.grid)
-        save = point if self.cache is not None and point > cached else None
-        self.plans[s.sid] = Plan(s, lane, cached, save)
+        points = save_points(n, s.stops, self.grid, cached) if self.cache is not None else []
+        self.plans[s.sid] = Plan(s, lane, cached, points)
         self.filling.append(s)
 
     def _trim_host(self, need: int) -> bool:
@@ -266,22 +272,22 @@ class LaneDecoder:
         return done
 
     def _pieces(self) -> tuple[list, list, list]:
-        """Foreground prompts first, then oldest, within ``prefill_rows``; a piece stops at its prompt's save point."""
+        """Foreground prompts first, then oldest, within ``prefill_rows``; a piece stops at its prompt's save points."""
 
         pieces, saves, finals, budget = [], [], [], self.prefill_rows
         for s in sorted(self.filling, key=lambda x: x.background):
             p = self.plans[s.sid]
             last = len(s.prompt) - 1
-            target = p.save_at if p.save_at is not None else last
+            target = p.points[0] if p.points else last
             if p.done < target and budget > 0:
                 end = piece_end(p.done, target, budget, self.grid)
                 pieces.append((p.lane, p.done, end))
                 budget -= end - p.done
                 p.done = end
-            if p.save_at is not None and p.done == p.save_at:
+            if p.points and p.done == p.points[0]:
                 saves.append(p.lane)
-                p.save_at = None
-            if p.done == last and p.save_at is None:
+                p.points.pop(0)
+            if p.done == last and not p.points:
                 finals.append(p.lane)
         for lane in finals:
             p = next(x for x in self.plans.values() if x.lane == lane)
@@ -368,4 +374,4 @@ def choose(cand: Candidates, positions: Sequence[int], sampling: Any) -> list[in
     return choose_rows(values, ids, positions, sampling)
 
 
-__all__ = ["LaneDecoder", "Plan", "choose", "piece_end", "save_point"]
+__all__ = ["LaneDecoder", "Plan", "choose", "piece_end", "save_point", "save_points"]
