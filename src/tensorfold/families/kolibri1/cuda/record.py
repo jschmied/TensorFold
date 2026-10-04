@@ -16,7 +16,7 @@ HEAD_ROWS = 1024         # rows a top-k pass takes (the head's 128k-wide logits)
 
 
 class Recorder:
-    """Per request, append-only files under ``root``: tokens, positions, states (bf16), top-k ids and log-probs."""
+    """Per request, append-only files: tokens, positions, kinds (1: generated), states (bf16), top-k ids, log-probs."""
 
     def __init__(self, root: str | Path, taps: Sequence[int], k: int = 32, floor_gb: float = 25.0) -> None:
         self.root = Path(root) / time.strftime("%Y%m%d")
@@ -35,8 +35,8 @@ class Recorder:
         return self.root / f"{os.getpid()}-{sid}"
 
     def add(self, sid: int, positions: Sequence[int], tokens: Sequence[int], states: Sequence[torch.Tensor],
-            final: torch.Tensor, head: torch.Tensor) -> None:
-        """Rows of one request in position order: their input tokens, tapped states [n, D] each, the head's top-k."""
+            final: torch.Tensor, head: torch.Tensor, kinds: int | Sequence[int] = 0) -> None:
+        """Rows of one request in position order: input tokens, kinds, tapped states [n, D] each, the head's top-k."""
 
         from tensorfold.cuda import moe as shared
 
@@ -51,7 +51,9 @@ class Recorder:
         base = self._files(sid)
         cols = torch.cat(list(states), -1).contiguous()
         self.dims = int(final.shape[1])
+        kind = np.full(len(tokens), kinds, dtype=np.uint8) if isinstance(kinds, int) else np.asarray(kinds, np.uint8)
         for ext, arr in ((".tok", np.asarray(tokens, dtype=np.int32)), (".pos", np.asarray(positions, dtype=np.int32)),
+                         (".kind", kind),
                          (".st", cols.view(torch.int16).cpu().numpy()), (".tki", torch.cat(ids).cpu().numpy()),
                          (".tkl", torch.cat(logp).view(torch.int16).cpu().numpy())):
             with open(str(base) + ext, "ab") as f:

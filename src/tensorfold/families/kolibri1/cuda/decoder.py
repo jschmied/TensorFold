@@ -139,7 +139,7 @@ class Decoder:
                 final, states = self.model.last
                 keep = torch.tensor([a + r for r in path], device=final.device)
                 self.recorder.add(s.sid, [c.p0 + r for r in path], [win[r] for r in path],
-                                  [t[keep] for t in states], final[keep], self.model.w.head)
+                                  [t[keep] for t in states], final[keep], self.model.w.head, kinds=1)
             new = [win[r] for r in path[1:]] + [last]
             s.counted(len(win))
             if len(win) > 1:

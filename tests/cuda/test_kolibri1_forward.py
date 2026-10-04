@@ -210,6 +210,8 @@ def test_recording_keeps_replies_and_writes_the_kept_rows(weights, tmp_path, mon
         tok = np.fromfile(base + ".tok", dtype=np.int32)
         assert info["rows"] == len(pos) and list(pos) == list(range(len(pos)))   # every kept row, in order, no drafts
         assert list(tok[:70]) == prompt and list(tok[70:]) == replies[0][:len(tok) - 70]
+        kind = np.fromfile(base + ".kind", dtype=np.uint8)
+        assert not kind[:70].any() and kind[70:].all()        # prompt rows 0, generated rows 1
         states = torch.from_numpy(np.fromfile(base + ".st", dtype=np.int16)).view(torch.bfloat16).view(len(pos), -1)
         x, taps = Model(weights, 512, 1).forward([Chain(0, 0, prompt)], prompt=True, features=True, taps=[0, 2])
         assert torch.equal(states[:70].cuda(), torch.cat(taps, -1))  # prompt rows: the prefill's own states
