@@ -172,3 +172,47 @@ def test_taps_return_the_listed_layers_states_and_leave_features_alone(weights):
     assert torch.equal(x, plain) and len(states) == 2
     assert torch.equal(states[1], x)                             # the last layer's output is the head's state
     assert states[0].shape == x.shape and not torch.equal(states[0], x)
+
+
+def test_recording_keeps_replies_and_writes_the_kept_rows(weights, tmp_path, monkeypatch):
+    import json
+
+    import numpy as np
+
+    from tensorfold.cuda.streams import Stream
+    from tensorfold.engine.exact_sampling import Sampling
+    from tensorfold.families.kolibri1.cuda import decoder
+    from tensorfold.families.kolibri1.cuda.forward import Chain, Model
+    from tensorfold.families.kolibri1.cuda.record import Recorder
+
+    guesses = tokens(40, seed=9)
+    monkeypatch.setattr(decoder.CopyIndex, "propose", lambda self, context, most: guesses[:most])   # rejected drafts
+    prompt = tokens(70, seed=12)
+    for sampling in (None, Sampling(seed=4, temperature=0.9, top_k=30, top_p=0.95)):
+        replies = []
+        for rec in (None, Recorder(tmp_path / str(sampling is None), [0, 2], k=8, floor_gb=0)):
+            m = Model(weights, 512, 1)
+            if rec is not None:
+                m.record_taps = (0, 2)
+            d = decoder.Decoder(m, (511,), rec)
+            s = Stream(list(prompt), 30, sampling)
+            d.admit(s)
+            while not s.done:
+                d.round()
+            d.finish([s])
+            replies.append(list(s.out))
+        assert replies[0] == replies[1]                        # recording reads, never changes, what serving computes
+        files = sorted(rec.root.glob("*.json"))
+        assert len(files) == 1
+        info = json.loads(files[0].read_text())
+        base = str(files[0])[:-5]
+        pos = np.fromfile(base + ".pos", dtype=np.int32)
+        tok = np.fromfile(base + ".tok", dtype=np.int32)
+        assert info["rows"] == len(pos) and list(pos) == list(range(len(pos)))   # every kept row, in order, no drafts
+        assert list(tok[:70]) == prompt and list(tok[70:]) == replies[0][:len(tok) - 70]
+        states = torch.from_numpy(np.fromfile(base + ".st", dtype=np.int16)).view(torch.bfloat16).view(len(pos), -1)
+        x, taps = Model(weights, 512, 1).forward([Chain(0, 0, prompt)], prompt=True, features=True, taps=[0, 2])
+        assert torch.equal(states[:70].cuda(), torch.cat(taps, -1))  # prompt rows: the prefill's own states
+        ids = np.fromfile(base + ".tki", dtype=np.int32).reshape(len(pos), 8)
+        if sampling is None:
+            assert list(ids[69:-1, 0]) == list(tok[70:])            # greedy: each row's top choice is the next token

@@ -7,6 +7,7 @@ from __future__ import annotations
 import time
 
 import numpy as np
+import torch
 
 from tensorfold.cuda.memory_gate import NoRoom
 from tensorfold.cuda.sampling import sample_rows
@@ -21,8 +22,8 @@ MIN_MATCH = 8            # context tokens a copy must repeat before it is propos
 
 
 class Decoder:
-    def __init__(self, model: Model, eos: tuple[int, ...]) -> None:
-        self.model, self.eos = model, tuple(eos)
+    def __init__(self, model: Model, eos: tuple[int, ...], recorder=None) -> None:
+        self.model, self.eos, self.recorder = model, tuple(eos), recorder
         self.free = list(range(model.slots))
         self.streams: dict[int, Stream] = {}      # decoding
         self.filling: list[Stream] = []           # admitted, prompts still prefilling (oldest first)
@@ -94,6 +95,9 @@ class Decoder:
             return [s]
         self.done_at[s.sid] = b
         self.written[s.sid] = max(self.written[s.sid], b)
+        if self.recorder is not None:
+            final, states = self.model.last
+            self.recorder.add(s.sid, range(a, b), s.prompt[a:b], states, final, self.model.w.head)
         s.prefill_s += time.perf_counter() - t0
         if first is None:
             return []
@@ -131,6 +135,11 @@ class Decoder:
             win = list(c.tokens)
             sampled = sample_rows(logits[a:a + len(win)], [c.p0 + 1 + i for i in range(len(win))], s.sampling)
             path, last = accept(win, list(range(-1, len(win) - 1)), sampled, s.count - len(s.out), self._ends(s))
+            if self.recorder is not None:                   # the kept rows only: a rejected draft's state is not one
+                final, states = self.model.last
+                keep = torch.tensor([a + r for r in path], device=final.device)
+                self.recorder.add(s.sid, [c.p0 + r for r in path], [win[r] for r in path],
+                                  [t[keep] for t in states], final[keep], self.model.w.head)
             new = [win[r] for r in path[1:]] + [last]
             s.counted(len(win))
             if len(win) > 1:
@@ -141,6 +150,8 @@ class Decoder:
 
     def finish(self, done: list[Stream]) -> None:
         for s in done:
+            if self.recorder is not None:
+                self.recorder.finish(s.sid, prompt=len(s.prompt), cached=s.cached, reply=len(s.out))
             self.streams.pop(s.sid, None)
             if s in self.filling:
                 self.filling.remove(s)

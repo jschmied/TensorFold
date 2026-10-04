@@ -69,6 +69,8 @@ class Model:
         self.cos = torch.cat([ang.cos(), ang.cos()], -1).float()          # [context, D] (neox halves)
         self.sin = torch.cat([ang.sin(), ang.sin()], -1).float()
         self.qk_norms = [torch.stack([L.q_norm, L.k_norm]).contiguous() for L in w.layers]
+        self.record_taps: tuple[int, ...] = ()            # layers whose outputs every forward keeps (``last``)
+        self.last: tuple | None = None                    # (final states [rows, D], those layers' states)
         self.scale = cfg.head_dim ** -0.5
 
     @staticmethod
@@ -104,7 +106,7 @@ class Model:
         res = w.embed[ids].float()
         h, hk, d, eps = cfg.heads, cfg.kv_heads, cfg.head_dim, cfg.eps
         x = rms(res, w.layers[0].input_norm, eps, bf16=True)
-        tapped = {}
+        tapped, keep = {}, set(taps) | set(self.record_taps)
         for i, L in enumerate(w.layers):
             q, k, v = glue.qkv(L.qkv(x), self.qk_norms[i], self.cos, self.sin, pos32, slot32, self.k[i], self.v[i],
                                heads=h, kv_heads=hk, eps=eps, rope=not cfg.full[i])
@@ -120,7 +122,7 @@ class Model:
             m = moe.run(x, L.router, L.bias, L.experts, cfg.top_k, prefill=prompt)
             after = w.layers[i + 1].input_norm if i + 1 < len(w.layers) else w.norm
             x = glue.add_rms(m, res, L.post_moe_norm, after, eps)
-            if i in taps:
+            if i in keep:
                 tapped[i] = x
         if rows is None:
             ends, at = [], 0
@@ -128,6 +130,8 @@ class Model:
                 at += len(c.tokens)
                 ends.append(at - 1)
             rows = ends
+        if self.record_taps:
+            self.last = (x, [tapped[i] for i in self.record_taps])
         if features:                                          # every row's normed state, as the head reads it
             return (x, [tapped[i] for i in taps]) if taps else x
         x = x[torch.tensor(list(rows), device=dev)]

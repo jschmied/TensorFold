@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -46,7 +47,18 @@ class Kolibri1Engine:
         self.context_window = window
         self.model = Model(self.w, window, streams)
         self.eos = tuple(cfg.eos)
-        self.decoder = Decoder(self.model, self.eos)
+        recorder = None
+        if os.environ.get("TENSORFOLD_KOLIBRI_RECORD"):  # drafter training data: kept rows' states and top-k choices
+            from .record import Recorder
+
+            taps = [int(v) for v in os.environ.get("TENSORFOLD_KOLIBRI_RECORD_TAPS", "44,47,49").split(",")]
+            self.model.record_taps = tuple(taps)
+            recorder = Recorder(os.environ["TENSORFOLD_KOLIBRI_RECORD"], taps,
+                                k=int(os.environ.get("TENSORFOLD_KOLIBRI_RECORD_TOPK", "32")),
+                                floor_gb=float(os.environ.get("TENSORFOLD_KOLIBRI_RECORD_FLOOR_GB", "25")))
+            print(f"[tensorfold] kolibri1: recording layers {taps} and top-{recorder.k} choices to {recorder.root}",
+                  flush=True)
+        self.decoder = Decoder(self.model, self.eos, recorder)
         self.scheduler = Scheduler(self.decoder, max_streams=streams)
         self.concurrent = streams > 1
         self.drafts = True                     # copies from the context (Kolibri 1 ships no draft head)
