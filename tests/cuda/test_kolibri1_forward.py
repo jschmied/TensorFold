@@ -161,3 +161,14 @@ def test_a_follow_up_resumes_its_kept_prompt_rows_and_equals_fresh(weights, monk
     resumed, cached = run(d, follow, None)
     fresh, _ = run(decoder.Decoder(forward.Model(weights, 512, 1), (511,)), follow, None)
     assert cached == 0 and resumed == fresh
+
+
+def test_taps_return_the_listed_layers_states_and_leave_features_alone(weights):
+    from tensorfold.families.kolibri1.cuda.forward import Chain, Model
+
+    ids = tokens(40, seed=31)
+    plain = Model(weights, 128).forward([Chain(0, 0, ids)], prompt=True, features=True)
+    x, states = Model(weights, 128).forward([Chain(0, 0, ids)], prompt=True, features=True, taps=[0, 2])
+    assert torch.equal(x, plain) and len(states) == 2
+    assert torch.equal(states[1], x)                             # the last layer's output is the head's state
+    assert states[0].shape == x.shape and not torch.equal(states[0], x)

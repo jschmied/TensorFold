@@ -81,8 +81,8 @@ class Model:
 
     @torch.no_grad()
     def forward(self, chains: Sequence[Chain], *, prompt: bool, rows: Sequence[int] | None = None,
-                features: bool = False):
-        """fp32 logits of ``rows`` (default: each chain's last), or with ``features`` every row's normed state."""
+                features: bool = False, taps: Sequence[int] = ()):
+        """fp32 logits of ``rows`` (default: each chain's last); ``features``: normed states, ``taps``: also layers'."""
 
         cfg, w = self.cfg, self.w
         if prompt and len(chains) != 1:
@@ -104,6 +104,7 @@ class Model:
         res = w.embed[ids].float()
         h, hk, d, eps = cfg.heads, cfg.kv_heads, cfg.head_dim, cfg.eps
         x = rms(res, w.layers[0].input_norm, eps, bf16=True)
+        tapped = {}
         for i, L in enumerate(w.layers):
             q, k, v = glue.qkv(L.qkv(x), self.qk_norms[i], self.cos, self.sin, pos32, slot32, self.k[i], self.v[i],
                                heads=h, kv_heads=hk, eps=eps, rope=not cfg.full[i])
@@ -119,6 +120,8 @@ class Model:
             m = moe.run(x, L.router, L.bias, L.experts, cfg.top_k, prefill=prompt)
             after = w.layers[i + 1].input_norm if i + 1 < len(w.layers) else w.norm
             x = glue.add_rms(m, res, L.post_moe_norm, after, eps)
+            if i in taps:
+                tapped[i] = x
         if rows is None:
             ends, at = [], 0
             for c in chains:
@@ -126,7 +129,7 @@ class Model:
                 ends.append(at - 1)
             rows = ends
         if features:                                          # every row's normed state, as the head reads it
-            return x
+            return (x, [tapped[i] for i in taps]) if taps else x
         x = x[torch.tensor(list(rows), device=dev)]
         return shared.router(x, w.head)
 
