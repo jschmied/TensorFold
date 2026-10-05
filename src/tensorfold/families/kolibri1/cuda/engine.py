@@ -58,10 +58,20 @@ class Kolibri1Engine:
                                 floor_gb=float(os.environ.get("TENSORFOLD_KOLIBRI_RECORD_FLOOR_GB", "25")))
             print(f"[tensorfold] kolibri1: recording layers {taps} and top-{recorder.k} choices to {recorder.root}",
                   flush=True)
-        self.decoder = Decoder(self.model, self.eos, recorder)
+        drafter = None
+        if os.environ.get("TENSORFOLD_KOLIBRI_DRAFTER"):  # a learned drafter for when copies find nothing
+            from .drafter import Drafter
+
+            drafter = Drafter(os.environ["TENSORFOLD_KOLIBRI_DRAFTER"], self.w.embed, self.w.head,
+                              depth=int(os.environ.get("TENSORFOLD_KOLIBRI_DRAFTER_DEPTH", "2")),
+                              vocab=os.environ.get("TENSORFOLD_KOLIBRI_DRAFTER_VOCAB") or None)
+            print(f"[tensorfold] kolibri1: learned drafter on layers {drafter.taps}, depth {drafter.depth}, "
+                  f"{'full' if drafter.vocab is None else len(drafter.vocab)} draft tokens", flush=True)
+        self.decoder = Decoder(self.model, self.eos, recorder, drafter,
+                               draft_streams=int(os.environ.get("TENSORFOLD_KOLIBRI_DRAFTER_STREAMS", str(streams))))
         self.scheduler = Scheduler(self.decoder, max_streams=streams)
         self.concurrent = streams > 1
-        self.drafts = True                     # copies from the context (Kolibri 1 ships no draft head)
+        self.drafts = True                     # copies from the context, and a learned drafter if one is given
         print(f"[tensorfold] kolibri1: {streams} stream(s) of {window} tokens "
               f"({streams * Model.slot_bytes(cfg, window) / 2**30:.1f} GiB of caches; sliding layers keep a "
               f"{self.model.ring}-key ring), ready in {time.perf_counter() - started:.0f}s", flush=True)

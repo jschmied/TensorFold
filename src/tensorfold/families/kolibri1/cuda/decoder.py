@@ -1,6 +1,7 @@
 """The ``Scheduler``'s decoder for Kolibri 1: a prompt chunk a round, then every decoding stream's window together."""
 # Windows copy what followed the context's last 8 tokens before; rows are row-invariant, so drafted equals serial.
 # A free slot keeps its prompt rows (prompt kernels' bits); a prompt extending them resumes there, equal to fresh.
+# With a learned drafter, a stream whose copies find nothing drafts its chain instead; the target verifies either.
 
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ from tensorfold.cuda.sampling import sample_rows
 from tensorfold.cuda.streams import Stream, accept, next_fill
 from tensorfold.families.qwen3_5.cuda.decode import CopyIndex, next_copy_rows
 
+from .drafter import WINDOW
 from .forward import PROMPT_CHUNK, Chain, Model
 
 STEP = 1024              # prompt rows a round while other streams decode
@@ -22,8 +24,16 @@ MIN_MATCH = 8            # context tokens a copy must repeat before it is propos
 
 
 class Decoder:
-    def __init__(self, model: Model, eos: tuple[int, ...], recorder=None) -> None:
+    def __init__(self, model: Model, eos: tuple[int, ...], recorder=None, drafter=None,
+                 draft_streams: int = 64) -> None:
         self.model, self.eos, self.recorder = model, tuple(eos), recorder
+        self.drafter, self.draft_streams = drafter, draft_streams
+        self.learned: dict[int, list[int]] = {}    # the drafter's chain for each stream's next round
+        self.learned_rows = self.learned_kept = 0
+        if drafter is not None:                    # its taps come from every forward's kept layer states
+            if model.record_taps and tuple(model.record_taps) != drafter.taps:
+                raise ValueError(f"the recorder's layers {model.record_taps} differ from the drafter's {drafter.taps}")
+            model.record_taps = drafter.taps
         self.free = list(range(model.slots))
         self.streams: dict[int, Stream] = {}      # decoding
         self.filling: list[Stream] = []           # admitted, prompts still prefilling (oldest first)
@@ -98,6 +108,13 @@ class Decoder:
         if self.recorder is not None:
             final, states = self.model.last
             self.recorder.add(s.sid, range(a, b), s.prompt[a:b], states, final, self.model.w.head)
+        if self.drafter is not None and s.draft:            # its last rows (the trained window) enter the drafter
+            lo = max(a, len(s.prompt) - 1 - WINDOW)
+            nxt = list(s.prompt[lo + 1:b + 1]) + ([first] if first is not None else [])   # each row's next token
+            if nxt:
+                _, states = self.model.last
+                rows = slice(lo - a, lo - a + len(nxt))
+                self.drafter.add(s.sid, list(range(lo, lo + len(nxt))), nxt, [t[rows] for t in states])
         s.prefill_s += time.perf_counter() - t0
         if first is None:
             return []
@@ -109,6 +126,8 @@ class Decoder:
         self.width[s.sid] = 16                       # a copy window's rows, doubled after a whole copy
         s.take([first], self._ends(s))
         self.context[s.sid].append(first)
+        if self.drafter is not None and s.draft:
+            self.learned[s.sid] = self.drafter.chain(s.sid)
         return [s] if s.done else []
 
     def round(self) -> list[Stream]:
@@ -118,7 +137,8 @@ class Decoder:
         live = [s for s in self.streams.values() if not s.done]
         if not live:
             return done
-        chains, starts = [], []
+        chains, starts, copied = [], [], {}
+        learn = self.drafter is not None and len(live) <= self.draft_streams
         for s in live:
             p = len(s.prompt) + len(s.out) - 1             # the pending token's position
             room = min(s.count - len(s.out), self.model.context - p) - 1
@@ -126,6 +146,10 @@ class Decoder:
             if s.draft and room > 0:
                 most = min(room, self.width[s.sid] - 1)
                 drafts = self.copies[s.sid].propose(self.context[s.sid], most)[:most]
+                copied[s.sid] = bool(drafts)
+                if not drafts and learn:
+                    drafts = self.learned.get(s.sid, [])[:room]
+                    self.learned_rows += len(drafts)
             starts.append(sum(len(c.tokens) for c in chains))
             chains.append(Chain(self.slot[s.sid], p, [s.out[-1], *drafts]))
             self.written[s.sid] = max(self.written[s.sid], p + 1 + len(drafts))
@@ -142,10 +166,18 @@ class Decoder:
                                   [t[keep] for t in states], final[keep], self.model.w.head, kinds=1)
             new = [win[r] for r in path[1:]] + [last]
             s.counted(len(win))
-            if len(win) > 1:
+            if len(win) > 1 and copied.get(s.sid):
                 self.width[s.sid] = next_copy_rows(len(win), len(path) == len(win), 1, MAX_ROWS)
+            elif len(win) > 1:
+                self.learned_kept += len(path) - 1
             s.take(new, self._ends(s))
             self.context[s.sid].extend(new)
+            if self.drafter is not None and s.draft:       # the kept rows enter the drafter, then the next chain
+                _, states = self.model.last
+                keep = torch.tensor([a + r for r in path], device=states[0].device)
+                self.drafter.add(s.sid, [c.p0 + r for r in path], new, [t[keep] for t in states])
+                if not s.done and learn:
+                    self.learned[s.sid] = self.drafter.chain(s.sid)
         return done + [s for s in live if s.done]
 
     def finish(self, done: list[Stream]) -> None:
@@ -163,8 +195,10 @@ class Decoder:
                 self.kept[slot] = (ids, self.written.pop(s.sid, rows), self.tick)
                 self.free.append(slot)
                 self.free.sort()
-            for d in (self.copies, self.context, self.width):
+            for d in (self.copies, self.context, self.width, self.learned):
                 d.pop(s.sid, None)
+            if self.drafter is not None:
+                self.drafter.drop(s.sid)
 
     def drop(self) -> list[Stream]:
         gone = [s for s in self.streams.values() if not s.done] + list(self.filling)
@@ -177,4 +211,7 @@ class Decoder:
         self.copies.clear()
         self.context.clear()
         self.width.clear()
+        self.learned.clear()
+        if self.drafter is not None:
+            self.drafter.cache.clear()
         return gone
