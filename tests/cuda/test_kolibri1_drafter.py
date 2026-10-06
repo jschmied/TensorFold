@@ -173,3 +173,25 @@ def test_learned_drafts_equal_the_serial_reply(weights, checkpoint, monkeypatch)
         for p, got in zip(prompts, together):
             serial, _ = decode(weights, checkpoint, [p], sampling, draft=False, drafter=False, monkeypatch=monkeypatch)
             assert got == serial[0]
+
+
+def test_a_release_directory_loads_the_same_drafter(weights, checkpoint, tmp_path):
+    import json
+
+    from safetensors.torch import save_file
+
+    from tensorfold.families.kolibri1.cuda.drafter import Drafter
+    from tensorfold.families.kolibri1.cuda.forward import Chain, Model
+
+    ck = torch.load(checkpoint)
+    save_file({k: v.contiguous() for k, v in ck["state"].items()}, tmp_path / "model.safetensors")
+    (tmp_path / "config.json").write_text(json.dumps({"drafter": ck["config"], "taps": ck["taps"]}))
+    (tmp_path / "draft_vocab.json").write_text(json.dumps(list(range(0, 512, 2))))
+    ids = tokens(40, seed=6)
+    _, taps = Model(weights, 128).forward([Chain(0, 0, ids)], prompt=True, features=True, taps=TAPS)
+    got = []
+    for src, vocab in ((tmp_path, None), (checkpoint, tmp_path / "draft_vocab.json")):
+        dr = Drafter(src, weights.embed, weights.head, depth=3, vocab=vocab)
+        dr.add(0, list(range(39)), ids[1:40], [t[:-1] for t in taps])
+        got.append(dr.chain(0))
+    assert got[0] == got[1] and all(t % 2 == 0 for t in got[0])  # same chain, drawn from the slice

@@ -45,7 +45,16 @@ class _Cache:
 class Drafter:
     def __init__(self, path: str | Path, embed: torch.Tensor, head: torch.Tensor, *, depth: int = 2,
                  vocab: str | Path | None = None) -> None:
-        ck = torch.load(path, map_location="cpu", weights_only=True)
+        p = Path(path)
+        if p.is_dir():                                       # a release: config.json, model.safetensors, draft_vocab.json
+            from safetensors.torch import load_file
+
+            meta = json.loads((p / "config.json").read_text())
+            ck = {"config": meta["drafter"], "state": load_file(p / "model.safetensors"), "taps": meta["taps"]}
+            if vocab is None and (p / meta.get("draft_vocab", "draft_vocab.json")).exists():
+                vocab = p / meta.get("draft_vocab", "draft_vocab.json")
+        else:                                                # a training checkpoint (train_mt.py's .pt)
+            ck = torch.load(p, map_location="cpu", weights_only=True)
         cfg = {"layers": 1, "taps": 1, **ck["config"]}
         self.d, self.h, self.hd = cfg["hidden"], cfg["heads"], cfg["head_dim"]
         self.eps, self.theta, self.layers = cfg["eps"], cfg["theta"], cfg["layers"]
