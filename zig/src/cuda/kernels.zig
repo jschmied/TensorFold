@@ -26,6 +26,7 @@ pub const lane_gemv: []const u8 = if (available) &Blob("fatbin_lane_gemv").bytes
 pub const sample: []const u8 = if (available) &Blob("fatbin_sample").bytes else &.{};
 pub const fp8_lane: []const u8 = if (available) &Blob("fatbin_fp8_lane").bytes else &.{};
 pub const fp8_experts: []const u8 = if (available) &Blob("fatbin_fp8_experts").bytes else &.{};
+pub const nvfp4_experts: []const u8 = if (available) &Blob("fatbin_nvfp4_experts").bytes else &.{};
 pub const torch_argmax: []const u8 = if (available) &Blob("fatbin_torch_argmax").bytes else &.{};
 pub const torch_topk: []const u8 = if (available) &Blob("fatbin_torch_topk").bytes else &.{};
 pub const torch_pointwise: []const u8 = if (available) &Blob("fatbin_torch_pointwise").bytes else &.{};
@@ -41,7 +42,7 @@ pub const gdn_symbols = struct {
 
 /// Every instantiation gdn.cu exports; tests resolve each one so a wrong name cannot hide behind an unused path.
 pub const gdn_variants = [_]TreeVariant{
-    tree(0, 8, 4, true), tree(1, 8, 4, false), tree(2, 8, 2, false), tree(2, 4, 4, false),
+    tree(0, 8, 4, true),  tree(1, 8, 4, false), tree(2, 8, 2, false),  tree(2, 4, 4, false),
     tree(4, 2, 4, false), tree(8, 2, 4, false), tree(16, 2, 2, false), tree(32, 2, 1, false),
 };
 

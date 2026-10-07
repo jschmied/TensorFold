@@ -10,6 +10,7 @@ const libs_tests = @import("libs_tests.zig");
 const sample_tests = @import("sample_tests.zig");
 const fp8_tests = @import("fp8_tests.zig");
 const fp8_experts_tests = @import("fp8_experts_tests.zig");
+const nvfp4_experts_tests = @import("nvfp4_experts_tests.zig");
 
 const usage =
     \\usage: tf-cuda-test <command>
@@ -29,6 +30,7 @@ const usage =
     \\  sample                    sample.cu's keyed draws against the Metal rule's host references (synthetic rows)
     \\  fp8-lane <dir>            block-FP8 projections against the Python lane matmul's bytes (oracle/fp8_lane.py)
     \\  fp8-experts <dir>         grouped block-FP8 experts against the Python bytes (oracle/fp8_experts.py)
+    \\  nvfp4-experts <dir>       grouped NVFP4 experts against the Python bytes (oracle/nvfp4_experts.py)
     \\
 ;
 
@@ -80,6 +82,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "triton")) return oracle_tests.tritonKernel(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "fp8-lane")) return fp8_tests.lane(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "fp8-experts")) return fp8_experts_tests.experts(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "nvfp4-experts")) return nvfp4_experts_tests.experts(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "sample")) return sample_tests.draws(gpu);
     std.debug.print("{s}", .{usage});
     return error.UnknownCommand;

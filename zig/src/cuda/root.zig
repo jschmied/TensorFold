@@ -25,6 +25,7 @@ pub const kernels = @import("kernels.zig");
 pub const fp8 = @import("fp8.zig");
 pub const grouped = @import("grouped.zig");
 pub const fp8_experts = @import("fp8_experts.zig");
+pub const nvfp4_experts = @import("nvfp4_experts.zig");
 pub const segments = @import("segments.zig");
 
 test {
@@ -36,4 +37,5 @@ test {
     _ = @import("fp8.zig");
     _ = @import("grouped.zig");
     _ = @import("fp8_experts.zig");
+    _ = @import("nvfp4_experts.zig");
 }
