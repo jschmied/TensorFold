@@ -6,6 +6,7 @@ const Fixture = @import("fixture.zig").Fixture;
 const Gpu = check.Gpu;
 
 const fp8 = cuda.fp8;
+const qmmf = cuda.qmmf;
 
 pub fn lane(gpu: Gpu, dir: []const u8) !void {
     var fx = try Fixture.open(gpu.gpa, gpu.io, dir);
@@ -43,11 +44,11 @@ pub fn lane(gpu: Gpu, dir: []const u8) !void {
     var ds = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(bs));
     defer ds.free();
     const cap = try gpu.ctx.capability();
-    var l = try fp8.Lane.load(gpu.d, cap / 10);
+    var l = try qmmf.Lane.load(gpu.d, cap / 10);
     defer l.unload();
     var stream = try cuda.Stream.init(gpu.d, true);
     defer stream.deinit();
-    const w: fp8.Weight = .{ .codes = dw.ptr, .scales = ds.ptr, .n = @intCast(n), .k = @intCast(k), .npad = @intCast(npad) };
+    const w = fp8.weight(dw.ptr, ds.ptr, n, k);
 
     var it = std.mem.tokenizeScalar(u8, try fx.string("rows"), ',');
     while (it.next()) |tok| {
@@ -69,7 +70,7 @@ pub fn lane(gpu: Gpu, dir: []const u8) !void {
         const got = try check.download(gpu, dy);
         defer a.free(got);
         try check.sameBytes(try std.fmt.bufPrint(&name, "y{d}", .{m}), got, want);
-        const p = fp8.plan(m, n, k, l.clusters);
+        const p = qmmf.plan(m, n, k, l.clusters);
         check.pass("fp8 lane: {d} rows x [{d}, {d}] equal Python's bytes (tile {d}, {d} slices, fused {}, cluster {})", .{ m, n, k, p.bm, p.sk, p.fused, p.cluster });
     }
 }
