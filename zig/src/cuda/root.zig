@@ -23,6 +23,8 @@ pub const triton = @import("triton.zig");
 pub const aot = @import("aot.zig");
 pub const kernels = @import("kernels.zig");
 pub const fp8 = @import("fp8.zig");
+pub const grouped = @import("grouped.zig");
+pub const fp8_experts = @import("fp8_experts.zig");
 pub const segments = @import("segments.zig");
 
 test {
@@ -32,4 +34,6 @@ test {
     _ = aot;
     _ = segments;
     _ = @import("fp8.zig");
+    _ = @import("grouped.zig");
+    _ = @import("fp8_experts.zig");
 }
