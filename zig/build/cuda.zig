@@ -147,7 +147,8 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
     const cuda = runtime(b, host, .debug, &.{});
     const mods = family(b, host, .debug, cuda, draft_ids);
     const native = engines(b, host, .debug, cuda, mods.lanes, mods.nemotron).engines;
-    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+    const kolibri1 = b.createModule(.{ .root_source_file = b.path("zig/src/families/kolibri1/cuda.zig"), .target = host, .optimize = .Debug, .link_libc = true });
+    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, kolibri1, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = host, .optimize = .debug, .link_libc = true });
     cli.addImport("cuda", cuda);
     cli.addImport("core", mods.core);
