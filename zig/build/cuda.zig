@@ -122,6 +122,10 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     runner.addImport("cuda", cuda);
     runner.addImport("lanes", mods.lanes);
     runner.addImport("nemotron", mods.nemotron);
+    const kolibri1 = b.createModule(.{ .root_source_file = b.path("zig/src/families/kolibri1/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    kolibri1.addImport("core", mods.core);
+    kolibri1.addImport("cuda", cuda);
+    runner.addImport("kolibri1", kolibri1);
     b.installArtifact(b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner }));
     nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.tokenizer, build_options, true).root_module.strip = strip;
 }
