@@ -60,11 +60,16 @@ class Kolibri1Engine:
                   flush=True)
         drafter = None
         if os.environ.get("TENSORFOLD_KOLIBRI_DRAFTER"):  # a learned drafter for when copies find nothing
+            from .block_drafter import BlockDrafter, is_block
             from .drafter import Drafter
 
-            drafter = Drafter(os.environ["TENSORFOLD_KOLIBRI_DRAFTER"], self.w.embed, self.w.head,
-                              depth=int(os.environ.get("TENSORFOLD_KOLIBRI_DRAFTER_DEPTH", "2")),
-                              vocab=os.environ.get("TENSORFOLD_KOLIBRI_DRAFTER_VOCAB") or None)
+            path, depth = os.environ["TENSORFOLD_KOLIBRI_DRAFTER"], os.environ.get("TENSORFOLD_KOLIBRI_DRAFTER_DEPTH")
+            vocab = os.environ.get("TENSORFOLD_KOLIBRI_DRAFTER_VOCAB") or None
+            if is_block(path):                         # train_block.py's checkpoints: one pass drafts a block
+                drafter = BlockDrafter(path, self.w.embed, self.w.head, depth=int(depth) if depth else None,
+                                       vocab=vocab)
+            else:
+                drafter = Drafter(path, self.w.embed, self.w.head, depth=int(depth or "2"), vocab=vocab)
             print(f"[tensorfold] kolibri1: learned drafter on layers {drafter.taps}, depth {drafter.depth}, "
                   f"{'full' if drafter.vocab is None else len(drafter.vocab)} draft tokens", flush=True)
         self.decoder = Decoder(self.model, self.eos, recorder, drafter,
