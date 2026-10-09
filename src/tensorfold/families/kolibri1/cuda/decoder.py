@@ -155,6 +155,7 @@ class Decoder:
             self.written[s.sid] = max(self.written[s.sid], p + 1 + len(drafts))
         total = sum(len(c.tokens) for c in chains)
         logits = self.model.forward(chains, prompt=False, rows=range(total))
+        pending = []                                         # streams whose next learned drafts come from one pass
         for s, c, a in zip(live, chains, starts):
             win = list(c.tokens)
             sampled = sample_rows(logits[a:a + len(win)], [c.p0 + 1 + i for i in range(len(win))], s.sampling)
@@ -177,7 +178,14 @@ class Decoder:
                 keep = torch.tensor([a + r for r in path], device=states[0].device)
                 self.drafter.add(s.sid, [c.p0 + r for r in path], new, [t[keep] for t in states])
                 if not s.done and learn:
-                    self.learned[s.sid] = self.drafter.chain(s.sid)
+                    pending.append(s.sid)
+        if pending:
+            many = getattr(self.drafter, "chain_many", None)
+            if many is not None and len(pending) > 1:        # one weight read for all streams (block drafter)
+                self.learned.update(many(pending))
+            else:
+                for sid in pending:
+                    self.learned[sid] = self.drafter.chain(sid)
         return done + [s for s in live if s.done]
 
     def finish(self, done: list[Stream]) -> None:
