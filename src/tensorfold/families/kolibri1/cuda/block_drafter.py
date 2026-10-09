@@ -31,16 +31,16 @@ def is_block(path: str | Path) -> bool:
 class _Cache:
     """One stream's context: per layer keys and values of its rows, plus the last row's context and fused vectors."""
 
-    def __init__(self, layers: int, h: int, hd: int, dev, dt) -> None:
-        shape = (h, 2 * WINDOW, hd)
+    def __init__(self, layers: int, h: int, hd: int, dev, dt, block: int) -> None:
+        shape = (h, 2 * WINDOW + block, hd)                 # past the rows: the block's own keys, rewritten each pass
         self.k = [torch.empty(shape, device=dev, dtype=dt) for _ in range(layers)]
         self.v = [torch.empty(shape, device=dev, dtype=dt) for _ in range(layers)]
-        self.n, self.pos, self.ctx, self.fused = 0, -1, None, None
+        self.n, self.pos, self.ctx, self.fused, self.block = 0, -1, None, None, block
 
     def room(self, rows: int) -> None:
         """Keep the last WINDOW rows at the front when ``rows`` more would not fit."""
 
-        if self.n + rows > self.k[0].shape[1]:
+        if self.n + rows + self.block > self.k[0].shape[1]:
             keep = min(self.n, WINDOW)
             for t in self.k + self.v:
                 t[:, :keep] = t[:, self.n - keep : self.n].clone()
@@ -117,7 +117,7 @@ class BlockDrafter:
         dev = self.embed.device
         c = self.cache.get(sid)
         if c is None:
-            c = self.cache[sid] = _Cache(self.layers, self.h, self.hd, dev, self.dt)
+            c = self.cache[sid] = _Cache(self.layers, self.h, self.hd, dev, self.dt, self.block)
         for lo in range(0, len(positions), WINDOW):
             part = slice(lo, lo + WINDOW)
             rows = len(positions[part])
@@ -158,9 +158,10 @@ class BlockDrafter:
                 z = torch.cat([z[:1], z[1:] + F.silu(self._rms(z[:-1], sn) @ sa.T) @ su.T], 0)
             a = self._rms(z, L["n1"])
             q = self._rope(self._heads(a @ L["q"].T), pos)
-            k = torch.cat([c.k[i][:, : c.n], self._rope(self._heads(a @ L["k"].T), pos)], 1)
-            v = torch.cat([c.v[i][:, : c.n], self._heads(a @ L["v"].T)], 1)
-            att = F.scaled_dot_product_attention(q[None], k[None], v[None], attn_mask=mask[None, None])[0]
+            c.k[i][:, c.n : c.n + b] = self._rope(self._heads(a @ L["k"].T), pos)      # in place: no copy of the
+            c.v[i][:, c.n : c.n + b] = self._heads(a @ L["v"].T)                        # context per pass
+            k, v = c.k[i][None, :, : c.n + b], c.v[i][None, :, : c.n + b]
+            att = F.scaled_dot_product_attention(q[None], k, v, attn_mask=mask[None, None])[0]
             z = z + att.transpose(0, 1).reshape(b, -1) @ L["o"].T
             m = self._rms(z, L["n2"])
             z = z + (F.silu(m @ L["gate"].T) * (m @ L["up"].T)) @ L["down"].T
