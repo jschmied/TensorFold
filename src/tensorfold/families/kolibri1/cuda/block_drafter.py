@@ -48,7 +48,10 @@ def is_block(path: str | Path) -> bool:
     """A train_block.py checkpoint (a .pt whose config has a block size), read without loading its tensors."""
 
     p = Path(path)
-    if p.is_dir() or p.suffix != ".pt":
+    if p.is_dir():                                           # a release: config.json names the drafter's block
+        cfg = p / "config.json"
+        return cfg.exists() and "block" in json.loads(cfg.read_text()).get("drafter", {})
+    if p.suffix != ".pt":
         return False
     return "block" in torch.load(p, map_location="cpu", weights_only=False, mmap=True)["config"]
 
@@ -84,7 +87,17 @@ class BlockDrafter:
     def __init__(self, path: str | Path, embed: torch.Tensor, head: torch.Tensor, *, depth: int | None = None,
                  vocab: str | Path | None = None, dtype: torch.dtype = torch.bfloat16, quant: str | None = None,
                  head_quant: str | None = None) -> None:
-        ck = torch.load(Path(path), map_location="cpu", weights_only=False)
+        p, serving = Path(path), {}
+        if p.is_dir():                                       # a release: config.json, model.safetensors, draft_vocab.json
+            from safetensors.torch import load_file
+
+            meta = json.loads((p / "config.json").read_text())
+            ck = {"config": meta["drafter"], "state": load_file(p / "model.safetensors"), "taps": meta["taps"]}
+            serving = meta.get("serving", {})
+            if vocab is None and (p / meta.get("draft_vocab", "draft_vocab.json")).exists():
+                vocab = p / meta.get("draft_vocab", "draft_vocab.json")
+        else:                                                # a training checkpoint (train_block.py's .pt)
+            ck = torch.load(p, map_location="cpu", weights_only=False)
         cfg = ck["config"]
         if not (cfg.get("chain_ctx") and cfg.get("row0_chain")):
             raise ValueError(f"block drafter {path}: serving reads chain_ctx + row0_chain checkpoints only")
@@ -120,8 +133,11 @@ class BlockDrafter:
         self.head = (head[self.vocab] if self.vocab is not None else head).to(dtype).contiguous()
         # the bytes a pass reads decide its cost on the GB10: weights and the head slice may be quantized (drafts
         # only: the target verifies every one)
-        quant = quant or os.environ.get("TENSORFOLD_KOLIBRI_BLOCK_QUANT", "bf16")
-        head_quant = head_quant or os.environ.get("TENSORFOLD_KOLIBRI_BLOCK_HEAD", quant)
+        # CUDA defaults: FP8 body, NVFP4 head slice (the fastest measured on GB10, same drafts); CPU stays bf16
+        cuda = embed.is_cuda and dtype == torch.bfloat16
+        quant = quant or os.environ.get("TENSORFOLD_KOLIBRI_BLOCK_QUANT") or (serving.get("quant", "fp8") if cuda else "bf16")
+        head_quant = (head_quant or os.environ.get("TENSORFOLD_KOLIBRI_BLOCK_HEAD")
+                      or (serving.get("head", "nvfp4") if cuda else "bf16"))
         self.quant = (quant, head_quant)
         if quant != "bf16":
             for L in self.L:
@@ -133,7 +149,7 @@ class BlockDrafter:
                 self.pred = tuple(_quantize(t, quant) for t in self.pred)
         self.head_mm = _quantize(self.head, head_quant)
         self.inv = 1.0 / self.theta ** (torch.arange(0, self.hd, 2, device=dev, dtype=torch.float32) / self.hd)
-        self.depth = min(self.block, depth or self.block)
+        self.depth = min(self.block, depth or serving.get("depth") or 2)      # 2 measured fastest on GB10
         self.cache: dict[int, _Cache] = {}
         self.states: list[torch.Tensor] = []               # the last pass's corrected states (tests read them)
 
