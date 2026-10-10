@@ -8,7 +8,6 @@ const pack = @import("pack.zig");
 
 const DeviceBuffer = cuda.DeviceBuffer;
 const fp8 = cuda.fp8;
-const fx8 = cuda.fp8_experts;
 
 pub const Layer = struct {
     input_norm: u64, // fp32 [D]
@@ -20,7 +19,7 @@ pub const Layer = struct {
     pre_moe_norm: u64,
     router: u64, // bf16 [E, D]
     bias: u64, // fp32 [E]
-    experts: fx8.Layer, // E routed, then the shared expert
+    experts: cuda.experts.Layer, // E routed, then the shared expert (format fp8g)
     post_moe_norm: u64,
 };
 
@@ -83,6 +82,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []co
             .router = try w.upload(d, h.router),
             .bias = try w.upload(d, std.mem.sliceAsBytes(h.bias)),
             .experts = .{
+                .format = .fp8g,
                 .up = try w.upload(d, std.mem.sliceAsBytes(h.up)),
                 .down = try w.upload(d, std.mem.sliceAsBytes(h.down)),
                 .up_scale = try w.upload(d, std.mem.sliceAsBytes(h.up_scale)),
