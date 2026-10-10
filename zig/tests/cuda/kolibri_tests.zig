@@ -104,3 +104,60 @@ pub fn forward(gpu: Gpu, model: []const u8, capture: []const u8, set: []const u8
     try check.expect(bad == 0, "kolibri1 forward: every captured call equals Python's logits", .{});
     check.pass("kolibri1 forward: {d} calls replayed, every named one's logits equal Python's bytes", .{calls.calls.len});
 }
+
+/// Greedy on the forward: a prompt (ids) prefilled, then `count` tokens by the fp32 argmax (torch's), and the rate.
+pub fn generate(gpu: Gpu, model: []const u8, set: []const u8, ids_file: []const u8, count_text: []const u8) !void {
+    const gpa = gpu.gpa;
+    const count = try std.fmt.parseInt(usize, count_text, 10);
+    const text = try std.Io.Dir.cwd().readFileAlloc(gpu.io, ids_file, gpa, .limited(1 << 26));
+    defer gpa.free(text);
+    var prompt: std.ArrayList(u32) = .empty;
+    defer prompt.deinit(gpa);
+    var it = std.mem.tokenizeAny(u8, text, ", \n");
+    while (it.next()) |t| try prompt.append(gpa, try std.fmt.parseInt(u32, t, 10));
+    var w = try kolibri1.weights.load(gpa, gpu.io, gpu.d, model, null);
+    defer w.deinit();
+    var k = try kolibri1.kernels.Kernels.load(gpa, gpu.io, gpu.ctx, set);
+    defer k.deinit();
+    var stream = try cuda.Stream.init(gpu.d, false);
+    defer stream.deinit();
+    const context = (prompt.items.len + count + 64 + 1023) / 1024 * 1024; // as the engine sizes it: whole 1,024s
+    const chunk = 2048;
+    var m = try kolibri1.forward.Model.init(gpa, gpu.d, stream, &w, context, 1, chunk);
+    defer m.deinit();
+    const o: kolibri1.kernels.Ops = .{ .k = &k, .s = stream };
+    const vocab = w.config.vocab;
+    var logits = try cuda.DeviceBuffer.alloc(gpu.d, vocab * 4);
+    defer logits.free();
+    const host = try gpa.alloc(f32, vocab);
+    defer gpa.free(host);
+    var at: usize = 0;
+    while (at < prompt.items.len) : (at += chunk) {
+        const end = @min(prompt.items.len, at + chunk);
+        try m.forward(o, &.{.{ .slot = 0, .p0 = at, .tokens = prompt.items[at..end] }}, true, null, logits.ptr);
+    }
+    var out: std.ArrayList(u32) = .empty;
+    defer out.deinit(gpa);
+    var t0 = check.now(gpu.io);
+    var pos = prompt.items.len;
+    for (0..count) |i| {
+        try stream.synchronize();
+        try logits.download(0, std.mem.sliceAsBytes(host));
+        var best: usize = 0;
+        for (host, 0..) |v, j| if (v > host[best]) {
+            best = j;
+        };
+        try out.append(gpa, @intCast(best));
+        if (i == 0) t0 = check.now(gpu.io);
+        if (i + 1 == count) break;
+        try m.forward(o, &.{.{ .slot = 0, .p0 = pos, .tokens = out.items[i..][0..1] }}, false, null, logits.ptr);
+        pos += 1;
+    }
+    const secs = @as(f64, @floatFromInt(check.now(gpu.io) - t0)) / 1e9;
+    var hash = std.hash.Wyhash.init(0);
+    hash.update(std.mem.sliceAsBytes(out.items));
+    std.debug.print("RESULT kolibri1 generate: {d} prompt tokens, {d} tokens greedy, {d:.2} tok/s decode, hash {x}\n", .{ prompt.items.len, out.items.len, @as(f64, @floatFromInt(out.items.len - 1)) / secs, hash.final() });
+    std.debug.print("TOKENS", .{});
+    for (out.items) |t| std.debug.print(" {d}", .{t});
+    std.debug.print("\n", .{});
+}
