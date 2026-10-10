@@ -55,6 +55,7 @@ const usage =
     \\  slide-grad MODEL IDS_FILE START [REACH [STARTS]]   Sliding Weights' gradient against a cubic fit of the loss
     \\  kolibri-layer0 <model> <dir>  Kolibri 1's layer 0 on the device against weights.load (oracle/kolibri_layer.py)
     \\  kolibri-forward MODEL CAPTURE SET  Kolibri 1's forward replayed against the Python engine's logits
+    \\  kolibri-generate MODEL SET IDS N   Kolibri 1 greedy: prefill, then N tokens a row at a time, tok/s
     \\
 ;
 
@@ -108,6 +109,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "fp8-experts")) return fp8_experts_tests.experts(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "kolibri-layer0")) return kolibri_tests.layer0(gpu, try arg(rest, 0), try arg(rest, 1));
     if (std.mem.eql(u8, cmd, "kolibri-forward")) return kolibri_tests.forward(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2));
+    if (std.mem.eql(u8, cmd, "kolibri-generate")) return kolibri_tests.generate(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try arg(rest, 3));
     if (std.mem.eql(u8, cmd, "sample")) return sample_tests.draws(gpu);
     if (std.mem.eql(u8, cmd, "glue")) return glue_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "window-profile")) return window_profile.run(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2));
