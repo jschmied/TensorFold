@@ -7,7 +7,7 @@ const names = @import("names.zig");
 
 const Tensor = core.checkpoint.Tensor;
 const fp8 = cuda.fp8;
-const fx8 = cuda.fp8_experts;
+const fx8 = cuda.experts.Fp8Experts;
 
 /// Fp8BlockLinear.from_checkpoint's arrays: codes [npad/64][k/64][8][32][2][8] and fp32 scale tiles.
 pub const Linear = struct { w8: []u8, bs: []f32, n: usize, k: usize };
@@ -22,7 +22,7 @@ pub const Layer = struct {
     pre_moe_norm: []f32,
     router: []u8, // [E, D] bf16 as stored
     bias: []f32,
-    up: []u32, // fp8_experts.Layer.up: [E][NI/32][D/32][2][32][2][4]
+    up: []u32, // experts.Layer.up (fp8g): [E][NI/32][D/32][2][32][2][4]
     down: []u32, // [E][D/32][NI/32][1][32][2][4]
     up_scale: []f32, // [E][2][NI/128][D/128] (gate, up)
     down_scale: []f32, // [E][1][D/128][NI/128]
@@ -96,7 +96,7 @@ fn experts(gpa: std.mem.Allocator, l: *Layer, ex: []const names.Expert, c: Confi
     l.up_scale = try gpa.alloc(f32, ex.len * 2 * sb);
     l.down_scale = try gpa.alloc(f32, ex.len * sb);
     for (ex, 0..) |e, i| {
-        try fx8.packGateUp(l.up[i * one / 2 ..][0 .. one / 2], e.gate.w.bytes, e.up.w.bytes, ni, d);
+        try fx8.packGateUp(gpa, l.up[i * one / 2 ..][0 .. one / 2], e.gate.w.bytes, e.up.w.bytes, ni, d);
         fx8.packOne(l.down[i * one / 4 ..][0 .. one / 4], e.down.w.bytes, d, ni);
         floats(l.up_scale[2 * i * sb ..][0..sb], e.gate.s);
         floats(l.up_scale[(2 * i + 1) * sb ..][0..sb], e.up.s);
