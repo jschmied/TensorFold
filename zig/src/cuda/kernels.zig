@@ -38,6 +38,7 @@ pub const nemotron_route: []const u8 = if (available) &Blob("fatbin_nemotron_rou
 pub const nemotron_mamba: []const u8 = if (available) &Blob("fatbin_nemotron_mamba").bytes else &.{};
 pub const nemotron_attention: []const u8 = if (available) &Blob("fatbin_nemotron_attention").bytes else &.{};
 pub const nemotron_keyed: []const u8 = if (available) &Blob("fatbin_nemotron_keyed").bytes else &.{};
+pub const kolibri_ops: []const u8 = if (available) &Blob("fatbin_kolibri_ops").bytes else &.{};
 pub const train: []const u8 = if (available) &Blob("fatbin_train").bytes else &.{};
 pub const train_mixers: []const u8 = if (available) &Blob("fatbin_train_mixers").bytes else &.{};
 

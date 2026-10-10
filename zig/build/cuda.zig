@@ -31,6 +31,7 @@ const kernels = [_]Kernel{
     .{ .name = "nemotron_mamba", .flags = glue },
     .{ .name = "nemotron_attention", .flags = glue },
     .{ .name = "nemotron_keyed", .flags = glue },
+    .{ .name = "kolibri_ops", .flags = &.{"-O3"} }, // ours: Kolibri 1's embedding rows as the fp32 residual
     .{ .name = "fp8_lane", .flags = &.{"-O3"} }, // nvfp4/qmmf.cu's FP8G device code, tensorfold_nvfp4_v3
     .{ .name = "train", .flags = &.{"-O3"} }, // ours: Sliding Weights' change and its learning (learner.zig)
     .{ .name = "train_mixers", .flags = &.{"-O3"} },
