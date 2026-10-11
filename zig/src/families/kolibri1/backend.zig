@@ -39,6 +39,8 @@ pub const Kolibri = struct {
     meta: cuda.DeviceBuffer, // a draw's first position minus one, a window each
     lane_bufs: std.ArrayList(cuda.DeviceBuffer) = .empty,
     next: u64 = 0,
+    graphs: []?fwd.Model.Decode, // a slot's one-row step, captured at its first queue (null: eager)
+    graphed: bool, // TENSORFOLD_KOLIBRI_GRAPHS=0 runs every step eager
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, m: *fwd.Model, k: *const kern.Kernels, s: cuda.Stream) !Kolibri {
         const v = m.c.vocab;
@@ -51,8 +53,12 @@ pub const Kolibri = struct {
         errdefer logits16.free();
         var tok = try cuda.DeviceBuffer.alloc(d, (ring + round_rows) * 4);
         errdefer tok.free();
-        const meta = try cuda.DeviceBuffer.alloc(d, round_rows * 4 * 4);
-        return .{ .gpa = gpa, .d = d, .m = m, .k = k, .s = s, .free = free, .logits = logits, .logits16 = logits16, .tok = tok, .meta = meta };
+        var meta = try cuda.DeviceBuffer.alloc(d, round_rows * 4 * 4);
+        errdefer meta.free();
+        const graphs = try gpa.alloc(?fwd.Model.Decode, m.slots);
+        @memset(graphs, null);
+        const off = if (std.c.getenv("TENSORFOLD_KOLIBRI_GRAPHS")) |e| std.mem.eql(u8, std.mem.span(e), "0") else false;
+        return .{ .gpa = gpa, .d = d, .m = m, .k = k, .s = s, .free = free, .logits = logits, .logits16 = logits16, .tok = tok, .meta = meta, .graphs = graphs, .graphed = !off };
     }
 
     pub fn deinit(x: *Kolibri) void {
@@ -61,6 +67,8 @@ pub const Kolibri = struct {
         x.lanes.deinit(x.gpa);
         for (x.lane_bufs.items) |*b| b.free();
         x.lane_bufs.deinit(x.gpa);
+        for (x.graphs) |*g| if (g.*) |*e| e.exec.deinit();
+        x.gpa.free(x.graphs);
         x.gpa.free(x.free);
         x.logits.free();
         x.logits16.free();
@@ -164,11 +172,23 @@ pub const Kolibri = struct {
         const l = x.lanes.getPtr(s) orelse return error.UnknownStream;
         const t = [1]u32{try x.value(feed)};
         if (position != l.len + 1) return error.PositionMismatch;
-        try x.m.forward(x.ops(), &.{.{ .slot = l.slot, .p0 = l.len, .tokens = &t }}, false, null, x.logits.ptr);
+        const logits = try x.step(l, t[0]);
         l.len += 1;
         const h = x.next;
-        try x.drawRows(l, x.logits.ptr, 0, 1, position, x.handle(), 0);
+        try x.drawRows(l, logits, 0, 1, position, x.handle(), 0);
         return h;
+    }
+
+    /// One row at the lane's cache length: the slot's captured graph (captured at its first step), else eager.
+    fn step(x: *Kolibri, l: *const Lane, token: u32) !u64 {
+        if (!x.graphed) {
+            try x.m.forward(x.ops(), &.{.{ .slot = l.slot, .p0 = l.len, .tokens = &.{token} }}, false, null, x.logits.ptr);
+            return x.logits.ptr;
+        }
+        const g = &x.graphs[l.slot];
+        if (g.* == null) g.* = try x.m.captureDecode(x.ops(), l.slot);
+        try x.m.decode(x.ops(), &g.*.?, token, l.len);
+        return g.*.?.logits;
     }
 
     fn read(ptr: *anyopaque, h: u64) anyerror!u32 {
@@ -197,14 +217,19 @@ pub const Kolibri = struct {
             total += l.rows.items.len;
         }
         if (total > round_rows) return error.RoundTooWide;
-        const rows = try x.gpa.alloc(usize, total);
-        defer x.gpa.free(rows);
-        for (rows, 0..) |*r, i| r.* = i;
-        try x.m.forward(x.ops(), chains, false, rows, x.logits.ptr);
+        var logits = x.logits.ptr;
+        if (total == 1) {
+            logits = try x.step(x.lanes.getPtr(windows[0].stream).?, chains[0].tokens[0]); // a lone row: the decode step
+        } else {
+            const rows = try x.gpa.alloc(usize, total);
+            defer x.gpa.free(rows);
+            for (rows, 0..) |*r, i| r.* = i;
+            try x.m.forward(x.ops(), chains, false, rows, logits);
+        }
         var at: usize = 0;
         for (windows, 0..) |w, i| {
             const l = x.lanes.getPtr(w.stream).?;
-            try x.drawRows(l, x.logits.ptr, at, l.rows.items.len, w.positions[0], ring + at, i);
+            try x.drawRows(l, logits, at, l.rows.items.len, w.positions[0], ring + at, i);
             at += l.rows.items.len;
         }
         const got = try x.gpa.alloc(u32, total);
