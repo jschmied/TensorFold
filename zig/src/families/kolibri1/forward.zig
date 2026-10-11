@@ -272,7 +272,10 @@ pub const Model = struct {
             const len = if (c.full[i]) m.context else m.ring;
             try o.qkv(.{ .rows = m.s.qkv, .norms = m.norms[i], .cos = m.cos, .sin = m.sin, .pos = m.s.pos, .slots = m.s.slot, .q = m.s.q, .k = m.s.kn, .v = m.s.vn, .kc = m.k[i], .vc = m.v[i], .len = len }, n, h, hk, dh, c.eps, !c.full[i]);
             if (!c.full[i]) {
-                try o.sliding(m.s.q, m.k[i], m.v[i], m.s.att, m.s.pos, m.s.slot, n, h, hk, dh, c.window, m.ring, scale);
+                if (prompt_chain) |ch| {
+                    const per = m.ring * hk * dh * 2; // a stream's ring rows
+                    try o.slidingPrompt(m.s.q, m.k[i] + ch.slot * per, m.v[i] + ch.slot * per, m.s.att, ch.p0, n, h, hk, dh, c.window, m.ring, scale);
+                } else try o.sliding(m.s.q, m.k[i], m.v[i], m.s.att, m.s.pos, m.s.slot, n, h, hk, dh, c.window, m.ring, scale);
             } else if (prompt_chain) |ch| {
                 const per = m.context * hk * dh * 2;
                 try o.prompt(m.s.q, m.k[i] + ch.slot * per, m.v[i] + ch.slot * per, m.s.att, ch.p0, n, h, hk, scale);

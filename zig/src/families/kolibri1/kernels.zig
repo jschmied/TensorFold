@@ -28,6 +28,7 @@ pub const Kernels = struct {
     moe: cuda.moe_glue.MoeGlue,
     dense: cuda.dense_rows.DenseRows,
     qk: cuda.qk_rows.QkRows,
+    win: cuda.window_attention.WindowAttention,
 
     /// The built-in modules plus the captured Triton set in `set_dir` (tools: capture_kolibri.py, aot_pack.py).
     pub fn load(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, set_dir: []const u8) !Kernels {
@@ -62,6 +63,8 @@ pub const Kernels = struct {
         errdefer k.dense.unload();
         k.qk = try cuda.qk_rows.QkRows.load(d);
         errdefer k.qk.unload();
+        k.win = try cuda.window_attention.WindowAttention.load(d);
+        errdefer k.win.unload();
         k.set = try aot.Set.load(gpa, io, d, ctx.device, set_dir);
         return k;
     }
@@ -72,6 +75,7 @@ pub const Kernels = struct {
         k.moe.unload();
         k.dense.unload();
         k.qk.unload();
+        k.win.unload();
         k.fp8x.unload();
         k.lane.unload();
         for (&k.mods) |*m| m.unload();
@@ -139,7 +143,12 @@ pub const Ops = struct {
 
     /// attention.sliding: a program a (row, KV head) over the ring's last `window` keys.
     pub fn sliding(o: Ops, q: u64, kc: u64, vc: u64, out: u64, pos: u64, slots: u64, w: usize, h: usize, hk: usize, d: usize, window: usize, ring: usize, scale: f32) !void {
-        try o.triton("_sliding", .{ w, hk, 1 }, &.{ aot.ptr("Q", "*bf16", q), aot.ptr("KC", "*bf16", kc), aot.ptr("VC", "*bf16", vc), aot.ptr("OUT", "*bf16", out), aot.ptr("POS", "*i32", pos), aot.ptr("SLOT", "*i32", slots) }, &.{ aot.ci("H", @intCast(h)), aot.ci("HK", @intCast(hk)), aot.ci("D", @intCast(d)), aot.ci("G", @intCast(h / hk)), aot.ci("WIN", @intCast(window)), aot.ci("RING", @intCast(ring)), aot.cf("SCALE", scale), aot.ci("BN", 64), aot.ci("GP", 16) });
+        try o.k.win.decode(o.s, q, kc, vc, out, pos, slots, .{ .h = h, .hk = hk, .d = d, .win = window, .ring = ring, .scale = scale }, w);
+    }
+
+    /// A prompt chunk's sliding rows: one stream's ring (kc, vc at its slot), rows at positions p0, p0 + 1, ...
+    pub fn slidingPrompt(o: Ops, q: u64, kc: u64, vc: u64, out: u64, p0: usize, w: usize, h: usize, hk: usize, d: usize, window: usize, ring: usize, scale: f32) !void {
+        try o.k.win.prompt(o.s, q, kc, vc, out, p0, w, .{ .h = h, .hk = hk, .d = d, .win = window, .ring = ring, .scale = scale });
     }
 
     /// prefill_attention.attention: prompt rows [p0, p0 + w) over every key before them (one stream's caches).
