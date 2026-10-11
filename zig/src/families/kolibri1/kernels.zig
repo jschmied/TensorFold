@@ -27,6 +27,7 @@ pub const Kernels = struct {
     norms: cuda.norms.Norms,
     moe: cuda.moe_glue.MoeGlue,
     dense: cuda.dense_rows.DenseRows,
+    qk: cuda.qk_rows.QkRows,
 
     /// The built-in modules plus the captured Triton set in `set_dir` (tools: capture_kolibri.py, aot_pack.py).
     pub fn load(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, set_dir: []const u8) !Kernels {
@@ -59,6 +60,8 @@ pub const Kernels = struct {
         errdefer k.moe.unload();
         k.dense = try cuda.dense_rows.DenseRows.load(d);
         errdefer k.dense.unload();
+        k.qk = try cuda.qk_rows.QkRows.load(d);
+        errdefer k.qk.unload();
         k.set = try aot.Set.load(gpa, io, d, ctx.device, set_dir);
         return k;
     }
@@ -68,6 +71,7 @@ pub const Kernels = struct {
         k.norms.unload();
         k.moe.unload();
         k.dense.unload();
+        k.qk.unload();
         k.fp8x.unload();
         k.lane.unload();
         for (&k.mods) |*m| m.unload();
@@ -129,7 +133,8 @@ pub const Ops = struct {
 
     /// glue.qkv: q/k norms, RoPE on sliding layers, k and v into the cache at pos % len.
     pub fn qkv(o: Ops, a: Qkv, n: usize, h: usize, hk: usize, d: usize, eps: f32, rope: bool) !void {
-        try o.triton("_qkv", .{ n, h + 2 * hk, 1 }, &.{ aot.ptr("QKV", "*bf16", a.rows), aot.ptr("NW", "*fp32", a.norms), aot.ptr("COS", "*fp32", a.cos), aot.ptr("SIN", "*fp32", a.sin), aot.ptr("POS", "*i32", a.pos), aot.ptr("SLOT", "*i32", a.slots), aot.ptr("Q", "*bf16", a.q), aot.ptr("KO", "*bf16", a.k), aot.ptr("VO", "*bf16", a.v), aot.ptr("KC", "*bf16", a.kc), aot.ptr("VC", "*bf16", a.vc), aot.int("LEN", int(a.len)) }, &.{ aot.ci("H", @intCast(h)), aot.ci("HK", @intCast(hk)), aot.ci("D", @intCast(d)), aot.cf("EPS", eps), aot.ci("ROPE", @intFromBool(rope)) });
+        const shape: cuda.qk_rows.Shape = .{ .norms = a.norms, .cos = if (rope) a.cos else null, .sin = if (rope) a.sin else null, .rot = if (rope) d else 0, .eps = eps };
+        try o.k.qk.rows(o.s, a.rows, .{ .h = h, .hk = hk, .dim = d }, shape, a.pos, a.slots, .{ .q = a.q, .k = a.k, .v = a.v, .kc = a.kc, .vc = a.vc, .len = a.len }, n);
     }
 
     /// attention.sliding: a program a (row, KV head) over the ring's last `window` keys.

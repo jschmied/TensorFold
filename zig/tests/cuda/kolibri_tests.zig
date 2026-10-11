@@ -76,6 +76,8 @@ pub fn forward(gpu: Gpu, model: []const u8, capture: []const u8, set: []const u8
     var logits = try cuda.DeviceBuffer.alloc(gpu.d, widest * w.config.vocab * 4);
     defer logits.free();
     var bad: usize = 0;
+    var total_rows: usize = 0;
+    var total_agree: usize = 0;
     for (calls.calls) |c| {
         const chains = try gpa.alloc(kolibri1.forward.Chain, c.chains.len);
         defer gpa.free(chains);
@@ -98,9 +100,30 @@ pub fn forward(gpu: Gpu, model: []const u8, capture: []const u8, set: []const u8
             if (@as(u32, @bitCast(a)) != @as(u32, @bitCast(b))) diff += 1;
             most = @max(most, @abs(a - b));
         }
-        std.debug.print("RESULT kolibri1 forward {s}: {d} of {d} logits differ from Python's bytes (largest {e})\n", .{ name, diff, wf.len, most });
+        const vocab = w.config.vocab;
+        var agree: usize = 0;
+        var close_rows: usize = 0; // rows whose largest difference stays under 0.5
+        const nrows = wf.len / vocab;
+        for (0..nrows) |r| {
+            const x = wf[r * vocab ..][0..vocab];
+            const y = gf[r * vocab ..][0..vocab];
+            var bx: usize = 0;
+            var by: usize = 0;
+            var rm: f32 = 0;
+            for (x, y, 0..) |p, q, j| {
+                if (p > x[bx]) bx = j;
+                if (q > y[by]) by = j;
+                rm = @max(rm, @abs(p - q));
+            }
+            if (bx == by) agree += 1;
+            if (rm < 0.5) close_rows += 1;
+        }
+        total_rows += nrows;
+        total_agree += agree;
+        std.debug.print("RESULT kolibri1 forward {s}: {d} of {d} logits differ from Python's bytes (largest {e}); top-1 {d}/{d}, rows within 0.5 {d}\n", .{ name, diff, wf.len, most, agree, nrows, close_rows });
         if (diff != 0) bad += 1;
     }
+    std.debug.print("RESULT kolibri1 forward: top-1 equal to Python's in {d} of {d} rows\n", .{ total_agree, total_rows });
     try check.expect(bad == 0, "kolibri1 forward: every captured call equals Python's logits", .{});
     check.pass("kolibri1 forward: {d} calls replayed, every named one's logits equal Python's bytes", .{calls.calls.len});
 }
@@ -310,4 +333,36 @@ pub fn lanesCheck(gpu: Gpu, model: []const u8, set: []const u8, ids_file: []cons
     if (!together) bad += 1;
     try check.expect(bad == 0, "kolibri1 lanes: drafted == plain and concurrent == solo", .{});
     check.pass("kolibri1 lanes: drafted == plain (greedy, sampled), two streams == each alone, {d} tokens each", .{count});
+}
+
+/// Teacher-forced fp32 logits of every row of the first 2,048 prompt tokens, written to `out_path` (quality A/Bs).
+pub fn logitsDump(gpu: Gpu, model: []const u8, set: []const u8, ids_file: []const u8, out_path: []const u8) !void {
+    const gpa = gpu.gpa;
+    const text = try std.Io.Dir.cwd().readFileAlloc(gpu.io, ids_file, gpa, .limited(1 << 26));
+    defer gpa.free(text);
+    var prompt: std.ArrayList(u32) = .empty;
+    defer prompt.deinit(gpa);
+    var it = std.mem.tokenizeAny(u8, text, ", \n");
+    while (it.next()) |t| try prompt.append(gpa, try std.fmt.parseInt(u32, t, 10));
+    const n = @min(prompt.items.len, 2048);
+    var w = try kolibri1.weights.load(gpa, gpu.io, gpu.d, model, null);
+    defer w.deinit();
+    var k = try kolibri1.kernels.Kernels.load(gpa, gpu.io, gpu.ctx, set);
+    defer k.deinit();
+    var stream = try cuda.Stream.init(gpu.d, false);
+    defer stream.deinit();
+    var m = try kolibri1.forward.Model.init(gpa, gpu.d, stream, &w, 4096, 1, 2048);
+    defer m.deinit();
+    const vocab = w.config.vocab;
+    const rows = try gpa.alloc(usize, n);
+    defer gpa.free(rows);
+    for (rows, 0..) |*r, i| r.* = i;
+    var lg = try cuda.DeviceBuffer.alloc(gpu.d, n * vocab * 4);
+    defer lg.free();
+    const o: kolibri1.kernels.Ops = .{ .k = &k, .s = stream };
+    try m.forward(o, &.{.{ .slot = 0, .p0 = 0, .tokens = prompt.items[0..n] }}, true, rows, lg.ptr);
+    const host = try back(gpu, lg.ptr, n * vocab * 4);
+    defer gpa.free(host);
+    try std.Io.Dir.cwd().writeFile(gpu.io, .{ .sub_path = out_path, .data = host });
+    std.debug.print("RESULT kolibri1 logits: {d} rows x {d} to {s}\n", .{ n, vocab, out_path });
 }
