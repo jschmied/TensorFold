@@ -30,6 +30,7 @@ pub const Model = struct {
     slots: usize,
     ring: usize,
     max_rows: usize,
+    chunks: usize = 0, // partial slots the attention scratch holds
     k: []u64, // per layer: the cache [slots, len, HK, D] bf16 (len: context for full layers, the ring for sliding)
     v: []u64,
     norms: []u64, // per layer: q_norm then k_norm, fp32 [2, D]
@@ -124,6 +125,7 @@ pub const Model = struct {
         const count = c.experts + 1;
         const wide = pairs > grouped.small;
         const chunks = (m.context + tree.max_nodes) / tree.chunk + 2;
+        m.chunks = chunks;
         m.s = .{
             .ids = try m.alloc(r * 4),
             .pos = try m.alloc(r * 4),
@@ -156,7 +158,7 @@ pub const Model = struct {
             .po = try m.alloc(chunks * r * c.heads * dh * 4),
             .pm = try m.alloc(chunks * r * c.heads * 4),
             .pl = try m.alloc(chunks * r * c.heads * 4),
-            .offs = try m.alloc(m.slots * 2 * 8),
+            .offs = try m.alloc(c.layers * m.max_rows * 2 * 8),
             .sel = try m.alloc(r * c.hidden * 2),
         };
     }
@@ -190,13 +192,8 @@ pub const Model = struct {
         try m.upload(s, m.s.ids, std.mem.sliceAsBytes(ids));
         try m.upload(s, m.s.pos, std.mem.sliceAsBytes(pos));
         try m.upload(s, m.s.slot, std.mem.sliceAsBytes(slot));
-        const w = m.w;
         const h = c.heads;
         const hk = c.kv_heads;
-        const dh = c.head_dim;
-        const scale: f32 = @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(dh))));
-        try o.embed(w.embed, m.s.ids, n, c.hidden, m.s.res);
-        try o.rms(m.s.res, w.layers[0].input_norm, m.s.x, n, c.hidden, c.eps);
         // the tree plan for full layers' decode rows: each chain a serial path after its committed keys
         var t: ?kern.Ops.Tree = null;
         var plan_flat: ?[]i32 = null;
@@ -215,14 +212,55 @@ pub const Model = struct {
             const p = try tree.build(gpa, windows, h / hk);
             plan_flat = p.flat;
             try m.upload(s, m.s.flat, std.mem.sliceAsBytes(p.flat));
-            const base = m.s.flat;
-            const rows_at = base;
-            const streams_at = base + p.width * 4;
-            const items_at = streams_at + p.streams * 16;
-            const parents_at = items_at + p.items * 12;
-            t = .{ .rows = rows_at, .streams = streams_at, .items = items_at, .parents = parents_at, .paths = m.s.paths, .depths = m.s.depths, .n_items = p.items, .chunks = p.most, .width = p.width };
+            t = treeAt(m.s.flat, p, m.s.paths, m.s.depths);
             try o.paths(t.?);
+            try m.offsets(s, chains, m.s.offs);
         }
+        // the head over the chosen rows (default: each chain's last)
+        var ends: std.ArrayList(usize) = .empty;
+        defer ends.deinit(gpa);
+        const pick_rows = rows orelse blk: {
+            var e: usize = 0;
+            for (chains) |ch| {
+                e += ch.tokens.len;
+                try ends.append(gpa, e - 1);
+            }
+            break :blk ends.items;
+        };
+        try m.launch(o, n, if (prompt) chains[0] else null, t, m.s.offs, chains.len, pick_rows, out);
+    }
+
+    fn treeAt(base: u64, p: tree.Plan, paths: u64, depths: u64) kern.Ops.Tree {
+        const streams_at = base + p.width * 4;
+        const items_at = streams_at + p.streams * 16;
+        return .{ .rows = base, .streams = streams_at, .items = items_at, .parents = items_at + p.items * 12, .paths = paths, .depths = depths, .n_items = p.items, .chunks = p.most, .width = p.width };
+    }
+
+    /// attention.offsets for every full layer: each chain's key and value cache, bf16 elements from `origin`.
+    fn offsets(m: *Model, s: cuda.Stream, chains: []const Chain, dst: u64) !void {
+        const c = m.c;
+        const per = m.context * c.kv_heads * c.head_dim * 2;
+        const offs = try m.gpa.alloc(i64, c.layers * 2 * chains.len);
+        defer m.gpa.free(offs);
+        for (0..c.layers) |i| for (chains, 0..) |ch, j| {
+            offs[(i * chains.len + j) * 2] = @intCast((m.k[i] + ch.slot * per - m.origin) / 2);
+            offs[(i * chains.len + j) * 2 + 1] = @intCast((m.v[i] + ch.slot * per - m.origin) / 2);
+        };
+        try m.upload(s, dst, std.mem.sliceAsBytes(offs));
+    }
+
+    /// The forward's launches over staged inputs, no host copies (a graph can hold them); `prompt_chain`: a chunk.
+    fn launch(m: *Model, o: kern.Ops, n: usize, prompt_chain: ?Chain, t: ?kern.Ops.Tree, offs: u64, streams: usize, pick_rows: []const usize, out: u64) !void {
+        const c = m.c;
+        const s = o.s;
+        const prompt = prompt_chain != null;
+        const w = m.w;
+        const h = c.heads;
+        const hk = c.kv_heads;
+        const dh = c.head_dim;
+        const scale: f32 = @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(dh))));
+        try o.embed(w.embed, m.s.ids, n, c.hidden, m.s.res);
+        try o.rms(m.s.res, w.layers[0].input_norm, m.s.x, n, c.hidden, c.eps);
         const slots_e = c.top_k + 1;
         const pairs = n * slots_e;
         const count = c.experts + 1;
@@ -235,20 +273,11 @@ pub const Model = struct {
             try o.qkv(.{ .rows = m.s.qkv, .norms = m.norms[i], .cos = m.cos, .sin = m.sin, .pos = m.s.pos, .slots = m.s.slot, .q = m.s.q, .k = m.s.kn, .v = m.s.vn, .kc = m.k[i], .vc = m.v[i], .len = len }, n, h, hk, dh, c.eps, !c.full[i]);
             if (!c.full[i]) {
                 try o.sliding(m.s.q, m.k[i], m.v[i], m.s.att, m.s.pos, m.s.slot, n, h, hk, dh, c.window, m.ring, scale);
-            } else if (prompt) {
+            } else if (prompt_chain) |ch| {
                 const per = m.context * hk * dh * 2;
-                const ch = chains[0];
                 try o.prompt(m.s.q, m.k[i] + ch.slot * per, m.v[i] + ch.slot * per, m.s.att, ch.p0, n, h, hk, scale);
             } else {
-                const per = m.context * hk * dh * 2;
-                const offs = try gpa.alloc(i64, 2 * chains.len);
-                defer gpa.free(offs);
-                for (chains, 0..) |ch, j| {
-                    offs[2 * j] = @intCast((m.k[i] + ch.slot * per - m.origin) / 2);
-                    offs[2 * j + 1] = @intCast((m.v[i] + ch.slot * per - m.origin) / 2);
-                }
-                try m.upload(s, m.s.offs, std.mem.sliceAsBytes(offs));
-                try o.treeAttention(m.s.q, m.s.kn, m.s.vn, m.origin, m.s.offs, t.?, .{ .o = m.s.po, .m = m.s.pm, .l = m.s.pl }, m.s.att, h, hk, dh, scale);
+                try o.treeAttention(m.s.q, m.s.kn, m.s.vn, m.origin, offs + i * streams * 16, t.?, .{ .o = m.s.po, .m = m.s.pm, .l = m.s.pl }, m.s.att, h, hk, dh, scale);
             }
             try o.k.lane.matmul(s, m.s.att, h * dh, n, L.o, m.s.o, m.s.part);
             try o.addRms(m.s.o, m.s.res, L.post_attn_norm, L.pre_moe_norm, m.s.x, n, c.hidden, c.eps);
@@ -269,18 +298,52 @@ pub const Model = struct {
             const after = if (i + 1 < w.layers.len) w.layers[i + 1].input_norm else w.norm;
             try o.addRms(m.s.mo, m.s.res, L.post_moe_norm, after, m.s.x, n, c.hidden, c.eps);
         }
-        // the head over the chosen rows (default: each chain's last)
-        var ends: std.ArrayList(usize) = .empty;
-        defer ends.deinit(gpa);
-        const pick_rows = rows orelse blk: {
-            var e: usize = 0;
-            for (chains) |ch| {
-                e += ch.tokens.len;
-                try ends.append(gpa, e - 1);
-            }
-            break :blk ends.items;
-        };
         for (pick_rows, 0..) |r, j| try m.d.check(m.d.api.cuMemcpyDtoDAsync_v2(m.s.sel + j * c.hidden * 2, m.s.x + r * c.hidden * 2, c.hidden * 2, s.handle), "cuMemcpyDtoDAsync");
         try o.router(m.s.sel, c.hidden, w.head, out, pick_rows.len, c.hidden, c.vocab);
+    }
+
+    /// One stream's one-row decode step as a CUDA graph: a padded plan fixes the grids; a step writes token and row.
+    pub const Decode = struct { exec: cuda.graph.Exec, slot: usize, flat: u64, logits: u64 };
+
+    pub fn captureDecode(m: *Model, o: kern.Ops, slot: usize) !Decode {
+        const c = m.c;
+        const s = o.s;
+        const p = try tree.buildPadded(m.gpa, &.{-1}, m.context, c.heads / c.kv_heads);
+        defer m.gpa.free(p.flat);
+        if (p.most > m.chunks) return error.PartialSlots;
+        const flat = try m.alloc(p.flat.len * 4);
+        try m.upload(s, flat, std.mem.sliceAsBytes(p.flat));
+        const t = treeAt(flat, p, try m.alloc(tree.max_nodes * 4), try m.alloc(4));
+        try o.paths(t); // a single root: its paths never change
+        const offs = try m.alloc(c.layers * 16);
+        try m.offsets(s, &.{.{ .slot = slot, .p0 = 0, .tokens = &.{} }}, offs);
+        const logits = try m.alloc(c.vocab * 4);
+        try s.synchronize();
+        try cuda.graph.beginCapture(s, .thread_local);
+        m.launch(o, 1, null, t, offs, 1, &.{0}, logits) catch |e| {
+            if (cuda.graph.endCapture(s)) |g| {
+                var gg = g;
+                gg.deinit();
+            } else |_| {}
+            return e;
+        };
+        var g = try cuda.graph.endCapture(s);
+        defer g.deinit();
+        return .{ .exec = try g.instantiate(), .slot = slot, .flat = flat, .logits = logits };
+    }
+
+    /// The step: `token` at position `p0` (the cache length before it) through the captured graph.
+    pub fn decode(m: *Model, o: kern.Ops, g: *const Decode, token: u32, p0: usize) !void {
+        const s = o.s;
+        if (p0 + 1 > m.context) return error.PastContext;
+        const ids = [1]i32{@intCast(token)};
+        const pos = [1]i32{@intCast(p0)};
+        const slot = [1]i32{@intCast(g.slot)};
+        try m.upload(s, m.s.ids, std.mem.sliceAsBytes(&ids));
+        try m.upload(s, m.s.pos, std.mem.sliceAsBytes(&pos));
+        try m.upload(s, m.s.slot, std.mem.sliceAsBytes(&slot));
+        const r = tree.row(1, p0);
+        try m.upload(s, g.flat + 4, std.mem.sliceAsBytes(&r));
+        try g.exec.launchOn(s);
     }
 };

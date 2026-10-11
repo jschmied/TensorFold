@@ -84,3 +84,41 @@ test "groups fold only when they fill the GPU" {
     try std.testing.expectEqual(@as(usize, 2), groups(4096, 32));
     try std.testing.expectEqual(@as(usize, 2 + 1), slots(4096, 32)); // 2 groups, then chunk 8 holds keys 4096..4127
 }
+
+/// padded_host: every group and chunk below `context` (the kernels skip unfilled ones); `row` is rewritten a replay.
+pub fn buildPadded(gpa: std.mem.Allocator, parents: []const i32, context: usize, heads_a_kv: usize) !Plan {
+    const w = parents.len;
+    const one = try build(gpa, &.{.{ .parents = parents, .committed = 0 }}, heads_a_kv);
+    defer gpa.free(one.flat);
+    var items: std.ArrayList(i32) = .empty;
+    defer items.deinit(gpa);
+    const codes = context / span + context / chunk;
+    for (0..codes) |ci| {
+        const c: i32 = if (ci < context / span) @intCast(ci) else -1 - @as(i32, @intCast(ci - context / span));
+        var first: usize = 0;
+        while (first < w * heads_a_kv) : (first += query_tile) for ([_]i32{ 0, @intCast(first), c }) |v| try items.append(gpa, v);
+    }
+    const head = w + 4; // rows, then the stream row
+    const flat = try gpa.alloc(i32, head + items.items.len + w);
+    @memcpy(flat[0..head], one.flat[0..head]);
+    @memcpy(flat[head..][0..items.items.len], items.items);
+    @memcpy(flat[head + items.items.len ..], one.flat[one.flat.len - w ..]);
+    return .{ .flat = flat, .width = w, .streams = 1, .items = items.items.len / 3, .most = (context + w + chunk - 1) / chunk };
+}
+
+/// The stream row a padded plan's replay writes: first row, rows, committed keys, partial slots.
+pub fn row(w: usize, committed: usize) [4]i32 {
+    return .{ 0, @intCast(w), @intCast(committed), @intCast(slots(committed, w)) };
+}
+
+test "a padded plan lists every code below the context, as padded_host does" {
+    const gpa = std.testing.allocator;
+    const p = try buildPadded(gpa, &.{-1}, 4096, 12);
+    defer gpa.free(p.flat);
+    // rows [0]; stream row (0, 1, 0, 1); codes 0, 1 (groups), then -1..-8 (chunks), each at first 0; parents [-1]
+    try std.testing.expectEqual(@as(usize, 10), p.items);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 0, 1, 0, 1 }, p.flat[0..5]);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 0, 0, 0, 0, 1, 0, 0, -1 }, p.flat[5..14]);
+    try std.testing.expectEqual(@as(i32, -1), p.flat[p.flat.len - 1]);
+    try std.testing.expectEqual(@as(usize, 9), p.most);
+}
