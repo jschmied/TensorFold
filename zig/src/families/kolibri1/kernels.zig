@@ -142,8 +142,8 @@ pub const Ops = struct {
     }
 
     /// attention.sliding: a program a (row, KV head) over the ring's last `window` keys.
-    pub fn sliding(o: Ops, q: u64, kc: u64, vc: u64, out: u64, pos: u64, slots: u64, w: usize, h: usize, hk: usize, d: usize, window: usize, ring: usize, scale: f32) !void {
-        try o.k.win.decode(o.s, q, kc, vc, out, pos, slots, .{ .h = h, .hk = hk, .d = d, .win = window, .ring = ring, .scale = scale }, w);
+    pub fn sliding(o: Ops, q: u64, kc: u64, vc: u64, out: u64, pos: u64, slots: u64, w: usize, h: usize, hk: usize, d: usize, window: usize, ring: usize, scale: f32, scratch: u64) !void {
+        try o.k.win.decode(o.s, q, kc, vc, out, pos, slots, .{ .h = h, .hk = hk, .d = d, .win = window, .ring = ring, .scale = scale }, scratch, w);
     }
 
     /// A prompt chunk's sliding rows: one stream's ring (kc, vc at its slot), rows at positions p0, p0 + 1, ...

@@ -40,7 +40,7 @@ pub const Model = struct {
     s: Scratch,
     buffers: std.ArrayList(DeviceBuffer) = .empty,
 
-    const Scratch = struct { ids: u64, pos: u64, slot: u64, res: u64, x: u64, qkv: u64, q: u64, kn: u64, vn: u64, att: u64, o: u64, part: u64, logits_e: u64, pick: u64, wts: u64, plan: grouped.Plan, act: u64, y: u64, mo: u64, flat: u64, paths: u64, depths: u64, po: u64, pm: u64, pl: u64, offs: u64, sel: u64 };
+    const Scratch = struct { ids: u64, pos: u64, slot: u64, res: u64, x: u64, qkv: u64, q: u64, kn: u64, vn: u64, att: u64, o: u64, part: u64, logits_e: u64, pick: u64, wts: u64, plan: grouped.Plan, act: u64, y: u64, mo: u64, flat: u64, paths: u64, depths: u64, po: u64, pm: u64, pl: u64, offs: u64, sel: u64, win: u64 };
 
     fn alloc(m: *Model, bytes: usize) !u64 {
         const b = try DeviceBuffer.alloc(m.d, @max(bytes, 256));
@@ -160,6 +160,7 @@ pub const Model = struct {
             .pl = try m.alloc(chunks * r * c.heads * 4),
             .offs = try m.alloc(c.layers * m.max_rows * 2 * 8),
             .sel = try m.alloc(r * c.hidden * 2),
+            .win = try m.alloc(cuda.window_attention.WindowAttention.scratchBytes(.{ .h = c.heads, .hk = c.kv_heads, .d = c.head_dim, .win = c.window, .ring = m.ring, .scale = 1 }, r)),
         };
     }
 
@@ -275,7 +276,7 @@ pub const Model = struct {
                 if (prompt_chain) |ch| {
                     const per = m.ring * hk * dh * 2; // a stream's ring rows
                     try o.slidingPrompt(m.s.q, m.k[i] + ch.slot * per, m.v[i] + ch.slot * per, m.s.att, ch.p0, n, h, hk, dh, c.window, m.ring, scale);
-                } else try o.sliding(m.s.q, m.k[i], m.v[i], m.s.att, m.s.pos, m.s.slot, n, h, hk, dh, c.window, m.ring, scale);
+                } else try o.sliding(m.s.q, m.k[i], m.v[i], m.s.att, m.s.pos, m.s.slot, n, h, hk, dh, c.window, m.ring, scale, m.s.win);
             } else if (prompt_chain) |ch| {
                 const per = m.context * hk * dh * 2;
                 try o.prompt(m.s.q, m.k[i] + ch.slot * per, m.v[i] + ch.slot * per, m.s.att, ch.p0, n, h, hk, scale);
