@@ -26,6 +26,7 @@ pub const Kernels = struct {
     draws: cuda.sample.Draws,
     norms: cuda.norms.Norms,
     moe: cuda.moe_glue.MoeGlue,
+    dense: cuda.dense_rows.DenseRows,
 
     /// The built-in modules plus the captured Triton set in `set_dir` (tools: capture_kolibri.py, aot_pack.py).
     pub fn load(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, set_dir: []const u8) !Kernels {
@@ -56,6 +57,8 @@ pub const Kernels = struct {
         errdefer k.norms.unload();
         k.moe = try cuda.moe_glue.MoeGlue.load(d);
         errdefer k.moe.unload();
+        k.dense = try cuda.dense_rows.DenseRows.load(d);
+        errdefer k.dense.unload();
         k.set = try aot.Set.load(gpa, io, d, ctx.device, set_dir);
         return k;
     }
@@ -64,6 +67,7 @@ pub const Kernels = struct {
         k.set.deinit();
         k.norms.unload();
         k.moe.unload();
+        k.dense.unload();
         k.fp8x.unload();
         k.lane.unload();
         for (&k.mods) |*m| m.unload();
@@ -168,10 +172,7 @@ pub const Ops = struct {
 
     /// cuda.moe.router: x [m, D] bf16 times rows [ne, D] bf16 -> [m, ne] fp32 (the MoE router and the head).
     pub fn router(o: Ops, x: u64, x_stride: usize, rows: u64, out: u64, m: usize, d: usize, ne: usize) !void {
-        const bm: usize = if (m <= 16) 16 else if (m <= 32) 32 else if (m <= 64) 64 else 128;
-        const be: usize = if (bm == 16) 32 else 64;
-        const bk: usize = if (bm == 16) 256 else 64;
-        try o.triton("_router", .{ (m + bm - 1) / bm, (ne + be - 1) / be, 1 }, &.{ aot.ptr("X", "*bf16", x), aot.ptr("W", "*bf16", rows), aot.ptr("OUT", "*fp32", out), aot.int("M", int(m)), aot.int("x_stride", int(x_stride)) }, &.{ aot.ci("D", @intCast(d)), aot.ci("NE", @intCast(ne)), aot.ci("BM", @intCast(bm)), aot.ci("BLOCK_E", @intCast(be)), aot.ci("BK", @intCast(bk)) });
+        try o.k.dense.rows(o.s, x, x_stride, rows, out, ne, m, ne, d);
     }
 
     /// moe._topk: each row's top-k experts by sigmoid + bias, weights, then the shared expert's slot.
