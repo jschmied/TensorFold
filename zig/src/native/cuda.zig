@@ -4,13 +4,14 @@ const cuda = @import("cuda");
 const api = @import("engine_api");
 const lanes = @import("lanes");
 const nemotron = @import("nemotron");
+const kolibri1 = @import("kolibri1");
 const Allocator = std.mem.Allocator;
 const budget = @import("cuda_memory.zig");
 const nemotron_slide = @import("nemotron_slide.zig");
 const Pool = budget.Pool;
 
 /// CUDA families provide metadata, open their lane backend and explain their refusals.
-const registry = .{nemotron.native};
+const registry = .{ nemotron.native, kolibri1.native };
 
 /// Nemotron's prompt-cache copies. A file-level value so the store's pointer stays valid for the process.
 const nemotron_snaps: api.prompt_cache.Snapshots.VTable = .{
@@ -437,13 +438,15 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     const h = try gpa.create(Host);
     errdefer gpa.destroy(h);
     h.* = .{ .gpa = gpa, .gpu = g, .family = loaded.ctx, .release = loaded.deinit, .inner = loaded.backend, .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined, .lone = loaded.lone };
-    const cache = budget.cacheBytes(o.prompt_cache_gib, room, loaded.stream_bytes * (streams -| free));
+    // a family without prompt-state copies (no `target`) serves with the cache off
+    const keeps = @hasField(@TypeOf(loaded), "target");
+    const cache = if (keeps) budget.cacheBytes(o.prompt_cache_gib, room, loaded.stream_bytes * (streams -| free)) else 0;
     h.startup = try std.fmt.allocPrint(gpa, "CUDA sm_{d} device {d} ({s}{s}): model {d:.2} GiB{s}; {d} stream{s} at once, {d:.2} GiB each at a {d}-token window, of {d:.1} GiB left after a {d:.1} GiB reserve; prompts in {d}-row chunks{s}{s}; {s}", .{
         capability,                                                                                                        device,                                                                                                       name, if (after.unified) ", memory shared with the host" else "", toGib(model), if (loaded.learn_bytes > 0) try std.fmt.allocPrint(a, " and {d:.2} GiB kept for --slide's trainer", .{toGib(loaded.learn_bytes)}) else "", streams, if (streams == 1) "" else "s", toGib(loaded.stream_bytes), window, toGib(room), toGib(after.reserve), F.prompt_rows, if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
         if (cache > 0) try std.fmt.allocPrint(a, ", a {d:.1} GiB prompt cache", .{toGib(cache)}) else ", no prompt cache", if (kernels) |dir| try std.fmt.allocPrint(a, "glue kernels captured at {s}", .{dir}) else "own glue kernels",
     });
     errdefer gpa.free(h.startup);
-    if (cache > 0) {
+    if (keeps and cache > 0) {
         const pc = api.prompt_cache;
         const store = try gpa.create(pc.Store);
         // states kept and resumed on the family's grid, where a cache-off pass cuts; the head reads one token on
@@ -454,7 +457,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         store.deinit();
         gpa.destroy(store);
     };
-    if (loaded.learns != null) {
+    if (@hasField(@TypeOf(loaded), "learns")) if (loaded.learns != null) {
         const Slide = nemotron_slide.Adapter(F.slide);
         h.dir = try gpa.dupe(u8, o.dir);
         const s = try gpa.create(Slide);
@@ -468,7 +471,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
             }
         }.f;
         h.learn = s.hook();
-    }
+    };
     errdefer if (h.slide) |s| {
         h.slide_free.?(gpa, s);
         gpa.free(h.dir);

@@ -8,6 +8,7 @@ pub const tree = @import("tree.zig");
 pub const kernels = @import("kernels.zig");
 pub const forward = @import("forward.zig");
 pub const backend = @import("backend.zig");
+pub const native = @import("native.zig");
 
 test {
     _ = @import("config.zig");
@@ -18,4 +19,5 @@ test {
     _ = @import("kernels.zig");
     _ = @import("forward.zig");
     _ = @import("backend.zig");
+    _ = @import("native.zig");
 }
