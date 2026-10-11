@@ -4,7 +4,6 @@ const cuda = @import("cuda");
 const tree = @import("tree.zig");
 
 const aot = cuda.aot;
-const fp8 = cuda.fp8;
 const grouped = cuda.grouped;
 const experts = cuda.experts;
 
@@ -16,7 +15,7 @@ const merge_columns = 64; // output columns a merge program folds
 
 pub const Kernels = struct {
     set: aot.Set,
-    lane: fp8.Lane,
+    lane: cuda.qmmf.Lane,
     fp8x: experts.Fp8Experts,
     router: grouped.Router,
     mods: [3]cuda.Module, // experts (the plan kernels), prefill_attention, kolibri_ops
@@ -40,7 +39,7 @@ pub const Kernels = struct {
         try k.pattn.allowDynamicShared(pattn_smem);
         k.embed = try k.mods[2].function("tf_kolibri_embed");
         const cap = try ctx.capability();
-        k.lane = try fp8.Lane.load(d, cap / 10);
+        k.lane = try cuda.qmmf.Lane.load(d, cap / 10);
         errdefer k.lane.unload();
         const sms: usize = @intCast(try ctx.attribute(.multiprocessor_count));
         k.fp8x = try experts.Fp8Experts.load(d, sms);

@@ -11,10 +11,10 @@ const fp8 = cuda.fp8;
 
 pub const Layer = struct {
     input_norm: u64, // fp32 [D]
-    qkv: fp8.Weight,
+    qkv: cuda.qmmf.Weight,
     q_norm: u64, // fp32 [head_dim]
     k_norm: u64,
-    o: fp8.Weight,
+    o: cuda.qmmf.Weight,
     post_attn_norm: u64,
     pre_moe_norm: u64,
     router: u64, // bf16 [E, D]
@@ -51,8 +51,8 @@ pub const Weights = struct {
         return w.upload(d, std.mem.sliceAsBytes(v));
     }
 
-    fn linear(w: *Weights, d: *const cuda.Driver, l: pack.Linear) !fp8.Weight {
-        return .{ .codes = try w.upload(d, l.w8), .scales = try w.upload(d, std.mem.sliceAsBytes(l.bs)), .n = @intCast(l.n), .k = @intCast(l.k), .npad = @intCast(fp8.padded(l.n)) };
+    fn linear(w: *Weights, d: *const cuda.Driver, l: pack.Linear) !cuda.qmmf.Weight {
+        return fp8.weight(try w.upload(d, l.w8), try w.upload(d, std.mem.sliceAsBytes(l.bs)), l.n, l.k);
     }
 };
 
