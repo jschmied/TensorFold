@@ -25,6 +25,7 @@ pub const Kernels = struct {
     bf16_fn: cuda.Function,
     draws: cuda.sample.Draws,
     norms: cuda.norms.Norms,
+    moe: cuda.moe_glue.MoeGlue,
 
     /// The built-in modules plus the captured Triton set in `set_dir` (tools: capture_kolibri.py, aot_pack.py).
     pub fn load(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, set_dir: []const u8) !Kernels {
@@ -53,6 +54,8 @@ pub const Kernels = struct {
         errdefer k.fp8x.unload();
         k.norms = try cuda.norms.Norms.load(d);
         errdefer k.norms.unload();
+        k.moe = try cuda.moe_glue.MoeGlue.load(d);
+        errdefer k.moe.unload();
         k.set = try aot.Set.load(gpa, io, d, ctx.device, set_dir);
         return k;
     }
@@ -60,6 +63,7 @@ pub const Kernels = struct {
     pub fn deinit(k: *Kernels) void {
         k.set.deinit();
         k.norms.unload();
+        k.moe.unload();
         k.fp8x.unload();
         k.lane.unload();
         for (&k.mods) |*m| m.unload();
@@ -172,11 +176,11 @@ pub const Ops = struct {
 
     /// moe._topk: each row's top-k experts by sigmoid + bias, weights, then the shared expert's slot.
     pub fn topk(o: Ops, logits: u64, bias: u64, pick: u64, wts: u64, rows: usize, ne: usize, k: usize) !void {
-        try o.triton("_topk", .{ rows, 1, 1 }, &.{ aot.ptr("L", "*fp32", logits), aot.ptr("BIAS", "*fp32", bias), aot.ptr("PICK", "*i32", pick), aot.ptr("WTS", "*fp32", wts) }, &.{ aot.ci("NE", @intCast(ne)), aot.ci("TOPK", @intCast(k)), aot.ci("SLOTS", @intCast(k + 1)), aot.ci("BLOCK", @intCast(std.math.ceilPowerOfTwo(usize, ne) catch unreachable)), aot.ci("SLOTP", @intCast(std.math.ceilPowerOfTwo(usize, k + 1) catch unreachable)) });
+        try o.k.moe.topk(o.s, logits, bias, .{ .experts = ne, .topk = k, .shared = true }, pick, wts, rows);
     }
 
     /// cuda.moe.combine: y [R, S, D] (fp32 decode, bf16 prompt) weighted by wts [R, S] -> [R, D] bf16.
     pub fn combine(o: Ops, y: u64, y_bf16: bool, wts: u64, out: u64, rows: usize, s: usize, d: usize) !void {
-        try o.triton("_combine", .{ rows, (d + 511) / 512, 1 }, &.{ aot.ptr("Y", if (y_bf16) "*bf16" else "*fp32", y), aot.ptr("W", "*fp32", wts), aot.ptr("OUT", "*bf16", out) }, &.{ aot.ci("S", @intCast(s)), aot.ci("D", @intCast(d)), aot.ci("BLOCK", 512) });
+        try o.k.moe.combine(o.s, y, if (y_bf16) .bf16 else .f32, wts, out, .bf16, rows, s, d);
     }
 };
