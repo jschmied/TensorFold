@@ -49,7 +49,7 @@ const CallJson = struct {
 const CallsJson = struct { context: usize, slots: usize, calls: []const CallJson };
 
 /// The Python engine's forwards replayed in order (capture_kolibri.py); `set` is that run's captured Triton set.
-pub fn forward(gpu: Gpu, model: []const u8, capture: []const u8, set: []const u8) !void {
+pub fn forward(gpu: Gpu, model: []const u8, capture: []const u8) !void {
     const gpa = gpu.gpa;
     const path = try std.fmt.allocPrint(gpa, "{s}/calls.json", .{capture});
     defer gpa.free(path);
@@ -60,7 +60,7 @@ pub fn forward(gpu: Gpu, model: []const u8, capture: []const u8, set: []const u8
     const calls = parsed.value;
     var w = try kolibri1.weights.load(gpa, gpu.io, gpu.d, model, null);
     defer w.deinit();
-    var k = try kolibri1.kernels.Kernels.load(gpa, gpu.io, gpu.ctx, set);
+    var k = try kolibri1.kernels.Kernels.load(gpu.ctx);
     defer k.deinit();
     var stream = try cuda.Stream.init(gpu.d, false);
     defer stream.deinit();
@@ -129,7 +129,7 @@ pub fn forward(gpu: Gpu, model: []const u8, capture: []const u8, set: []const u8
 }
 
 /// Greedy on the forward: a prompt (ids) prefilled, then `count` tokens by the fp32 argmax (torch's), and the rate.
-pub fn generate(gpu: Gpu, model: []const u8, set: []const u8, ids_file: []const u8, count_text: []const u8) !void {
+pub fn generate(gpu: Gpu, model: []const u8, ids_file: []const u8, count_text: []const u8) !void {
     const gpa = gpu.gpa;
     const count = try std.fmt.parseInt(usize, count_text, 10);
     const text = try std.Io.Dir.cwd().readFileAlloc(gpu.io, ids_file, gpa, .limited(1 << 26));
@@ -140,7 +140,7 @@ pub fn generate(gpu: Gpu, model: []const u8, set: []const u8, ids_file: []const 
     while (it.next()) |t| try prompt.append(gpa, try std.fmt.parseInt(u32, t, 10));
     var w = try kolibri1.weights.load(gpa, gpu.io, gpu.d, model, null);
     defer w.deinit();
-    var k = try kolibri1.kernels.Kernels.load(gpa, gpu.io, gpu.ctx, set);
+    var k = try kolibri1.kernels.Kernels.load(gpu.ctx);
     defer k.deinit();
     var stream = try cuda.Stream.init(gpu.d, false);
     defer stream.deinit();
@@ -186,7 +186,7 @@ pub fn generate(gpu: Gpu, model: []const u8, set: []const u8, ids_file: []const 
 }
 
 /// The same through captureDecode's graph: each step a token, a position and the plan's stream row, then the replay.
-pub fn generateGraph(gpu: Gpu, model: []const u8, set: []const u8, ids_file: []const u8, count_text: []const u8) !void {
+pub fn generateGraph(gpu: Gpu, model: []const u8, ids_file: []const u8, count_text: []const u8) !void {
     const gpa = gpu.gpa;
     const count = try std.fmt.parseInt(usize, count_text, 10);
     const text = try std.Io.Dir.cwd().readFileAlloc(gpu.io, ids_file, gpa, .limited(1 << 26));
@@ -197,7 +197,7 @@ pub fn generateGraph(gpu: Gpu, model: []const u8, set: []const u8, ids_file: []c
     while (it.next()) |t| try prompt.append(gpa, try std.fmt.parseInt(u32, t, 10));
     var w = try kolibri1.weights.load(gpa, gpu.io, gpu.d, model, null);
     defer w.deinit();
-    var k = try kolibri1.kernels.Kernels.load(gpa, gpu.io, gpu.ctx, set);
+    var k = try kolibri1.kernels.Kernels.load(gpu.ctx);
     defer k.deinit();
     var stream = try cuda.Stream.init(gpu.d, false);
     defer stream.deinit();
@@ -287,7 +287,7 @@ fn freeRuns(gpa: std.mem.Allocator, runs: [][]u32) void {
 }
 
 /// The lane engine on Kolibri's backend: drafted == plain (greedy and sampled), two streams together == each alone.
-pub fn lanesCheck(gpu: Gpu, model: []const u8, set: []const u8, ids_file: []const u8, count_text: []const u8) !void {
+pub fn lanesCheck(gpu: Gpu, model: []const u8, ids_file: []const u8, count_text: []const u8) !void {
     const gpa = gpu.gpa;
     const count = try std.fmt.parseInt(u32, count_text, 10);
     const text = try std.Io.Dir.cwd().readFileAlloc(gpu.io, ids_file, gpa, .limited(1 << 26));
@@ -298,7 +298,7 @@ pub fn lanesCheck(gpu: Gpu, model: []const u8, set: []const u8, ids_file: []cons
     while (it.next()) |t| try prompt.append(gpa, try std.fmt.parseInt(u32, t, 10));
     var w = try kolibri1.weights.load(gpa, gpu.io, gpu.d, model, null);
     defer w.deinit();
-    var k = try kolibri1.kernels.Kernels.load(gpa, gpu.io, gpu.ctx, set);
+    var k = try kolibri1.kernels.Kernels.load(gpu.ctx);
     defer k.deinit();
     var stream = try cuda.Stream.init(gpu.d, false);
     defer stream.deinit();
@@ -336,7 +336,7 @@ pub fn lanesCheck(gpu: Gpu, model: []const u8, set: []const u8, ids_file: []cons
 }
 
 /// Teacher-forced fp32 logits of every row of the first 2,048 prompt tokens, written to `out_path` (quality A/Bs).
-pub fn logitsDump(gpu: Gpu, model: []const u8, set: []const u8, ids_file: []const u8, out_path: []const u8) !void {
+pub fn logitsDump(gpu: Gpu, model: []const u8, ids_file: []const u8, out_path: []const u8) !void {
     const gpa = gpu.gpa;
     const text = try std.Io.Dir.cwd().readFileAlloc(gpu.io, ids_file, gpa, .limited(1 << 26));
     defer gpa.free(text);
@@ -347,7 +347,7 @@ pub fn logitsDump(gpu: Gpu, model: []const u8, set: []const u8, ids_file: []cons
     const n = @min(prompt.items.len, 2048);
     var w = try kolibri1.weights.load(gpa, gpu.io, gpu.d, model, null);
     defer w.deinit();
-    var k = try kolibri1.kernels.Kernels.load(gpa, gpu.io, gpu.ctx, set);
+    var k = try kolibri1.kernels.Kernels.load(gpu.ctx);
     defer k.deinit();
     var stream = try cuda.Stream.init(gpu.d, false);
     defer stream.deinit();

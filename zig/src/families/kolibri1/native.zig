@@ -44,20 +44,19 @@ fn streams() usize {
     return std.fmt.parseInt(usize, std.mem.span(v), 10) catch 4;
 }
 
-/// The checkpoint, its captured Triton set (TENSORFOLD_KOLIBRI_KERNELS, until the glue is our own) and caches.
+/// The checkpoint, our own kernels and caches.
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
     _ = kernels; // the registry's set is Nemotron's glue; Kolibri names its own
-    const set = std.mem.span(std.c.getenv("TENSORFOLD_KOLIBRI_KERNELS") orelse return error.KolibriNeedsCapturedKernels);
     const own = try gpa.create(Owned);
     errdefer gpa.destroy(own);
     own.gpa = gpa;
     own.w = try weights.load(gpa, io, ctx.d, dir, null);
     errdefer own.w.deinit();
-    own.k = try kern.Kernels.load(gpa, io, ctx, set);
+    own.k = try kern.Kernels.load(ctx);
     errdefer own.k.deinit();
     own.s = try cuda.Stream.init(ctx.d, false);
     errdefer own.s.deinit();
-    const context = (o.context + 1023) / 1024 * 1024; // the captured set's cache lengths are whole 1,024s
+    const context = (o.context + 1023) / 1024 * 1024; // whole 1,024s
     const n = streams();
     own.m = try fwd.Model.init(gpa, ctx.d, own.s, &own.w, context, n, be.prompt_rows);
     errdefer own.m.deinit();

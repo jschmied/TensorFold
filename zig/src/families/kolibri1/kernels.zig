@@ -3,7 +3,6 @@ const std = @import("std");
 const cuda = @import("cuda");
 const tree = @import("tree.zig");
 
-const aot = cuda.aot;
 const grouped = cuda.grouped;
 const experts = cuda.experts;
 
@@ -14,7 +13,6 @@ const pattn_heads = 4; // query heads a block
 const merge_columns = 64; // output columns a merge program folds
 
 pub const Kernels = struct {
-    set: aot.Set,
     lane: cuda.qmmf.Lane,
     fp8x: experts.Fp8Experts,
     router: grouped.Router,
@@ -29,9 +27,10 @@ pub const Kernels = struct {
     dense: cuda.dense_rows.DenseRows,
     qk: cuda.qk_rows.QkRows,
     win: cuda.window_attention.WindowAttention,
+    tree: cuda.tree_attention.TreeAttention,
 
-    /// The built-in modules plus the captured Triton set in `set_dir` (tools: capture_kolibri.py, aot_pack.py).
-    pub fn load(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, set_dir: []const u8) !Kernels {
+    /// The built-in modules: every kernel Kolibri 1 launches is our own CUDA, nothing recorded from Python.
+    pub fn load(ctx: *const cuda.Context) !Kernels {
         const d = ctx.d;
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
         var k: Kernels = undefined;
@@ -65,17 +64,18 @@ pub const Kernels = struct {
         errdefer k.qk.unload();
         k.win = try cuda.window_attention.WindowAttention.load(d);
         errdefer k.win.unload();
-        k.set = try aot.Set.load(gpa, io, d, ctx.device, set_dir);
+        k.tree = try cuda.tree_attention.TreeAttention.load(d);
+        errdefer k.tree.unload();
         return k;
     }
 
     pub fn deinit(k: *Kernels) void {
-        k.set.deinit();
         k.norms.unload();
         k.moe.unload();
         k.dense.unload();
         k.qk.unload();
         k.win.unload();
+        k.tree.unload();
         k.fp8x.unload();
         k.lane.unload();
         for (&k.mods) |*m| m.unload();
@@ -90,10 +90,6 @@ fn int(x: usize) i32 {
 pub const Ops = struct {
     k: *const Kernels,
     s: cuda.Stream,
-
-    fn triton(o: Ops, f: []const u8, grid: [3]usize, args: []const aot.Arg, consts: []const aot.Const) !void {
-        try o.k.set.run(o.s, f, .{ @intCast(grid[0]), @intCast(grid[1]), @intCast(grid[2]) }, args, consts);
-    }
 
     /// weights.embed[ids].float(): the fp32 residual of `rows` tokens.
     pub fn embed(o: Ops, table: u64, ids: u64, rows: usize, d: usize, out: u64) !void {
@@ -168,20 +164,15 @@ pub const Ops = struct {
 
     /// attention.from_packed's paths: each window row's ancestors.
     pub fn paths(o: Ops, t: Tree) !void {
-        try o.triton("_paths", .{ t.width, 1, 1 }, &.{ aot.ptr("PARENTS", "*i32", t.parents), aot.ptr("PATHS", "*i32", t.paths), aot.ptr("DEPTHS", "*i32", t.depths) }, &.{aot.ci("MAXD", tree.max_nodes)});
+        try o.k.tree.paths(o.s, t.parents, t.paths, t.depths, t.width);
     }
 
-    pub const Partials = struct { o: u64, m: u64, l: u64 };
-
-    /// attention.attention: committed keys by item (_shared), each row's own path (_tail), then the merge.
-    pub fn treeAttention(o: Ops, q: u64, kn: u64, vn: u64, origin: u64, offs: u64, t: Tree, p: Partials, out: u64, h: usize, hk: usize, d: usize, scale: f32) !void {
-        const g = h / hk;
-        const w = t.width;
-        const cs = [_]aot.Const{ aot.ci("H", @intCast(h)), aot.ci("HK", @intCast(hk)), aot.ci("D", @intCast(d)), aot.ci("G", @intCast(g)), aot.ci("CH", tree.chunk), aot.cf("SCALE", scale), aot.ci("GR", tree.group) };
-        if (t.n_items > 0) try o.triton("_shared", .{ t.n_items * hk, 1, 1 }, &.{ aot.ptr("Q", "*bf16", q), aot.ptr("KC", "*bf16", origin), aot.ptr("VC", "*bf16", origin), aot.ptr("OFF", "*i64", offs), aot.ptr("STREAM", "*i32", t.streams), aot.ptr("ITEMS", "*i32", t.items), aot.ptr("PO", "*fp32", p.o), aot.ptr("PM", "*fp32", p.m), aot.ptr("PL", "*fp32", p.l), aot.int("W", int(w)) }, &cs);
-        const tails = 1 + (tree.max_nodes + tree.chunk - 1) / tree.chunk;
-        try o.triton("_tail", .{ w, hk, tails }, &.{ aot.ptr("Q", "*bf16", q), aot.ptr("KN", "*bf16", kn), aot.ptr("VN", "*bf16", vn), aot.ptr("KC", "*bf16", origin), aot.ptr("VC", "*bf16", origin), aot.ptr("OFF", "*i64", offs), aot.ptr("STREAM", "*i32", t.streams), aot.ptr("ROWS", "*i32", t.rows), aot.ptr("PATHS", "*i32", t.paths), aot.ptr("DEPTHS", "*i32", t.depths), aot.ptr("PO", "*fp32", p.o), aot.ptr("PM", "*fp32", p.m), aot.ptr("PL", "*fp32", p.l), aot.int("W", int(w)) }, &(cs ++ [_]aot.Const{aot.ci("MAXD", tree.max_nodes)}));
-        try o.triton("_merge", .{ w, hk, d / merge_columns }, &.{ aot.ptr("PO", "*fp32", p.o), aot.ptr("PM", "*fp32", p.m), aot.ptr("PL", "*fp32", p.l), aot.ptr("OUT", "*bf16", out), aot.ptr("STREAM", "*i32", t.streams), aot.ptr("ROWS", "*i32", t.rows), aot.int("W", int(w)) }, &.{ aot.ci("H", @intCast(h)), aot.ci("D", @intCast(d)), aot.ci("G", @intCast(g)), aot.ci("DS", merge_columns), aot.ci("CH", tree.chunk), aot.ci("GR", tree.group) });
+    /// cuda/tree_attention: committed keys, then each row's path; `scratch` holds scratchBytes(rows, hk, ng).
+    pub fn treeAttention(o: Ops, q: u64, kn: u64, vn: u64, origin: u64, offs: u64, t: Tree, scratch: u64, rows: usize, ng: usize, out: u64, h: usize, hk: usize, d: usize, scale: f32) !void {
+        if (d != 128) return error.TreeHeadDim;
+        if (t.width > rows) return error.TreeRowsPastScratch;
+        const tr: cuda.tree_attention.Rows = .{ .row_stream = t.rows, .streams = t.streams, .offs = offs, .origin = origin, .paths = t.paths, .depths = t.depths };
+        try o.k.tree.run(o.s, q, kn, vn, tr, cuda.tree_attention.TreeAttention.scratch(scratch, rows, hk, ng), out, t.width, h, hk, ng, scale);
     }
 
     /// cuda.moe.router: x [m, D] bf16 times rows [ne, D] bf16 -> [m, ne] fp32 (the MoE router and the head).

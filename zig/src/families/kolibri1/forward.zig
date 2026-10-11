@@ -40,7 +40,7 @@ pub const Model = struct {
     s: Scratch,
     buffers: std.ArrayList(DeviceBuffer) = .empty,
 
-    const Scratch = struct { ids: u64, pos: u64, slot: u64, res: u64, x: u64, qkv: u64, q: u64, kn: u64, vn: u64, att: u64, o: u64, part: u64, logits_e: u64, pick: u64, wts: u64, plan: grouped.Plan, act: u64, y: u64, mo: u64, flat: u64, paths: u64, depths: u64, po: u64, pm: u64, pl: u64, offs: u64, sel: u64, win: u64 };
+    const Scratch = struct { ids: u64, pos: u64, slot: u64, res: u64, x: u64, qkv: u64, q: u64, kn: u64, vn: u64, att: u64, o: u64, part: u64, logits_e: u64, pick: u64, wts: u64, plan: grouped.Plan, act: u64, y: u64, mo: u64, flat: u64, paths: u64, depths: u64, offs: u64, sel: u64, win: u64, tree: u64 };
 
     fn alloc(m: *Model, bytes: usize) !u64 {
         const b = try DeviceBuffer.alloc(m.d, @max(bytes, 256));
@@ -155,11 +155,9 @@ pub const Model = struct {
             .flat = try m.alloc((r * 2 + m.slots * 4 + 3 * r * c.heads / c.kv_heads * chunks) * 4 + 4096),
             .paths = try m.alloc(r * tree.max_nodes * 4),
             .depths = try m.alloc(r * 4),
-            .po = try m.alloc(chunks * r * c.heads * dh * 4),
-            .pm = try m.alloc(chunks * r * c.heads * 4),
-            .pl = try m.alloc(chunks * r * c.heads * 4),
             .offs = try m.alloc(c.layers * m.max_rows * 2 * 8),
             .sel = try m.alloc(r * c.hidden * 2),
+            .tree = try m.alloc(cuda.tree_attention.TreeAttention.scratchBytes(treeRows(r), c.kv_heads, m.treeGroups())),
             .win = try m.alloc(cuda.window_attention.WindowAttention.scratchBytes(.{ .h = c.heads, .hk = c.kv_heads, .d = c.head_dim, .win = c.window, .ring = m.ring, .scale = 1 }, r)),
         };
     }
@@ -231,6 +229,16 @@ pub const Model = struct {
         try m.launch(o, n, if (prompt) chains[0] else null, t, m.s.offs, chains.len, pick_rows, out);
     }
 
+    /// Rows a tree call takes (decode and verify windows; prompt chunks run the prompt kernels).
+    fn treeRows(max_rows: usize) usize {
+        return @min(max_rows, 256);
+    }
+
+    /// Key groups a row can need: the context and a full window (a graph's padded plan holds them all).
+    fn treeGroups(m: *const Model) usize {
+        return cuda.tree_attention.TreeAttention.groups(m.context + tree.max_nodes);
+    }
+
     fn treeAt(base: u64, p: tree.Plan, paths: u64, depths: u64) kern.Ops.Tree {
         const streams_at = base + p.width * 4;
         const items_at = streams_at + p.streams * 16;
@@ -281,7 +289,7 @@ pub const Model = struct {
                 const per = m.context * hk * dh * 2;
                 try o.prompt(m.s.q, m.k[i] + ch.slot * per, m.v[i] + ch.slot * per, m.s.att, ch.p0, n, h, hk, scale);
             } else {
-                try o.treeAttention(m.s.q, m.s.kn, m.s.vn, m.origin, offs + i * streams * 16, t.?, .{ .o = m.s.po, .m = m.s.pm, .l = m.s.pl }, m.s.att, h, hk, dh, scale);
+                try o.treeAttention(m.s.q, m.s.kn, m.s.vn, m.origin, offs + i * streams * 16, t.?, m.s.tree, treeRows(m.max_rows), m.treeGroups(), m.s.att, h, hk, dh, scale);
             }
             try o.k.lane.matmul(s, m.s.att, h * dh, n, L.o, m.s.o, m.s.part);
             try o.addRms(m.s.o, m.s.res, L.post_attn_norm, L.pre_moe_norm, m.s.x, n, c.hidden, c.eps);
