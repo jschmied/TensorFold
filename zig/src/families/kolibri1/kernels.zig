@@ -24,6 +24,7 @@ pub const Kernels = struct {
     argmax_fn: cuda.Function,
     bf16_fn: cuda.Function,
     draws: cuda.sample.Draws,
+    norms: cuda.norms.Norms,
 
     /// The built-in modules plus the captured Triton set in `set_dir` (tools: capture_kolibri.py, aot_pack.py).
     pub fn load(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, set_dir: []const u8) !Kernels {
@@ -50,12 +51,15 @@ pub const Kernels = struct {
         const sms: usize = @intCast(try ctx.attribute(.multiprocessor_count));
         k.fp8x = try experts.Fp8Experts.load(d, sms);
         errdefer k.fp8x.unload();
+        k.norms = try cuda.norms.Norms.load(d);
+        errdefer k.norms.unload();
         k.set = try aot.Set.load(gpa, io, d, ctx.device, set_dir);
         return k;
     }
 
     pub fn deinit(k: *Kernels) void {
         k.set.deinit();
+        k.norms.unload();
         k.fp8x.unload();
         k.lane.unload();
         for (&k.mods) |*m| m.unload();
@@ -105,12 +109,12 @@ pub const Ops = struct {
 
     /// forward.rms (bf16 out): a program a row.
     pub fn rms(o: Ops, x: u64, w: u64, out: u64, rows: usize, n: usize, eps: f32) !void {
-        try o.triton("_rms", .{ rows, 1, 1 }, &.{ aot.ptr("X", "*fp32", x), aot.ptr("W", "*fp32", w), aot.ptr("OUT", "*bf16", out) }, &.{ aot.ci("N", @intCast(n)), aot.cf("EPS", eps), aot.ci("BLOCK", @intCast(std.math.ceilPowerOfTwo(usize, n) catch unreachable)), aot.ci("BF16", 1) });
+        try o.k.norms.rms(o.s, x, .f32, w, out, .bf16, rows, n, eps);
     }
 
     /// glue.add_rms: res += rms(x) * w1 in place; out = bf16(rms(res) * w2).
     pub fn addRms(o: Ops, x: u64, res: u64, w1: u64, w2: u64, out: u64, rows: usize, n: usize, eps: f32) !void {
-        try o.triton("_add_rms", .{ rows, 1, 1 }, &.{ aot.ptr("X", "*bf16", x), aot.ptr("RES", "*fp32", res), aot.ptr("W1", "*fp32", w1), aot.ptr("W2", "*fp32", w2), aot.ptr("OUT", "*bf16", out) }, &.{ aot.ci("N", @intCast(n)), aot.cf("EPS", eps), aot.ci("BLOCK", @intCast(std.math.ceilPowerOfTwo(usize, n) catch unreachable)) });
+        try o.k.norms.addRms(o.s, x, .bf16, res, w1, w2, out, .bf16, rows, n, eps);
     }
 
     pub const Qkv = struct { rows: u64, norms: u64, cos: u64, sin: u64, pos: u64, slots: u64, q: u64, k: u64, v: u64, kc: u64, vc: u64, len: usize };
