@@ -161,3 +161,94 @@ pub fn generate(gpu: Gpu, model: []const u8, set: []const u8, ids_file: []const 
     for (out.items) |t| std.debug.print(" {d}", .{t});
     std.debug.print("\n", .{});
 }
+
+const lanes = @import("lanes");
+
+const Case = struct { prompt: []const u32, sampling: ?lanes.Sampling, drafts: bool };
+
+/// Cases admitted together into the lane engine on Kolibri's backend, run to the end: each one's tokens, the rate.
+fn lanesRun(gpu: Gpu, kb: *kolibri1.backend.Kolibri, cases: []const Case, count: u32) !struct { out: [][]u32, rate: f64 } {
+    const gpa = gpu.gpa;
+    var cfg = try lanes.Config.init(gpa, kb.facts(), 16, 15);
+    defer cfg.deinit(gpa);
+    var clock: lanes.fake.FixedClock = .{};
+    var engine = lanes.Engine.init(gpa, &cfg, kb.backend(), clock.clock());
+    defer engine.deinit();
+    const streams = try gpa.alloc(lanes.Stream, cases.len);
+    defer gpa.free(streams);
+    const props = try gpa.alloc(lanes.SuffixLookup, cases.len);
+    defer gpa.free(props);
+    for (cases, streams, props) |c, *s, *p| {
+        p.* = try lanes.SuffixLookup.init(gpa, .{ .min_match = 4 });
+        s.* = try lanes.Stream.init(gpa, .{ .id = "k", .prompt = c.prompt, .max_new = count, .eos = &.{}, .sampling = c.sampling, .drafts = c.drafts, .proposer = p.proposer() });
+    }
+    defer for (streams, props) |*s, *p| {
+        s.deinit(gpa);
+        p.deinit();
+    };
+    for (streams) |*s| try engine.addStream(s);
+    const t0 = check.now(gpu.io);
+    while (engine.activeCount() > 0) try engine.step();
+    const secs = @as(f64, @floatFromInt(check.now(gpu.io) - t0)) / 1e9;
+    const out = try gpa.alloc([]u32, cases.len);
+    var n: usize = 0;
+    for (out, streams) |*o, *s| {
+        o.* = try gpa.dupe(u32, s.emitted());
+        n += o.len;
+    }
+    return .{ .out = out, .rate = @as(f64, @floatFromInt(n)) / secs };
+}
+
+fn freeRuns(gpa: std.mem.Allocator, runs: [][]u32) void {
+    for (runs) |r| gpa.free(r);
+    gpa.free(runs);
+}
+
+/// The lane engine on Kolibri's backend: drafted == plain (greedy and sampled), two streams together == each alone.
+pub fn lanesCheck(gpu: Gpu, model: []const u8, set: []const u8, ids_file: []const u8, count_text: []const u8) !void {
+    const gpa = gpu.gpa;
+    const count = try std.fmt.parseInt(u32, count_text, 10);
+    const text = try std.Io.Dir.cwd().readFileAlloc(gpu.io, ids_file, gpa, .limited(1 << 26));
+    defer gpa.free(text);
+    var prompt: std.ArrayList(u32) = .empty;
+    defer prompt.deinit(gpa);
+    var it = std.mem.tokenizeAny(u8, text, ", \n");
+    while (it.next()) |t| try prompt.append(gpa, try std.fmt.parseInt(u32, t, 10));
+    var w = try kolibri1.weights.load(gpa, gpu.io, gpu.d, model, null);
+    defer w.deinit();
+    var k = try kolibri1.kernels.Kernels.load(gpa, gpu.io, gpu.ctx, set);
+    defer k.deinit();
+    var stream = try cuda.Stream.init(gpu.d, false);
+    defer stream.deinit();
+    var m = try kolibri1.forward.Model.init(gpa, gpu.d, stream, &w, 4096, 2, kolibri1.backend.prompt_rows);
+    defer m.deinit();
+    var kb = try kolibri1.backend.Kolibri.init(gpa, gpu.d, &m, &k, stream);
+    defer kb.deinit();
+    const p = prompt.items;
+    const sampled: lanes.Sampling = .{ .seed = 7, .temperature = 0.8, .top_k = 20, .top_p = 0.95 };
+    var bad: usize = 0;
+    var names: [64]u8 = undefined;
+    for ([_]?lanes.Sampling{ null, sampled }) |sp| {
+        const plain = try lanesRun(gpu, &kb, &.{.{ .prompt = p, .sampling = sp, .drafts = false }}, count);
+        defer freeRuns(gpa, plain.out);
+        const drafted = try lanesRun(gpu, &kb, &.{.{ .prompt = p, .sampling = sp, .drafts = true }}, count);
+        defer freeRuns(gpa, drafted.out);
+        const equal = std.mem.eql(u32, plain.out[0], drafted.out[0]);
+        const name = try std.fmt.bufPrint(&names, "{s}", .{if (sp == null) "greedy" else "sampled"});
+        std.debug.print("RESULT kolibri1 lanes {s}: plain {d:.2} tok/s, drafted {d:.2} tok/s, tokens equal {}, hash {x}\n", .{ name, plain.rate, drafted.rate, equal, std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(plain.out[0])) });
+        if (!equal) bad += 1;
+    }
+    // two streams admitted together against each run alone
+    const second = p[0 .. p.len - 3];
+    const pair = try lanesRun(gpu, &kb, &.{ .{ .prompt = p, .sampling = null, .drafts = true }, .{ .prompt = second, .sampling = sampled, .drafts = true } }, count);
+    defer freeRuns(gpa, pair.out);
+    const solo_a = try lanesRun(gpu, &kb, &.{.{ .prompt = p, .sampling = null, .drafts = true }}, count);
+    defer freeRuns(gpa, solo_a.out);
+    const solo_b = try lanesRun(gpu, &kb, &.{.{ .prompt = second, .sampling = sampled, .drafts = true }}, count);
+    defer freeRuns(gpa, solo_b.out);
+    const together = std.mem.eql(u32, pair.out[0], solo_a.out[0]) and std.mem.eql(u32, pair.out[1], solo_b.out[0]);
+    std.debug.print("RESULT kolibri1 lanes two streams: {d:.2} tok/s together, equal to each alone {}\n", .{ pair.rate, together });
+    if (!together) bad += 1;
+    try check.expect(bad == 0, "kolibri1 lanes: drafted == plain and concurrent == solo", .{});
+    check.pass("kolibri1 lanes: drafted == plain (greedy, sampled), two streams == each alone, {d} tokens each", .{count});
+}

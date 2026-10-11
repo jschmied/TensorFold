@@ -128,6 +128,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const kolibri1 = b.createModule(.{ .root_source_file = b.path("zig/src/families/kolibri1/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true });
     kolibri1.addImport("core", mods.core);
     kolibri1.addImport("cuda", cuda);
+    kolibri1.addImport("lanes", mods.lanes);
     runner.addImport("kolibri1", kolibri1);
     b.installArtifact(b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner }));
     nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.tokenizer, build_options, true).root_module.strip = strip;
@@ -198,6 +199,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     const kolibri1 = b.createModule(.{ .root_source_file = b.path("zig/src/families/kolibri1/cuda.zig"), .target = host, .optimize = .debug, .link_libc = true });
     kolibri1.addImport("core", mods.core);
     kolibri1.addImport("cuda", cuda);
+    kolibri1.addImport("lanes", mods.lanes);
     for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.heat, kolibri1, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = host, .optimize = .debug, .link_libc = true });
     cli.addImport("cuda", cuda);

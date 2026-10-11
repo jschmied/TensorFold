@@ -7,6 +7,7 @@ pub const weights = @import("weights.zig");
 pub const tree = @import("tree.zig");
 pub const kernels = @import("kernels.zig");
 pub const forward = @import("forward.zig");
+pub const backend = @import("backend.zig");
 
 test {
     _ = @import("config.zig");
@@ -16,4 +17,5 @@ test {
     _ = @import("tree.zig");
     _ = @import("kernels.zig");
     _ = @import("forward.zig");
+    _ = @import("backend.zig");
 }

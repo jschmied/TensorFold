@@ -18,16 +18,19 @@ pub const Kernels = struct {
     lane: cuda.qmmf.Lane,
     fp8x: experts.Fp8Experts,
     router: grouped.Router,
-    mods: [3]cuda.Module, // experts (the plan kernels), prefill_attention, kolibri_ops
+    mods: [4]cuda.Module, // experts (the plan kernels), prefill_attention, kolibri_ops, sample
     pattn: cuda.Function,
     embed: cuda.Function,
+    argmax_fn: cuda.Function,
+    bf16_fn: cuda.Function,
+    draws: cuda.sample.Draws,
 
     /// The built-in modules plus the captured Triton set in `set_dir` (tools: capture_kolibri.py, aot_pack.py).
     pub fn load(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, set_dir: []const u8) !Kernels {
         const d = ctx.d;
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
         var k: Kernels = undefined;
-        const images = [_][]const u8{ cuda.kernels.experts, cuda.kernels.prefill_attention, cuda.kernels.kolibri_ops };
+        const images = [_][]const u8{ cuda.kernels.experts, cuda.kernels.prefill_attention, cuda.kernels.kolibri_ops, cuda.kernels.sample };
         var loaded: usize = 0;
         errdefer for (k.mods[0..loaded]) |*m| m.unload();
         for (images, 0..) |img, i| {
@@ -38,6 +41,9 @@ pub const Kernels = struct {
         k.pattn = try k.mods[1].function(pattn_symbol);
         try k.pattn.allowDynamicShared(pattn_smem);
         k.embed = try k.mods[2].function("tf_kolibri_embed");
+        k.argmax_fn = try k.mods[2].function("tf_kolibri_argmax");
+        k.bf16_fn = try k.mods[2].function("tf_kolibri_to_bf16");
+        k.draws = try cuda.sample.Draws.resolve(k.mods[3]);
         const cap = try ctx.capability();
         k.lane = try cuda.qmmf.Lane.load(d, cap / 10);
         errdefer k.lane.unload();
@@ -77,6 +83,24 @@ pub const Ops = struct {
         a.add(int(d));
         a.add(out);
         try cuda.launch.launch(o.k.embed, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, o.s, &a);
+    }
+
+    /// Each row's argmax over `v` fp32 logits, ties to the lowest id (torch.argmax), into `out` (u32 a row).
+    pub fn argmax(o: Ops, logits: u64, rows: usize, v: usize, out: u64) !void {
+        var a: cuda.Args = .{};
+        a.add(logits);
+        a.add(int(v));
+        a.add(out);
+        try cuda.launch.launch(o.k.argmax_fn, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, o.s, &a);
+    }
+
+    /// bf16 copies of `n` fp32 logits (round to nearest even), as sample.cu's draws read them.
+    pub fn toBf16(o: Ops, x: u64, y: u64, n: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(y);
+        a.add(@as(i64, @intCast(n)));
+        try cuda.launch.launch(o.k.bf16_fn, .{ .grid = .{ .x = @intCast(@min((n + 255) / 256, 4096)) }, .block = .{ .x = 256 } }, o.s, &a);
     }
 
     /// forward.rms (bf16 out): a program a row.
