@@ -37,10 +37,14 @@ pub const Kolibri = struct {
     logits16: cuda.DeviceBuffer, // their bf16 copy for keyed draws
     tok: cuda.DeviceBuffer, // drawn tokens: the handle ring, then a round's rows
     meta: cuda.DeviceBuffer, // a draw's first position minus one, a window each
-    lane_bufs: std.ArrayList(cuda.DeviceBuffer) = .empty,
+    lane_bufs: std.ArrayList(cuda.DeviceBuffer) = .empty, // a slot's last-row logits and rule, two a slot
     next: u64 = 0,
     graphs: []?fwd.Model.Decode, // a slot's one-row step, captured at its first queue (null: eager)
     graphed: bool, // TENSORFOLD_KOLIBRI_GRAPHS=0 runs every step eager
+    held: []std.ArrayList(u32), // a free slot's cached tokens: positions [0, len) its last stream left
+    used: []u64, // a slot's last release, for the oldest-first choice among equals
+    clock: u64 = 0,
+    reuses: bool, // TENSORFOLD_KOLIBRI_REUSE=0 prefills every prompt from 0
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, m: *fwd.Model, k: *const kern.Kernels, s: cuda.Stream) !Kolibri {
         const v = m.c.vocab;
@@ -57,8 +61,13 @@ pub const Kolibri = struct {
         errdefer meta.free();
         const graphs = try gpa.alloc(?fwd.Model.Decode, m.slots);
         @memset(graphs, null);
-        const off = if (std.c.getenv("TENSORFOLD_KOLIBRI_GRAPHS")) |e| std.mem.eql(u8, std.mem.span(e), "0") else false;
-        return .{ .gpa = gpa, .d = d, .m = m, .k = k, .s = s, .free = free, .logits = logits, .logits16 = logits16, .tok = tok, .meta = meta, .graphs = graphs, .graphed = !off };
+        errdefer gpa.free(graphs);
+        const held = try gpa.alloc(std.ArrayList(u32), m.slots);
+        @memset(held, .empty);
+        errdefer gpa.free(held);
+        const used = try gpa.alloc(u64, m.slots);
+        @memset(used, 0);
+        return .{ .gpa = gpa, .d = d, .m = m, .k = k, .s = s, .free = free, .logits = logits, .logits16 = logits16, .tok = tok, .meta = meta, .graphs = graphs, .graphed = !envOff("TENSORFOLD_KOLIBRI_GRAPHS"), .held = held, .used = used, .reuses = !envOff("TENSORFOLD_KOLIBRI_REUSE") };
     }
 
     pub fn deinit(x: *Kolibri) void {
@@ -69,6 +78,9 @@ pub const Kolibri = struct {
         x.lane_bufs.deinit(x.gpa);
         for (x.graphs) |*g| if (g.*) |*e| e.exec.deinit();
         x.gpa.free(x.graphs);
+        for (x.held) |*h| h.deinit(x.gpa);
+        x.gpa.free(x.held);
+        x.gpa.free(x.used);
         x.gpa.free(x.free);
         x.logits.free();
         x.logits16.free();
@@ -85,6 +97,33 @@ pub const Kolibri = struct {
         return .{ .exact_width = 16, .gpu_tokens = false, .mtp = false, .speculate = false, .hidden_rows = true, .batch_rows = round_rows, .max_streams = @intCast(x.m.slots) };
     }
 
+    fn envOff(name: [*:0]const u8) bool {
+        const v = std.c.getenv(name) orelse return false;
+        return std.mem.eql(u8, std.mem.span(v), "0");
+    }
+
+    /// Prompt rows a slot's held keys serve: the common prefix less the last row; none once the ring lost the window.
+    fn reusable(x: *const Kolibri, slot: usize, prompt: []const u32) usize {
+        const held = x.held[slot].items;
+        const common = std.mem.indexOfDiff(u32, held, prompt) orelse held.len;
+        const r = @min(common, prompt.len - 1);
+        if (r == 0 or held.len - r > x.m.ring - x.m.c.window) return 0;
+        return r;
+    }
+
+    const Pick = struct { slot: usize, from: usize };
+
+    /// The free slot whose held tokens serve the most of `prompt`; among equals the least recently used.
+    fn choose(x: *const Kolibri, prompt: []const u32) ?Pick {
+        var best: ?Pick = null;
+        for (x.free, 0..) |f, i| {
+            if (!f) continue;
+            const r = if (x.reuses) x.reusable(i, prompt) else 0;
+            if (best == null or r > best.?.from or (r == best.?.from and x.used[i] < x.used[best.?.slot])) best = .{ .slot = i, .from = r };
+        }
+        return best;
+    }
+
     fn self(ptr: *anyopaque) *Kolibri {
         return @ptrCast(@alignCast(ptr));
     }
@@ -93,10 +132,14 @@ pub const Kolibri = struct {
         return .{ .k = x.k, .s = x.s };
     }
 
-    fn laneBuf(x: *Kolibri, bytes: usize) !u64 {
-        const b = try cuda.DeviceBuffer.alloc(x.d, bytes);
-        try x.lane_bufs.append(x.gpa, b);
-        return b.ptr;
+    /// The slot's own buffers, allocated at its first stream: the prompt's last logits row, then the rule.
+    fn slotBufs(x: *Kolibri, slot: usize) !struct { last: u64, rule: u64 } {
+        while (x.lane_bufs.items.len < 2 * (slot + 1)) {
+            const bytes = if (x.lane_bufs.items.len % 2 == 0) x.m.c.vocab * 4 else @sizeOf(cuda.sample.Rule);
+            try x.lane_bufs.ensureUnusedCapacity(x.gpa, 1);
+            x.lane_bufs.appendAssumeCapacity(try cuda.DeviceBuffer.alloc(x.d, bytes));
+        }
+        return .{ .last = x.lane_bufs.items[2 * slot].ptr, .rule = x.lane_bufs.items[2 * slot + 1].ptr };
     }
 
     fn upload(x: *Kolibri, dst: u64, bytes: []const u8) !void {
@@ -121,28 +164,29 @@ pub const Kolibri = struct {
         const got = try x.lanes.getOrPut(x.gpa, s);
         if (got.found_existing) return error.StreamAlreadyPrefilled;
         errdefer _ = x.lanes.remove(s);
-        const slot = for (x.free, 0..) |f, i| {
-            if (f) break i;
-        } else return error.NoFreeSlot;
-        const v = x.m.c.vocab;
-        got.value_ptr.* = .{ .slot = slot, .last = try x.laneBuf(v * 4), .rule = try x.laneBuf(@sizeOf(cuda.sample.Rule)) };
+        const p = s.prompt();
+        if (p.len == 0) return error.EmptyPrompt;
+        const pick = x.choose(p) orelse return error.NoFreeSlot;
+        const slot = pick.slot;
+        const bufs = try x.slotBufs(slot);
+        got.value_ptr.* = .{ .slot = slot, .last = bufs.last, .rule = bufs.rule };
         x.free[slot] = false;
+        errdefer x.free[slot] = true;
+        x.held[slot].shrinkRetainingCapacity(pick.from); // past `from` the prompt pass rewrites the keys
         const l = got.value_ptr;
         if (s.sampling) |sp| if (sp.temperature > 0) {
             const r = cuda.sample.rule(sp.seed, sp.temperature, sp.top_p, sp.minLog(), sp.top_k);
             try x.upload(l.rule, std.mem.asBytes(&r));
             l.sampled = true;
         };
-        const p = s.prompt();
-        if (p.len == 0) return error.EmptyPrompt;
-        var at: usize = 0;
+        var at: usize = pick.from;
         while (at < p.len) : (at += prompt_rows) {
             if (s.isCancelled()) return error.Cancelled;
             const end = @min(p.len, at + prompt_rows);
             try x.m.forward(x.ops(), &.{.{ .slot = slot, .p0 = at, .tokens = p[at..end] }}, true, null, l.last);
         }
         l.len = p.len;
-        s.cached = 0;
+        s.cached = @intCast(pick.from);
     }
 
     fn handle(x: *Kolibri) usize {
@@ -265,6 +309,13 @@ pub const Kolibri = struct {
         if (x.lanes.fetchRemove(s)) |kv| {
             var l = kv.value;
             x.free[l.slot] = true;
+            // keys [0, len): the stream's prompt and the tokens it fed, for a later prompt to reuse
+            const h = &x.held[l.slot];
+            h.clearRetainingCapacity();
+            const n = @min(l.len, s.context.items.len);
+            h.appendSlice(x.gpa, s.context.items[0..n]) catch h.clearRetainingCapacity();
+            x.clock += 1;
+            x.used[l.slot] = x.clock;
             l.rows.deinit(x.gpa);
         }
     }
