@@ -167,12 +167,12 @@ pub const Ops = struct {
         try o.k.tree.paths(o.s, t.parents, t.paths, t.depths, t.width);
     }
 
-    /// cuda/tree_attention: committed keys, then each row's path; `scratch` holds scratchBytes(rows, hk, ng).
+    /// cuda/tree_attention: committed keys, then each row's path; `scratch` holds scratchBytes(rows, hk, ng, d).
     pub fn treeAttention(o: Ops, q: u64, kn: u64, vn: u64, origin: u64, offs: u64, t: Tree, scratch: u64, rows: usize, ng: usize, out: u64, h: usize, hk: usize, d: usize, scale: f32) !void {
         if (d != 128) return error.TreeHeadDim;
         if (t.width > rows) return error.TreeRowsPastScratch;
         const tr: cuda.tree_attention.Rows = .{ .row_stream = t.rows, .streams = t.streams, .offs = offs, .origin = origin, .paths = t.paths, .depths = t.depths };
-        try o.k.tree.run(o.s, q, kn, vn, tr, cuda.tree_attention.TreeAttention.scratch(scratch, rows, hk, ng), out, t.width, h, hk, ng, scale);
+        try o.k.tree.run(o.s, q, kn, vn, tr, cuda.tree_attention.TreeAttention.scratch(scratch, rows, hk, ng, d), out, t.width, h, hk, d, ng, scale);
     }
 
     /// cuda.moe.router: x [m, D] bf16 times rows [ne, D] bf16 -> [m, ne] fp32 (the MoE router and the head).

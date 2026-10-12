@@ -157,7 +157,7 @@ pub const Model = struct {
             .depths = try m.alloc(r * 4),
             .offs = try m.alloc(c.layers * m.max_rows * 2 * 8),
             .sel = try m.alloc(r * c.hidden * 2),
-            .tree = try m.alloc(cuda.tree_attention.TreeAttention.scratchBytes(treeRows(r), c.kv_heads, m.treeGroups())),
+            .tree = try m.alloc(cuda.tree_attention.TreeAttention.scratchBytes(treeRows(r), c.kv_heads, m.treeGroups(), c.head_dim)),
             .win = try m.alloc(cuda.window_attention.WindowAttention.scratchBytes(.{ .h = c.heads, .hk = c.kv_heads, .d = c.head_dim, .win = c.window, .ring = m.ring, .scale = 1 }, r)),
         };
     }
