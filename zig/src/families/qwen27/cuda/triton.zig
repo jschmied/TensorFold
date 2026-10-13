@@ -130,7 +130,7 @@ pub const Tri = struct {
         const ng = (t.chunks * chunk + cuda.tree_attention.span - 1) / cuda.tree_attention.span;
         const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(a.dim), -0.5));
         const rows: cuda.tree_attention.Rows = .{ .row_stream = plan.rows, .streams = plan.streams, .offs = offs, .origin = base, .paths = plan.paths, .depths = plan.depths };
-        try t.g.tree.run(t.s, q, kn, vn, rows, TA.scratch(part.o, plan.width, a.kv_heads, ng, a.dim), out, plan.width, a.heads, a.kv_heads, a.dim, ng, scale);
+        try t.g.tree.run(t.s, q, kn, vn, rows, TA.scratch(part.o, plan.width, a.heads, a.kv_heads, ng, a.dim), out, plan.width, a.heads, a.kv_heads, a.dim, ng, scale);
     }
 };
 

@@ -73,10 +73,10 @@ fn call(x: *Set, s: cuda.Stream, g: *const tree.TreeAttention, d: usize, rows: [
     const paths = try x.zero(s, n * tree.max_depth * 4);
     const depths = try x.zero(s, n * 4);
     try g.paths(s, try x.up(std.mem.sliceAsBytes(par)), paths, depths, n);
-    const sc_base = try x.zero(s, tree.TreeAttention.scratchBytes(n, hk, ng, d));
+    const sc_base = try x.zero(s, tree.TreeAttention.scratchBytes(n, h, hk, ng, d));
     const out = try x.zero(s, n * h * d * 2);
     const rws: tree.Rows = .{ .row_stream = try x.up(std.mem.sliceAsBytes(rs)), .streams = streams_dev, .offs = offs, .origin = origin, .paths = paths, .depths = depths };
-    try g.run(s, try x.up(std.mem.sliceAsBytes(q)), try x.up(std.mem.sliceAsBytes(kn)), try x.up(std.mem.sliceAsBytes(vn)), rws, tree.TreeAttention.scratch(sc_base, n, hk, ng, d), out, n, h, hk, d, ng, scale);
+    try g.run(s, try x.up(std.mem.sliceAsBytes(q)), try x.up(std.mem.sliceAsBytes(kn)), try x.up(std.mem.sliceAsBytes(vn)), rws, tree.TreeAttention.scratch(sc_base, n, h, hk, ng, d), out, n, h, hk, d, ng, scale);
     try s.synchronize();
     return x.down(u16, out, n * h * d);
 }
@@ -189,13 +189,29 @@ fn case(gpu: check.Gpu, d: usize, h: usize, hk: usize, seed: u64, worst_all: *f6
     const strided = try call(&x, s, &g, d, all, row_stream, parents, qs, kns, vns, h, hk, &streams, offs_dev, origin, ng, scale);
     try check.sameBytes("tree attention: one shared block", std.mem.sliceAsBytes(strided), std.mem.sliceAsBytes(got));
     g.shared_blocks = 96;
-    const wide = try call(&x, s, &g, d, all, row_stream, parents, qs, kns, vns, h, hk, &streams, offs_dev, origin, 129, scale);
+    const wide = try call(&x, s, &g, d, all, row_stream, parents, qs, kns, vns, h, hk, &streams, offs_dev, origin, 513, scale);
     try check.sameBytes("tree attention: groups for a 262k context", std.mem.sliceAsBytes(wide), std.mem.sliceAsBytes(got));
+    // one warp a block (a device with SMs to spare): stream 2's rows alone, its full groups too, the batch's bits
+    g.sms = 1 << 20;
+    defer g.sms = 0;
+    const third = try a.alloc(usize, widths[2]);
+    for (third, 0..) |*r, i| r.* = widths[0] + widths[1] + i;
+    try check.expect(widths[2] * ng * hk <= tree.slice_items, "tree attention: the one-warp case fits the slices", .{});
+    const one = try call(&x, s, &g, d, third, row_stream, parents, qs, kns, vns, h, hk, &streams, offs_dev, origin, ng, scale);
+    try check.sameBytes("tree attention: one warp a block", std.mem.sliceAsBytes(one), std.mem.sliceAsBytes(got[(widths[0] + widths[1]) * h * d ..][0 .. widths[2] * h * d]));
+    g.shared_blocks = 1;
+    const one_strided = try call(&x, s, &g, d, third, row_stream, parents, qs, kns, vns, h, hk, &streams, offs_dev, origin, ng, scale);
+    try check.sameBytes("tree attention: one warp a block, one shared block", std.mem.sliceAsBytes(one_strided), std.mem.sliceAsBytes(one));
+    g.shared_blocks = 96;
+    g.sms = 1; // more one-warp blocks than SMs: two tile stages instead of three
+    const two = try call(&x, s, &g, d, third, row_stream, parents, qs, kns, vns, h, hk, &streams, offs_dev, origin, ng, scale);
+    try check.sameBytes("tree attention: one warp a block, two stages", std.mem.sliceAsBytes(two), std.mem.sliceAsBytes(one));
+    g.shared_blocks = 96;
 }
 
 pub fn run(gpu: check.Gpu) !void {
     var worst: f64 = 0;
     try case(gpu, 128, 48, 4, 41, &worst); // Kolibri
     try case(gpu, 256, 24, 4, 42, &worst); // Qwen3.8-27B
-    check.pass("tree attention: dim 128 and 256, committed keys and paths within float64 tolerance (worst {d:.3}), a stream's bits alone, any group slots", .{worst});
+    check.pass("tree attention: dim 128 and 256, committed keys and paths within float64 tolerance (worst {d:.3}), a stream's bits alone, any group slots, four-warp or one-warp blocks", .{worst});
 }
