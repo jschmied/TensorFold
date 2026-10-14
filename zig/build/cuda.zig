@@ -39,6 +39,8 @@ const kernels = [_]Kernel{
     .{ .name = "nemotron_keyed", .flags = glue },
     .{ .name = "norms", .flags = &.{"-O3"} }, // ours: RMS norm rows for every family (cuda/norms.zig)
     .{ .name = "embed_rows", .flags = &.{"-O3"} }, // ours: 4-bit affine and bf16 token rows (cuda/embed_rows.zig)
+    .{ .name = "kda", .flags = glue }, // ours: Kimi Delta Attention decode rows and verify windows (cuda/kda.zig)
+    .{ .name = "kda_prompt", .flags = glue }, // ours: Kimi Delta Attention prompt chunks (cuda/kda.zig)
     .{ .name = "qmmf", .flags = &.{"-O3"} }, // nvfp4/qmmf.cu's device code (FP8G, FP4), tensorfold_nvfp4_v3
     .{ .name = "prompt16", .flags = &.{"-O3"} }, // nvfp4/prompt.cu's FP4 and FP8 tile 4, tensorfold_nvfp4_prompt_v1
     .{ .name = "modelopt_pack", .flags = &.{"-O3"} }, // ours: ModelOpt tensors into the lane, prompt and expert layouts

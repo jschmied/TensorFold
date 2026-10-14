@@ -46,6 +46,8 @@ pub const nemotron_attention: []const u8 = if (available) &Blob("fatbin_nemotron
 pub const nemotron_keyed: []const u8 = if (available) &Blob("fatbin_nemotron_keyed").bytes else &.{};
 pub const norms: []const u8 = if (available) &Blob("fatbin_norms").bytes else &.{};
 pub const embed_rows: []const u8 = if (available) &Blob("fatbin_embed_rows").bytes else &.{};
+pub const kda: []const u8 = if (available) &Blob("fatbin_kda").bytes else &.{};
+pub const kda_prompt: []const u8 = if (available) &Blob("fatbin_kda_prompt").bytes else &.{};
 
 /// Symbols in the gdn image as cuobjdump lists them for the built fatbin (named namespace tf_gdn).
 pub const gdn_symbols = struct {
