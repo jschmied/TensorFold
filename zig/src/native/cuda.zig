@@ -391,7 +391,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         shown[1],   if (kernels) |dir| try std.fmt.allocPrint(a, "glue kernels captured at {s}", .{dir}) else "own glue kernels",
     });
     errdefer gpa.free(h.startup);
-    if (@hasDecl(F, "snap_save") and cache > 0) {
+    if (@hasDecl(F, "snap_save") and cache > 0 and !kv_pages.ownCache(loaded)) {
         const pc = api.prompt_cache;
         const store = try gpa.create(pc.Store);
         errdefer gpa.destroy(store);

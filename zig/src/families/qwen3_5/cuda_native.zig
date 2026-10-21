@@ -14,6 +14,7 @@ const vision_prompt = @import("cuda_vision_prompt.zig");
 const reuse = @import("cuda_reuse.zig");
 const Mtp = @import("cuda_mtp.zig").Mtp;
 const pages_mod = @import("cuda_pages.zig");
+const prefix_mod = @import("cuda_prefix.zig");
 const kv_pool = @import("core").kv_pool;
 const be = lanes.backend;
 pub const vision = @import("cuda_vision.zig");
@@ -64,6 +65,8 @@ pub const Loaded = struct {
     target: *reuse.Target,
     /// TF_QWEN_KV_PAGES: the streams beside the first take pages of one pool (null: a window each).
     layout: ?kv_pool.Layout = null,
+    /// TF_QWEN_KV_SHARE: the family keeps prompts as pool pages itself; the host makes no prompt cache of its own.
+    own_prompt_cache: bool = false,
 };
 
 /// The pool's layout with a drafter (`extra` bytes a stream): DFlash2's ring and taps in the run, the rest fixed.
@@ -85,6 +88,10 @@ pub fn attach(p: *anyopaque, streams: u32, pages: usize) !void {
         if (l.draft) |d| d.ring_of = .{ .ctx = l, .ring = Lanes.ringOf };
         if (l.mtp) |m| m.ring_of = .{ .ctx = l, .area = Lanes.ringOf };
     }
+    if (l.share_snaps > 0 and streams > 0) { // every stream on pages, so each can adopt the kept ones
+        l.prefix = try prefix_mod.Prefix.init(l.gpa, l.e, l.pages.?, l.share_snaps);
+        l.paged_only = true;
+    }
     l.paged_only = pages_mod.pagedOnly() and streams > 0; // checks: every stream on pages, the reserved window idle
 }
 
@@ -101,6 +108,9 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     if (o.slide and o.kv8) return error.UnsupportedLearningFormat;
     const page_tokens = try pages_mod.paging();
     if (page_tokens > 0 and o.slide) return error.QwenPagesNoLearner;
+    const share_snaps = try prefix_mod.sharing();
+    // a kept page boundary must be a cold pass's chunk cut, so its rows and the chunks after it keep a cold pass's bits
+    if (share_snaps > 0 and (page_tokens == 0 or page_tokens % E.max_rows != 0)) return error.QwenShareNeedsPages;
     const e = try E.Engine.init(gpa, io, ctx, dir, o.kv8);
     errdefer e.deinit();
     if (e.g.vocab != c.vocab) return error.UnsupportedQwenVocab; // draw.zig's masks are sized by the 2B's vocabulary
@@ -109,7 +119,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     const v: ?*vision.Vision = if (o.vision) |lim| try vision.Vision.open(gpa, io, ctx.d, e.stream, dir, e.g.hidden, lim) else null;
     errdefer if (v) |x| x.deinit();
     const l = try gpa.create(Lanes);
-    l.* = .{ .gpa = gpa, .io = io, .e = e, .capacity = o.context, .page_tokens = page_tokens, .cost_context = ctx, .startup = e.startup, .vision = v, .target = undefined };
+    l.* = .{ .gpa = gpa, .io = io, .e = e, .capacity = o.context, .page_tokens = page_tokens, .share_snaps = share_snaps, .cost_context = ctx, .startup = e.startup, .vision = v, .target = undefined };
     l.target = .{ .e = e, .caches = &l.caches, .seen = &l.seen };
     return .{
         .learns = if (o.slide) e else null,
@@ -124,6 +134,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .vision = v,
         .target = &l.target,
         .layout = if (page_tokens > 0) pages_mod.layout(e, o.context, page_tokens, 0, 0) else null,
+        .own_prompt_cache = share_snaps > 0,
     };
 }
 
@@ -210,6 +221,8 @@ pub fn explain(ctx: ?*anyopaque, err: anyerror) ?[]const u8 {
     if (ctx == null) return switch (err) {
         error.NoQwenVision => "--vision: this checkpoint has no image tower (no vision_config): serve it without --vision",
         error.QwenPagesNoLearner => "TF_QWEN_KV_PAGES: the learner reads whole windows, not pages; drop --slide or unset it",
+        error.QwenShareNeedsPages => "TF_QWEN_KV_SHARE keeps prompts as pool pages: set TF_QWEN_KV_PAGES to a multiple of 128 positions",
+        error.BadQwenKvShare => "TF_QWEN_KV_SHARE takes the most recurrent-state snapshots the prompt cache keeps (0 or unset: off)",
         error.BadQwenKvPages => "TF_QWEN_KV_PAGES takes the positions a page holds (a whole number; 0 or unset: a window each)",
         error.UnsupportedQwenVision => "--vision: this checkpoint's image tower or text M-RoPE is not one the CUDA engine reads",
         else => null,
@@ -255,6 +268,12 @@ fn release(p: *anyopaque) void {
     l.deinit();
 }
 
+/// TF_QWEN_POOL_LOG=1: a line after each prompt pass with the pool's census (the agent replay's memory readings).
+fn poolLog() bool {
+    const v = std.c.getenv("TF_QWEN_POOL_LOG") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
+}
+
 /// The device draw of a stream's rule at `position`: sample.cu's keyed rule, greedy at temperature 0 or without one.
 fn pick(sampling: ?lanes.Sampling, position: u64) E.Draw {
     const s = sampling orelse return .{ .rule = null, .position = position };
@@ -271,6 +290,9 @@ const Lanes = struct {
     page_tokens: usize = 0,
     pages: ?*pages_mod.Pages = null,
     paged_only: bool = false,
+    /// TF_QWEN_KV_SHARE's snapshots (0: off) and the prompt cache over the pool's pages `attach` made.
+    share_snaps: usize = 0,
+    prefix: ?*prefix_mod.Prefix = null,
     /// The DFlash2 drafter, when one is attached: its rings go into the pool lanes' runs.
     draft: ?*Draft = null,
     /// The MTP drafter (qwen3_5_moe), when attached: its ring and state go into the pool lanes' runs.
@@ -301,6 +323,7 @@ const Lanes = struct {
         self.seen.deinit(self.gpa);
         for (self.pool.items) |cache| self.drop(cache);
         self.pool.deinit(self.gpa);
+        if (self.prefix) |x| x.deinit(); // its pages back to the pool before the pool goes
         if (self.pages) |p| p.deinit();
         if (self.vision) |v| v.deinit();
         self.e.deinit();
@@ -378,7 +401,10 @@ const Lanes = struct {
             return err;
         };
         errdefer if (self.seen.fetchRemove(stream)) |kv| self.gpa.free(kv.value);
-        const cache = try self.take(ids.len, stream.max_new);
+        // TF_QWEN_KV_SHARE: the kept pages this prompt resumes, adopted; images and request cuts keep their own grid
+        var share: ?Shared = if (self.prefix != null and images == null and stream.chunks.len == 0) try self.resumeShared(stream, ids) else null;
+        defer if (share) |*x| self.gpa.free(x.plan.marks);
+        const cache = if (share) |*x| try self.openShared(stream, ids, x) else try self.take(ids.len, stream.max_new);
         errdefer self.give(cache);
         // the stream's cache is found by a save at a mark (cuda_reuse.zig) while its pass runs
         try self.caches.put(self.gpa, stream, cache);
@@ -386,7 +412,13 @@ const Lanes = struct {
         // a kept state resumes only where a cold pass cuts a chunk, so the chunks after it keep a cold pass's bits
         var at: usize = 0;
         stream.cached = 0;
-        if (stream.reuse.saved) |saved| {
+        if (share) |*x| {
+            try self.prefix.?.put(&x.owner);
+            at = x.plan.from;
+            stream.cached = @intCast(at);
+            cache.len = at;
+            cache.written = at;
+        } else if (stream.reuse.saved) |saved| {
             if (stream.reuse.at > 0 and stream.reuse.at < ids.len and coldCut(ids.len, stream.chunks, stream.reuse.at)) {
                 if (reuse.restoreCache(self.e, cache, saved, seen)) {
                     at = stream.reuse.at;
@@ -403,12 +435,37 @@ const Lanes = struct {
             try self.e.forward(&.{.{ .cache = cache, .rows = end - at, .images = if (images) |*im| im else null }}, ids[at..end], .last);
             at = end;
             // a mark the store asked for, where this pass cut anyway: the lane host copies the state here
-            if (end < ids.len and std.mem.indexOfScalar(u32, stream.reuse.marks, @intCast(end)) != null) {
+            if (share) |x| {
+                if (end < ids.len and std.mem.indexOfScalar(u32, x.plan.marks, @intCast(end)) != null)
+                    self.prefix.?.keep(cache, ids, end) catch |err| std.log.warn("qwen3_5: prompt pages not kept: {s}", .{@errorName(err)});
+            } else if (end < ids.len and std.mem.indexOfScalar(u32, stream.reuse.marks, @intCast(end)) != null) {
                 if (stream.reuse.hook) |k| k.at(k.ptr, stream, @intCast(end));
             }
         }
         // the reply's rows rotate past the image prompt's positions (rope_delta)
         if (media) |m| cache.delta = m.delta;
+        if (poolLog()) if (self.pages) |p| {
+            const n = p.pool.census();
+            std.log.info("qwen3_5 pool after a prompt of {d} (resumed at {d}): {d} pages leased, {d} held by the prompt cache, {d} free of {d}", .{ ids.len, stream.cached, n.leased, n.kept, n.free, n.total });
+        };
+    }
+
+    /// A prompt's resume from the kept pages: the plan, the pages it adopts and the state still to restore.
+    const Shared = struct { plan: prefix_mod.radix.Plan, owner: prefix_mod.Owner = .{}, adopt: std.ArrayList(u32) = .empty };
+
+    fn resumeShared(self: *Lanes, stream: *lanes.Stream, ids: []const u32) !Shared {
+        var x: Shared = .{ .plan = undefined };
+        errdefer x.adopt.deinit(self.gpa);
+        x.plan = try self.prefix.?.begin(ids, stream.history_len, stream.shared_prefixes, &x.owner, &x.adopt);
+        return x;
+    }
+
+    /// A pool lane holding the adopted pages first (released if it cannot open: the request waits and asks again).
+    fn openShared(self: *Lanes, stream: *lanes.Stream, ids: []const u32, x: *Shared) !*E.Cache {
+        defer x.adopt.deinit(self.gpa);
+        const cache = try self.pages.?.openWith(ids.len, stream.max_new, x.adopt.items);
+        x.owner.cache = cache;
+        return cache;
     }
 
     fn firstFn(ptr: *anyopaque, stream: *lanes.Stream, position: u64) !u64 {
