@@ -46,13 +46,15 @@ pub fn run(gpu: check.Gpu) !void {
     const gw = r.bfs(width * hidden, 0.04);
     const uw = r.bfs(width * hidden, 0.04);
     const dw = r.bfs(hidden * width, 0.02);
+    var owned = false; // the node frees the three projections once it holds them
     var gate = try flash.projection.dense(r.a, gpu.d, tensor(gw, width, hidden));
-    errdefer gate.free();
+    errdefer if (!owned) gate.free();
     var up = try flash.projection.dense(r.a, gpu.d, tensor(uw, width, hidden));
-    errdefer up.free();
+    errdefer if (!owned) up.free();
     var down = try flash.projection.dense(r.a, gpu.d, tensor(dw, hidden, width));
-    errdefer down.free();
+    errdefer if (!owned) down.free();
     var ffn = try flash.dense_ffn.Ffn.init(gpu.d, &lane, act.f, gate, up, down, most);
+    owned = true;
     defer ffn.free();
     const dx = try r.dev(std.mem.sliceAsBytes(x));
     const out = try r.out(most * hidden * 4);
