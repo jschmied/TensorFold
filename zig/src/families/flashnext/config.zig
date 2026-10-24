@@ -232,7 +232,8 @@ fn moeLayers(c: *Config) !void {
         if (v != .array) return error.InvalidFlashLayers;
         for (v.array.items) |item| {
             const i = try integer(item);
-            if (i < c.layers) only[i] = true;
+            if (i >= c.layers) return error.InvalidFlashLayers;
+            only[i] = true;
         }
     };
     var dense_layers: usize = 0;

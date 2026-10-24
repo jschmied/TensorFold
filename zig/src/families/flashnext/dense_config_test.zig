@@ -138,3 +138,10 @@ test "dense Flash Next config: the HC rank is read, never defaulted to Flash Nex
         try t.expectEqual(@as(usize, @intCast(rank)), c.hc_lowrank);
     }
 }
+
+test "dense Flash Next config: an mlp_only_layers entry past the last layer is refused, not dropped" {
+    try t.expectError(error.InvalidFlashLayers, moeWith(t.allocator, &.{ .{ "mlp_only_layers", "[48]" }, .{ "intermediate_size", "9216" } }));
+    var c = try moeWith(t.allocator, &.{ .{ "mlp_only_layers", "[47]" }, .{ "intermediate_size", "9216" } });
+    defer c.deinit();
+    try t.expect(!c.moe_layer[47] and c.moe_layer[46]);
+}
