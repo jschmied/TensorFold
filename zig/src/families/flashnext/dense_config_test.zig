@@ -1,5 +1,4 @@
-//! A dense Flash Next config (provisional: no released checkpoint) parses beside the MoE one without changing it.
-//! The fixture is parser-only: its quantization.bits is 6, which cuda_config admits no CUDA load for (4-bit, group 32 only).
+//! A dense Flash Next config (provisional, parser-only: its 6-bit quantization has no CUDA load) parses beside the MoE one.
 const std = @import("std");
 const config = @import("config.zig");
 const t = std.testing;
