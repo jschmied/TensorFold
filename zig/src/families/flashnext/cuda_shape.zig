@@ -50,7 +50,8 @@ pub const Shape = struct {
         return s.top_k + 1;
     }
 
-    /// The attention projection's q|gate, k, v and indexer columns.
+    /// The attention projection's q|gate, k, v and indexer columns (provisional: Flash Next's combined layout, which
+    /// Intel's dense dimensions do not confirm for Qwen4).
     pub fn projN(s: Shape) usize {
         return s.q_heads * 2 * s.head_dim + 2 * s.kv_heads * s.head_dim + (s.index_heads + 1) * s.index_dim;
     }
