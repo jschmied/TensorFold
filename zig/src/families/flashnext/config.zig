@@ -27,10 +27,13 @@ pub const Config = struct {
     value_dim: usize,
     conv: usize,
     gate: Gate,
+    /// The MoE widths below are 0 for a dense config (`intermediate` > 0); isDense() says which.
     experts: usize,
     topk: usize,
     expert_width: usize,
     shared_width: usize,
+    /// The dense SwiGLU width (`intermediate_size`); 0 for a MoE config.
+    intermediate: usize,
     hc_count: usize,
     hc_lowrank: usize,
     index_heads: usize,
@@ -68,6 +71,10 @@ pub const Config = struct {
         const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 24));
         defer gpa.free(bytes);
         return parse(gpa, bytes);
+    }
+
+    pub fn isDense(c: *const Config) bool {
+        return c.experts == 0;
     }
 
     pub fn wide(c: *const Config) !usize {
@@ -191,6 +198,22 @@ fn quantBlock(root: std.json.ObjectMap, text: std.json.ObjectMap) !std.json.Obje
     return error.MissingAffineConfig;
 }
 
+const Ffn = struct { experts: usize = 0, topk: usize = 0, expert_width: usize = 0, shared_width: usize = 0, intermediate: usize = 0 };
+
+/// A config with `num_experts` is MoE and needs every expert field; one without is dense and needs `intermediate_size`.
+fn ffnShape(text: std.json.ObjectMap) !Ffn {
+    if (text.get("num_experts") != null) return .{
+        .experts = try required(text, "num_experts"),
+        .topk = try required(text, "num_experts_per_tok"),
+        .expert_width = try required(text, "moe_intermediate_size"),
+        .shared_width = try required(text, "shared_expert_intermediate_size"),
+    };
+    for ([_][]const u8{ "num_experts_per_tok", "moe_intermediate_size", "shared_expert_intermediate_size" }) |name| {
+        if (text.get(name) != null) return error.InvalidFlashShape;
+    }
+    return .{ .intermediate = try required(text, "intermediate_size") };
+}
+
 pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Config {
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, bytes, .{});
     errdefer parsed.deinit();
@@ -209,6 +232,7 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Config {
     if (partial < 0 or partial > 1 or head_dim == 0) return error.UnsupportedFlashRope;
     const gate: std.json.Value = text.get("output_gate_type") orelse .{ .string = "sigmoid" };
     if (gate != .string) return error.UnsupportedFlashGate;
+    const moe = try ffnShape(text);
     var c = Config{
         .parsed = parsed,
         .text = text,
@@ -228,10 +252,11 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Config {
         .value_dim = try required(text, "linear_value_head_dim"),
         .conv = try required(text, "linear_conv_kernel_dim"),
         .gate = std.meta.stringToEnum(Gate, gate.string) orelse return error.UnsupportedFlashGate,
-        .experts = try required(text, "num_experts"),
-        .topk = try required(text, "num_experts_per_tok"),
-        .expert_width = try required(text, "moe_intermediate_size"),
-        .shared_width = try required(text, "shared_expert_intermediate_size"),
+        .experts = moe.experts,
+        .topk = moe.topk,
+        .expert_width = moe.expert_width,
+        .shared_width = moe.shared_width,
+        .intermediate = moe.intermediate,
         .hc_count = try optional(text, "hc_count", 4),
         .hc_lowrank = try optional(text, "hc_lowrank", 320),
         .index_heads = try optional(text, "indexer_n_heads", 4),

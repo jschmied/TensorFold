@@ -417,6 +417,7 @@ test {
     _ = native;
     _ = @import("cuda_snap.zig");
     _ = @import("cuda_config.zig");
+    _ = @import("dense_config_test.zig");
     _ = @import("cuda_projection_load.zig");
     _ = @import("cuda_rank_engine.zig");
     _ = @import("cuda_round_graph.zig");
