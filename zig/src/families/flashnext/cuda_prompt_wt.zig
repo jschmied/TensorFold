@@ -291,15 +291,15 @@ pub const HcW = struct {
 };
 
 pub fn linearLayer(layer: usize) bool {
-    return layer % 4 != 3;
+    return shape.linearLayer(layer);
 }
 
 pub fn linearIndex(layer: usize) usize {
-    return layer - layer / 4;
+    return shape.linearIndex(layer);
 }
 
 pub fn attnIndex(layer: usize) usize {
-    return layer / 4;
+    return shape.attnIndex(layer);
 }
 
 pub fn toBf16(v: f32) u16 {

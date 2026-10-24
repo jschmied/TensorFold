@@ -260,6 +260,20 @@ fn moeLayers(c: *Config) !void {
     if (c.text.get("hidden_act")) |v| if (v != .string or !std.mem.eql(u8, v.string, "silu")) return error.ProvisionalDenseActivation;
 }
 
+/// The layer roles: `layer_types`, else Qwen3-Next's `full_attention_interval` (every interval-th layer is full).
+fn layerKinds(c: *Config) !void {
+    const kinds = c.text.get("layer_types") orelse {
+        const every = try required(c.text, "full_attention_interval");
+        for (0..c.layers) |i| c.kinds[i] = if ((i + 1) % every == 0) .sparse_attention else .linear_attention;
+        return;
+    };
+    if (kinds != .array or kinds.array.items.len != c.layers) return error.InvalidFlashLayers;
+    for (kinds.array.items, 0..) |v, i| {
+        if (v != .string) return error.InvalidFlashLayers;
+        c.kinds[i] = if (std.mem.eql(u8, v.string, "linear_attention")) .linear_attention else if (std.mem.eql(u8, v.string, "sparse_attention") or std.mem.eql(u8, v.string, "full_attention")) .sparse_attention else return error.InvalidFlashLayers;
+    }
+}
+
 pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Config {
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, bytes, .{});
     errdefer parsed.deinit();
@@ -342,12 +356,7 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Config {
     _ = try c.wide();
     _ = try c.convWidth();
     try moeLayers(&c);
-    const kinds = text.get("layer_types") orelse return error.MissingFlashField;
-    if (kinds != .array or kinds.array.items.len != c.layers) return error.InvalidFlashLayers;
-    for (kinds.array.items, 0..) |v, i| {
-        if (v != .string) return error.InvalidFlashLayers;
-        c.kinds[i] = if (std.mem.eql(u8, v.string, "linear_attention")) .linear_attention else if (std.mem.eql(u8, v.string, "sparse_attention") or std.mem.eql(u8, v.string, "full_attention")) .sparse_attention else return error.InvalidFlashLayers;
-    }
+    try layerKinds(&c);
     if (text.get("ple_layer_ids")) |v| if (v != .null) {
         if (v != .array) return error.InvalidFlashNgram;
         for (v.array.items) |item| {

@@ -12,7 +12,7 @@ const Want = struct { name: []const u8, value: i64, moe: bool = false };
 const shapes = [_]Want{
     .{ .name = "hidden_size", .value = wt.dims },
     .{ .name = "num_hidden_layers", .value = wt.layers_n },
-    .{ .name = "full_attention_interval", .value = 4 },
+    .{ .name = "full_attention_interval", .value = shape.full_every },
     .{ .name = "vocab_size", .value = wt.vocab },
     .{ .name = "num_attention_heads", .value = wt.q_heads },
     .{ .name = "num_key_value_heads", .value = wt.kv_heads },

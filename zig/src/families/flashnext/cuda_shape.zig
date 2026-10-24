@@ -27,18 +27,33 @@ pub const Shape = struct {
     gdn_key_dim: usize,
     gdn_value_dim: usize,
     taps: usize,
+    /// Every `full_every`-th layer is full attention (the schedule's period), the others are DeltaNet.
+    full_every: usize,
 
     pub fn dense(s: Shape) bool {
         return s.experts == 0;
     }
 
-    /// Every fourth layer is full attention (cuda_prompt_wt.linearLayer).
+    pub fn linearLayer(s: Shape, layer: usize) bool {
+        return (layer + 1) % s.full_every != 0;
+    }
+
     pub fn linearLayers(s: Shape) usize {
-        return s.layers - s.layers / 4;
+        return s.layers - s.layers / s.full_every;
     }
 
     pub fn attnLayers(s: Shape) usize {
-        return s.layers / 4;
+        return s.layers / s.full_every;
+    }
+
+    /// The layer's place among the DeltaNet layers (its state slot).
+    pub fn linearIndex(s: Shape, layer: usize) usize {
+        return layer - layer / s.full_every;
+    }
+
+    /// The layer's place among the full-attention layers.
+    pub fn attnIndex(s: Shape, layer: usize) usize {
+        return layer / s.full_every;
     }
 
     pub fn wide(s: Shape) usize {
@@ -62,6 +77,7 @@ pub const Shape = struct {
     /// The first config field whose value the kernels cannot run, or null; each limit names its kernel constant.
     pub fn limits(s: Shape) ?[]const u8 {
         if (s.layers == 0 or s.layers > config.max_layers) return "num_hidden_layers";
+        if (s.full_every < 2 or s.full_every > s.layers) return "full_attention_interval";
         if (s.streams != 4) return "hc_count"; // cuda_glue's row HC kernels take four streams (the HC kernel holds eight)
         if (s.dims == 0 or s.dims % 256 != 0) return "hidden_size"; // the HC fold and the 256-wide K tile of the router
         if (s.low == 0 or s.low % 32 != 0) return "hc_lowrank"; // one quantization group per scale
@@ -85,8 +101,9 @@ pub const Shape = struct {
 
     /// The shape of a parsed config, or the layer or field the CUDA path would not serve.
     pub fn fromConfig(c: *const config.Config) !Shape {
-        if (c.isMixed()) return error.UnsupportedMixedLayers; // the CUDA path runs one feed-forward kind in every layer
+        if (c.isMixed()) return error.ProvisionalMixedLayers; // provisional: the CUDA path runs one feed-forward kind in every layer
         const dense_ffn = c.isDense();
+        const every = try scheduleEvery(c);
         const s: Shape = .{
             .layers = c.layers,
             .dims = c.hidden,
@@ -110,14 +127,24 @@ pub const Shape = struct {
             .gdn_key_dim = c.key_dim,
             .gdn_value_dim = c.value_dim,
             .taps = c.conv,
+            .full_every = every,
         };
         for (0..c.layers) |i| {
-            if ((c.kinds[i] == .linear_attention) != (i % 4 != 3)) return error.UnsupportedLayerSchedule;
+            if ((c.kinds[i] == .linear_attention) != s.linearLayer(i)) return error.UnsupportedLayerSchedule;
         }
         if (s.limits() != null) return error.UnsupportedShape;
         return s;
     }
 };
+
+/// A config's schedule period: the first full-attention layer's place, which full_attention_interval must match.
+fn scheduleEvery(c: *const config.Config) !usize {
+    var first: usize = 0;
+    while (first < c.layers and c.kinds[first] == .linear_attention) first += 1;
+    if (first == c.layers) return error.UnsupportedLayerSchedule; // no full-attention layer
+    if (c.text.get("full_attention_interval")) |v| if (v != .null and (v != .integer or v.integer != first + 1)) return error.UnsupportedLayerSchedule;
+    return first + 1;
+}
 
 /// The shipped Flash Next checkpoint: 2560 wide, 48 layers, 512 experts, Q24/KV2.
 pub const flash_next: Shape = .{
@@ -143,6 +170,7 @@ pub const flash_next: Shape = .{
     .gdn_key_dim = 128,
     .gdn_value_dim = 128,
     .taps = 4,
+    .full_every = 4,
 };
 
 /// A provisional dense shape implied by Intel's kernels, no released checkpoint; the layer count is a placeholder.

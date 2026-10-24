@@ -77,5 +77,58 @@ test "shape: a config with some dense and some MoE layers is refused" {
     var c = try config.parse(t.allocator, @embedFile("fixtures/config.json"));
     defer c.deinit();
     c.moe_layer[0] = false;
-    try t.expectError(error.UnsupportedMixedLayers, shape.Shape.fromConfig(&c));
+    try t.expectError(error.ProvisionalMixedLayers, shape.Shape.fromConfig(&c));
+}
+
+fn schedule(gpa: std.mem.Allocator, base: []const u8, drop_types: bool, interval: ?i64) !config.Config {
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, base, .{});
+    defer parsed.deinit();
+    const root = &parsed.value.object;
+    const text = if (root.getPtr("text_config")) |v| &v.object else root;
+    if (drop_types) _ = text.swapRemove("layer_types");
+    if (interval) |n| try text.put(gpa, "full_attention_interval", .{ .integer = n }) else _ = text.swapRemove("full_attention_interval");
+    const bytes = try std.json.Stringify.valueAlloc(gpa, parsed.value, .{});
+    defer gpa.free(bytes);
+    return config.parse(gpa, bytes);
+}
+
+test "shape: the schedule is read from layer_types or from full_attention_interval, and the two must agree" {
+    inline for (.{ @embedFile("fixtures/config.json"), @embedFile("fixtures/dense_config_parser_only.json") }, .{ shape.flash_next, shape.qwen4_dense }) |text, want| {
+        var types = try schedule(t.allocator, text, false, null);
+        defer types.deinit();
+        try t.expectEqualDeep(want, try shape.Shape.fromConfig(&types));
+        var interval = try schedule(t.allocator, text, true, 4);
+        defer interval.deinit();
+        try t.expectEqualSlices(config.Kind, types.kinds[0..types.layers], interval.kinds[0..interval.layers]);
+        try t.expectEqualDeep(want, try shape.Shape.fromConfig(&interval));
+        var both = try schedule(t.allocator, text, false, 4);
+        defer both.deinit();
+        try t.expectEqualDeep(want, try shape.Shape.fromConfig(&both));
+        var clash = try schedule(t.allocator, text, false, 3);
+        defer clash.deinit();
+        try t.expectError(error.UnsupportedLayerSchedule, shape.Shape.fromConfig(&clash));
+    }
+    try t.expectError(error.MissingFlashField, schedule(t.allocator, @embedFile("fixtures/config.json"), true, null));
+}
+
+test "shape: another period is a shape of its own, indexed by its period, and only the compiled one is served" {
+    var c = try schedule(t.allocator, @embedFile("fixtures/dense_config_parser_only.json"), true, 8);
+    defer c.deinit();
+    const s = try shape.Shape.fromConfig(&c);
+    try t.expectEqual(@as(usize, 8), s.full_every);
+    try t.expectEqual(@as(usize, 56), s.linearLayers());
+    try t.expectEqual(@as(usize, 8), s.attnLayers());
+    try t.expect(s.linearLayer(6) and !s.linearLayer(7));
+    try t.expectEqual(@as(usize, 7), s.linearIndex(8));
+    try t.expectEqual(@as(usize, 1), s.attnIndex(8));
+    try t.expect(!std.meta.eql(s, shape.compiled));
+    var flat = shape.flash_next;
+    flat.full_every = 1;
+    try t.expectEqualStrings("full_attention_interval", flat.limits().?);
+    // the 3:1 schedule's indexes are the ones the serving path has always used
+    for (0..48) |l| {
+        try t.expectEqual(l % 4 != 3, shape.flash_next.linearLayer(l));
+        try t.expectEqual(l - l / 4, shape.flash_next.linearIndex(l));
+        try t.expectEqual(l / 4, shape.flash_next.attnIndex(l));
+    }
 }
