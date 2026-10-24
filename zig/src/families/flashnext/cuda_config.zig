@@ -3,9 +3,10 @@
 const std = @import("std");
 const wt = @import("cuda_prompt_wt.zig");
 const gdn = @import("cuda_gdn.zig");
+const shape = @import("cuda_shape.zig").compiled;
 
 /// One config field and the value the kernels and buffers assume.
-const Want = struct { name: []const u8, value: i64 };
+const Want = struct { name: []const u8, value: i64, moe: bool = false };
 
 /// The text config's shapes the CUDA path's constants hold.
 const shapes = [_]Want{
@@ -16,10 +17,10 @@ const shapes = [_]Want{
     .{ .name = "num_attention_heads", .value = wt.q_heads },
     .{ .name = "num_key_value_heads", .value = wt.kv_heads },
     .{ .name = "head_dim", .value = wt.head_dim },
-    .{ .name = "num_experts", .value = wt.experts_n },
-    .{ .name = "num_experts_per_tok", .value = wt.slots - 1 },
-    .{ .name = "moe_intermediate_size", .value = wt.moe_w },
-    .{ .name = "shared_expert_intermediate_size", .value = wt.moe_w },
+    .{ .name = "num_experts", .value = wt.experts_n, .moe = true },
+    .{ .name = "num_experts_per_tok", .value = wt.slots - 1, .moe = true },
+    .{ .name = "moe_intermediate_size", .value = wt.moe_w, .moe = true },
+    .{ .name = "shared_expert_intermediate_size", .value = wt.moe_w, .moe = true },
     .{ .name = "hc_count", .value = wt.streams },
     .{ .name = "hc_lowrank", .value = wt.low },
     .{ .name = "linear_num_key_heads", .value = gdn.nk },
@@ -105,8 +106,13 @@ fn geometry(text: std.json.ObjectMap) ?[]const u8 {
     const learned = int(text, learned_key) orelse 0;
     if (learned < 0 or learned > 128 or @mod(learned, 32) != 0) return learned_key;
     for (shapes) |w| {
+        if (w.moe and shape.dense()) continue;
         const want = if (std.mem.eql(u8, w.name, "shared_expert_intermediate_size")) w.value + learned else w.value;
         if (int(text, w.name) != want) return w.name;
+    }
+    if (shape.dense()) {
+        if (int(text, "intermediate_size") != shape.ffn) return "intermediate_size";
+        if (given(text, "num_experts") != null) return "num_experts";
     }
     return semantics(text);
 }
@@ -119,6 +125,7 @@ fn projection(q: std.json.ObjectMap, name: []const u8, algo: []const u8, group: 
 }
 
 fn modeloptMismatch(text: std.json.ObjectMap, quant: std.json.ObjectMap) ?[]const u8 {
+    if (shape.dense()) return "quantization_config.dense_ffn"; // a dense checkpoint's quantization waits for its release
     if (!holds(quant.get("quant_method") orelse return "quantization_config.quant_method", .{ .word = "modelopt" })) return "quantization_config.quant_method";
     if (!holds(quant.get("quant_algo") orelse return "quantization_config.quant_algo", .{ .word = "MIXED_PRECISION" })) return "quantization_config.quant_algo";
     if (given(quant, "kv_cache_quant_algo") != null) return "quantization_config.kv_cache_quant_algo";

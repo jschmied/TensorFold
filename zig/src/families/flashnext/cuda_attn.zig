@@ -5,18 +5,19 @@ const cuda = @import("cuda");
 const core = @import("core");
 const hc = @import("cuda_hc.zig");
 const qmm = @import("cuda_qmm.zig");
+const wt = @import("cuda_prompt_wt.zig");
 
-const dims: usize = 2560;
-const q_heads: usize = 24;
-const kv_heads: usize = 2;
-const head_dim: usize = 256;
-const index_heads: usize = 4;
-const index_dim: usize = 128;
-const half: usize = 32;
+const dims = wt.dims;
+const q_heads = wt.q_heads;
+const kv_heads = wt.kv_heads;
+const head_dim = wt.head_dim;
+const index_heads = wt.index_heads;
+const index_dim = wt.index_dim;
+const half = wt.half;
 const eps: f32 = 1e-6;
 const attn_scale: f32 = 0.0625;
-const proj_n: usize = q_heads * 2 * head_dim + 2 * kv_heads * head_dim + (index_heads + 1) * index_dim;
-const out_k: usize = q_heads * head_dim;
+const proj_n = wt.proj_n;
+const out_k = wt.out_k;
 const nch: usize = 3;
 const prefix = "language_model.model.layers.47.self_attn.";
 
@@ -206,7 +207,6 @@ pub fn decode(comptime Tri: type, gpa: std.mem.Allocator, driver: *cuda.Driver, 
     const kn = file.get(prefix ++ "k_norm.weight") orelse return error.MissingTensor;
     const iqn = file.get(prefix ++ "indexer.q_layernorm.weight") orelse return error.MissingTensor;
     if (!qn.is(.bf16, &.{head_dim}) or !kn.is(.bf16, &.{head_dim}) or !iqn.is(.bf16, &.{index_dim})) return error.UnexpectedTensor;
-    if (proj_n != 13952) return error.UnexpectedTensor;
 
     const stacked = try stitch(gpa, &parts);
     defer gpa.free(stacked.words);

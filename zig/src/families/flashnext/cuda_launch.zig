@@ -3,6 +3,7 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const aot = cuda.aot;
+const wt = @import("cuda_prompt_wt.zig");
 
 pub const embed = @import("cuda_embed.zig");
 pub const projection = @import("cuda_projection.zig");
@@ -148,7 +149,7 @@ pub const Tri = struct {
     /// glue.attn_prep for text positions, bf16 KV (BITS 0, the scale pointers unread); `length` unused at MODE 0.
     pub fn attnPrep(t: Tri, proj: u64, pos: u64, q_scale: u64, k_scale: u64, i_scale: u64, inv: u64, q: u64, kc: u64, vc: u64, iq: u64, ikc: u64, rope: u64, delta: u64, eps: f32, rows: usize, length: usize) !void {
         if (t.glue("_attn_prep")) |g| return g.attnPrep(t.s, proj, pos, q_scale, k_scale, i_scale, inv, q, kc, vc, iq, ikc, eps, rows);
-        try t.run("_attn_prep", .{ u(rows), u(24 + 2 + 4 + 1), 1 }, &.{
+        try t.run("_attn_prep", .{ u(rows), u(wt.q_heads + wt.kv_heads + wt.index_heads + 1), 1 }, &.{
             p("P", "*bf16", proj),
             p("POS0", "*i32", pos),
             p("QW", "*fp32", q_scale),
@@ -166,7 +167,7 @@ pub const Tri = struct {
             p("DELTA", "*i32", delta),
             int("length", length),
             aot.float("eps", eps),
-        }, &.{ ci("PW", 13952), ci("NQ", 24), ci("NKV", 2), ci("HD", 256), ci("NI", 4), ci("IHD", 128), ci("HALF", 32), ci("BITS", 0), ci("MODE", 0), ci("S1", 11), ci("S2", 10) });
+        }, &.{ ci("PW", wt.proj_n), ci("NQ", wt.q_heads), ci("NKV", wt.kv_heads), ci("HD", wt.head_dim), ci("NI", wt.index_heads), ci("IHD", wt.index_dim), ci("HALF", wt.half), ci("BITS", 0), ci("MODE", 0), ci("S1", 11), ci("S2", 10) });
     }
 
     /// attention._chunks over 512-key chunks, bf16 KV; `qsa` the sparse form (NCH 5, QSA 1), else dense (NCH 3, QSA 0).
@@ -185,7 +186,7 @@ pub const Tri = struct {
             p("IDS", "*i32", ids),
             p("NKR", "*i32", nk),
             p("SPR", "*i32", sparse),
-        }, &.{ ci("H", 24), ci("HK", 2), ci("D", 256), ci("G", 12), ci("CH", 512), ci("NCH", if (qsa) 5 else 3), aot.cf("SCALE", 0.0625), ci("IDW", 2052), ci("QSA", @intFromBool(qsa)), ci("BITS", 0) });
+        }, &.{ ci("H", wt.q_heads), ci("HK", wt.kv_heads), ci("D", wt.head_dim), ci("G", wt.q_heads / wt.kv_heads), ci("CH", 512), ci("NCH", if (qsa) wt.nch else wt.dense_nch), aot.cf("SCALE", 0.0625), ci("IDW", wt.index_idw), ci("QSA", @intFromBool(qsa)), ci("BITS", 0) });
     }
 
     /// attention._merge: one program per row and per KV head, in attnChunks' form.
@@ -199,7 +200,7 @@ pub const Tri = struct {
             p("OUT", "*bf16", out),
             p("NKR", "*i32", nk),
             p("SPR", "*i32", sparse),
-        }, &.{ ci("H", 24), ci("HK", 2), ci("D", 256), ci("G", 12), ci("CH", 512), ci("NCH", if (qsa) 5 else 3), ci("QSA", @intFromBool(qsa)), ci("BITS", 0) });
+        }, &.{ ci("H", wt.q_heads), ci("HK", wt.kv_heads), ci("D", wt.head_dim), ci("G", wt.q_heads / wt.kv_heads), ci("CH", 512), ci("NCH", if (qsa) wt.nch else wt.dense_nch), ci("QSA", @intFromBool(qsa)), ci("BITS", 0) });
     }
 
     /// attention.qsa_pool for text rows (MODE 0): every complete block of 4 indexer keys pooled, normed and roped.
@@ -214,7 +215,7 @@ pub const Tri = struct {
             aot.float("eps", eps),
             int("R", rows),
             int("length", 0),
-        }, &.{ ci("DI", 128), ci("HALF", 32), ci("RATIO", 4), ci("MODE", 0), ci("S1", 11), ci("S2", 10) });
+        }, &.{ ci("DI", wt.index_dim), ci("HALF", wt.half), ci("RATIO", wt.index_ratio), ci("MODE", 0), ci("S1", 11), ci("S2", 10) });
     }
 
     /// attention._scores: rows' complete blocks scored; `nb` is the row stride (a multiple of 16), `blocks` the grid.
@@ -226,7 +227,7 @@ pub const Tri = struct {
             p("POS0", "*i32", pos),
             p("SC", "*fp32", sc),
             int("NB", nb),
-        }, &.{ ci("HI", 4), ci("DI", 128), ci("RATIO", 4), ci("TOP", 512), ci("BB", 64) });
+        }, &.{ ci("HI", wt.index_heads), ci("DI", wt.index_dim), ci("RATIO", wt.index_ratio), ci("TOP", wt.index_top), ci("BB", 64) });
     }
 
     /// Dense connections always use native glue; a captured affine projection cannot replace these operators.
@@ -385,19 +386,19 @@ pub const Tri = struct {
             p("L", "*fp32", logits),
             p("PICK", "*i32", pick),
             p("WTS", "*fp32", wts),
-        }, &.{ ci("NE", 512), ci("NL", 513), ci("TOPK", 10), ci("SLOTS", 11), ci("BLOCK", 1024), ci("SLOTP", 16) });
+        }, &.{ ci("NE", wt.experts_n), ci("NL", wt.experts_n + 1), ci("TOPK", wt.slots - 1), ci("SLOTS", wt.slots), ci("BLOCK", 1024), ci("SLOTP", 16) });
     }
 
     /// moe.router over `rows` rows at the one-row tiles (BM 16, BLOCK_E 32, BK 256), each row keeping its own bits.
     pub fn routerMany(t: Tri, x: u64, w: u64, out: u64, x_stride: usize, rows: usize) !void {
         if (t.glue("_router")) |g| return g.routerMany(t.s, x, w, out, x_stride, rows);
-        try t.run("_router", .{ cdiv(rows, 16), cdiv(513, 32), 1 }, &.{
+        try t.run("_router", .{ cdiv(rows, 16), cdiv(wt.experts_n + 1, 32), 1 }, &.{
             p("X", "*bf16", x),
             p("W", "*bf16", w),
             p("OUT", "*fp32", out),
             int("M", rows),
             int("x_stride", x_stride),
-        }, &.{ ci("D", 2560), ci("NE", 513), ci("BM", 16), ci("BLOCK_E", 32), ci("BK", 256) });
+        }, &.{ ci("D", wt.dims), ci("NE", wt.experts_n + 1), ci("BM", 16), ci("BLOCK_E", 32), ci("BK", 256) });
     }
 };
 
@@ -418,6 +419,7 @@ test {
     _ = @import("cuda_snap.zig");
     _ = @import("cuda_config.zig");
     _ = @import("dense_config_test.zig");
+    _ = @import("cuda_shape_test.zig");
     _ = @import("cuda_projection_load.zig");
     _ = @import("cuda_rank_engine.zig");
     _ = @import("cuda_round_graph.zig");

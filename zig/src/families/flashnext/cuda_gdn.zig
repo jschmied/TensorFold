@@ -6,11 +6,13 @@ const embed = @import("cuda_embed.zig");
 const hc = @import("cuda_hc.zig");
 const qmm = @import("cuda_qmm.zig");
 
-pub const nk: usize = 16;
-pub const nv: usize = 48;
-pub const dk: usize = 128;
-pub const dv: usize = 128;
-pub const taps: usize = 4;
+const shape = @import("cuda_shape.zig").compiled;
+
+pub const nk: usize = shape.gdn_key_heads;
+pub const nv: usize = shape.gdn_value_heads;
+pub const dk: usize = shape.gdn_key_dim;
+pub const dv: usize = shape.gdn_value_dim;
+pub const taps: usize = shape.taps;
 pub const conv_dim: usize = 2 * nk * dk + nv * dv;
 pub const proj_width: usize = conv_dim + nv * dv + 2 * nv;
 pub const value_dim: usize = nv * dv;
@@ -220,7 +222,7 @@ pub fn memory(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Stream
     const out_b = try mapped.lookup(gpa, try std.fmt.bufPrint(&name, "{s}out_proj.biases", .{prefix}), .bf16);
     if (conv.dim(0) != conv_dim or conv.dim(1) != taps or norm.dim(0) != dv) return error.UnexpectedTensor;
     if (a_bits.dim(0) != nv or dt_bits.dim(0) != nv) return error.UnexpectedTensor;
-    if (out_w.dim(0) != 2560 or out_w.dim(1) != value_dim / 8) return error.UnexpectedTensor;
+    if (out_w.dim(0) != shape.dims or out_w.dim(1) != value_dim / 8) return error.UnexpectedTensor;
     if (proj_bytes.len != proj_width * 2) return error.UnexpectedTensor;
 
     const proj = try gpa.alloc(u16, proj_width);
@@ -321,10 +323,10 @@ pub fn memory(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Stream
     const got_xs = try gpa.alloc(f32, groups);
     defer gpa.free(got_xs);
     for (got_xs, 0..) |*o, i| o.* = @bitCast(std.mem.readInt(u32, xs_bytes[4 * i ..][0..4], .little));
-    const host_proj = try gpa.alloc(u16, 2560);
+    const host_proj = try gpa.alloc(u16, shape.dims);
     defer gpa.free(host_proj);
-    try qmm.dotRow(got_u16, got_xs, out_w.bytes, out_s.bytes, out_b.bytes, 2560, value_dim, host_proj);
-    var lane = try qmm.pack(gpa, out_w.bytes, out_s.bytes, out_b.bytes, 2560, value_dim / 8);
+    try qmm.dotRow(got_u16, got_xs, out_w.bytes, out_s.bytes, out_b.bytes, shape.dims, value_dim, host_proj);
+    var lane = try qmm.pack(gpa, out_w.bytes, out_s.bytes, out_b.bytes, shape.dims, value_dim / 8);
     defer lane.deinit(gpa);
     var w_b = try cuda.DeviceBuffer.fromHost(driver, lane.weight);
     defer w_b.free();
@@ -332,10 +334,10 @@ pub fn memory(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Stream
     defer s_b.free();
     var b_b = try cuda.DeviceBuffer.fromHost(driver, lane.biases);
     defer b_b.free();
-    var branch = try cuda.DeviceBuffer.alloc(driver, 2560 * 2);
+    var branch = try cuda.DeviceBuffer.alloc(driver, shape.dims * 2);
     defer branch.free();
-    try qmm.matmul(driver, stream.*, gout.ptr, gxs.ptr, w_b.ptr, s_b.ptr, b_b.ptr, branch.ptr, 1, 2560, value_dim);
-    const branch_bytes = try gpa.alloc(u8, 2560 * 2);
+    try qmm.matmul(driver, stream.*, gout.ptr, gxs.ptr, w_b.ptr, s_b.ptr, b_b.ptr, branch.ptr, 1, shape.dims, value_dim);
+    const branch_bytes = try gpa.alloc(u8, shape.dims * 2);
     defer gpa.free(branch_bytes);
     try stream.synchronize();
     try branch.download(0, branch_bytes);
@@ -347,11 +349,11 @@ pub fn memory(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Stream
         if (dist != 0) proj_off += 1;
         if (dist > proj_steps) proj_steps = dist;
     }
-    std.debug.print("gdn out_proj n {d} off {d} max_steps {d} head {x:0>4} host {x:0>4}\n", .{ 2560, proj_off, proj_steps, std.mem.readInt(u16, branch_bytes[0..2], .little), host_proj[0] });
+    std.debug.print("gdn out_proj n {d} off {d} max_steps {d} head {x:0>4} host {x:0>4}\n", .{ shape.dims, proj_off, proj_steps, std.mem.readInt(u16, branch_bytes[0..2], .little), host_proj[0] });
     if (out_off != 0 or xs_off != 0 or st_off != 0 or proj_off != 0) return null;
     // Eight K slices, left unreduced for the write-back.
     const sk: usize = 8;
-    const n: usize = 2560;
+    const n: usize = shape.dims;
     var part_b = try cuda.DeviceBuffer.alloc(driver, sk * n * 4);
     defer part_b.free();
     try qmm.partials(driver, stream.*, gout.ptr, gxs.ptr, w_b.ptr, s_b.ptr, b_b.ptr, branch.ptr, part_b.ptr, 1, n, value_dim, sk);

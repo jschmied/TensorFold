@@ -5,15 +5,16 @@ const cuda = @import("cuda");
 const core = @import("core");
 const hc = @import("cuda_hc.zig");
 const qmm = @import("cuda_qmm.zig");
+const wt = @import("cuda_prompt_wt.zig");
 
-const dims: usize = 2560;
-const streams: usize = 4;
-const low: usize = 320;
+const dims = wt.dims;
+const streams = wt.streams;
+const low = wt.low;
 const wide: usize = streams * dims;
 const sk: usize = 32;
 const per: usize = 10;
 const eps: f32 = 1e-6;
-const vocab: usize = 248320;
+const vocab = wt.vocab;
 const prefix = "language_model.model.hyper_connection_mixer.";
 
 const Tensor = core.safetensors.Tensor;

@@ -1,7 +1,7 @@
 //! A single bounded decode graph, recaptured when sequence owners, scratch or attention geometry change.
 const std = @import("std");
 const cuda = @import("cuda");
-const dims = 2560;
+const dims = @import("cuda_prompt_wt.zig").dims;
 
 pub fn enabled() bool {
     const value = std.c.getenv("TF_FLASHNEXT_DECODE_GRAPH") orelse return false;

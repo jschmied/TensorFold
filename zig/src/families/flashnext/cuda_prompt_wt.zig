@@ -7,34 +7,36 @@ const hc = @import("cuda_hc.zig");
 const qmm = @import("cuda_qmm.zig");
 const gdn = @import("cuda_gdn.zig");
 
-pub const layers_n: usize = 48;
-pub const linear_n: usize = 36;
-pub const attn_n: usize = 12;
-pub const dims: usize = 2560;
-pub const streams: usize = 4;
-pub const wide: usize = streams * dims;
-pub const low: usize = 320;
+const shape = @import("cuda_shape.zig").compiled;
+
+pub const layers_n: usize = shape.layers;
+pub const linear_n: usize = shape.linearLayers();
+pub const attn_n: usize = shape.attnLayers();
+pub const dims: usize = shape.dims;
+pub const streams: usize = shape.streams;
+pub const wide: usize = shape.wide();
+pub const low: usize = shape.low;
 pub const eps: f32 = 1e-6;
-pub const vocab: usize = 248320;
-pub const experts_n: usize = 512;
-pub const slots: usize = 11;
-pub const moe_w: usize = 640;
+pub const vocab: usize = shape.vocab;
+pub const experts_n: usize = shape.experts;
+pub const slots: usize = shape.slots();
+pub const moe_w: usize = shape.moe_w;
 pub const block_bytes: usize = 160 * 4;
 pub const tile: usize = 16;
-pub const q_heads: usize = 24;
-pub const kv_heads: usize = 2;
-pub const head_dim: usize = 256;
-pub const index_heads: usize = 4;
-pub const index_dim: usize = 128;
-pub const half: usize = 32;
-pub const proj_n: usize = 13952;
-pub const out_k: usize = 6144;
+pub const q_heads: usize = shape.q_heads;
+pub const kv_heads: usize = shape.kv_heads;
+pub const head_dim: usize = shape.head_dim;
+pub const index_heads: usize = shape.index_heads;
+pub const index_dim: usize = shape.index_dim;
+pub const half: usize = shape.rotary_pairs;
+pub const proj_n: usize = shape.projN();
+pub const out_k: usize = shape.outK();
 /// Chunks of 512 keys a row's attention reads at most: 2,048 selected keys plus a tail, or 2,051 dense keys.
 pub const nch: usize = 5;
 pub const dense_nch: usize = 3;
 /// The block indexer (QSA): keys pooled in blocks of 4, a row past 512 complete blocks reads its 512 best.
-pub const index_ratio: usize = 4;
-pub const index_top: usize = 512;
+pub const index_ratio: usize = shape.index_ratio;
+pub const index_top: usize = shape.index_top;
 /// A row's key list: the budget's 2,048 keys plus a tail of up to ratio - 1 (attention.AttnScratch.idw).
 pub const index_idw: usize = index_top * index_ratio + index_ratio;
 /// Keys a dense row reads at most before selection starts: (top + 1) x ratio - 1.
