@@ -145,3 +145,31 @@ test "dense Flash Next config: an mlp_only_layers entry past the last layer is r
     defer c.deinit();
     try t.expect(!c.moe_layer[47] and c.moe_layer[46]);
 }
+
+test "dense Flash Next config: PLE is a capability, absent unless the config declares it" {
+    var bare = try config.parse(t.allocator, dense);
+    defer bare.deinit();
+    try t.expect(!bare.hasPle());
+    try t.expectEqual(@as(usize, 0), bare.ple_dim + bare.ple_conv + bare.ngram + bare.ngram_heads + bare.ngram_vocab + bare.ngram_shards);
+    const declared = try with(t.allocator, "ple_embed_dim", 5120);
+    defer t.allocator.free(declared);
+    var c = try config.parse(t.allocator, declared);
+    defer c.deinit();
+    try t.expect(c.hasPle());
+    try t.expectEqual(@as(usize, 5120), c.ple_dim);
+    try t.expectEqual(@as(usize, 3), c.ngram);
+    const odd = try with(t.allocator, "ple_embed_dim", 5121);
+    defer t.allocator.free(odd);
+    try t.expectError(error.InvalidFlashNgram, config.parse(t.allocator, odd));
+}
+
+test "dense Flash Next config: the shipped MoE config keeps its PLE" {
+    var c = try config.parse(t.allocator, moe);
+    defer c.deinit();
+    try t.expect(c.hasPle());
+    try t.expectEqual(@as(usize, 2560), c.ple_dim);
+    try t.expectEqual(@as(usize, 3), c.ngram);
+    try t.expectEqual(@as(usize, 8), c.ngram_heads);
+    try t.expectEqual(@as(usize, 20_000_000), c.ngram_vocab);
+    try t.expectEqual(@as(usize, 128), c.ngram_shards);
+}

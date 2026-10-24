@@ -100,6 +100,11 @@ pub const Config = struct {
         return std.math.add(usize, try std.math.mul(usize, 2, try c.keyWidth()), try c.valueWidth());
     }
 
+    /// The PLE is a capability: a config that declares none has no PLE fields (all zero), never Flash Next's defaults.
+    pub fn hasPle(c: *const Config) bool {
+        return c.ngram != 0;
+    }
+
     pub fn ngramHeadCount(c: *const Config) !usize {
         return std.math.mul(usize, c.ngram - 1, c.ngram_heads);
     }
@@ -223,6 +228,14 @@ fn ffnShape(text: std.json.ObjectMap) !Ffn {
     return .{ .intermediate = try optional(text, "intermediate_size", 0) };
 }
 
+/// The config keys that describe the PLE (per-layer embedding) capability.
+const ple_keys = [_][]const u8{ "ple_layer_ids", "ple_embed_dim", "ple_conv_kernel_size", "ngram_size", "heads_per_ngram", "ngram_vocab_size_base", "make_ngram_vocab_size_divisible_by", "split_ngram_parts" };
+
+fn pleDeclared(text: std.json.ObjectMap) bool {
+    for (ple_keys) |k| if (text.get(k)) |v| if (v != .null) return true;
+    return false;
+}
+
 /// Which layers are MoE: not in `mlp_only_layers`, experts exist, and (index + 1) divides by `decoder_sparse_step`.
 fn moeLayers(c: *Config) !void {
     const step = try optional(c.text, "decoder_sparse_step", 1);
@@ -266,6 +279,7 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Config {
     const gate: std.json.Value = text.get("output_gate_type") orelse .{ .string = "sigmoid" };
     if (gate != .string) return error.UnsupportedFlashGate;
     const moe = try ffnShape(text);
+    const ple = pleDeclared(text);
     var c = Config{
         .parsed = parsed,
         .text = text,
@@ -297,13 +311,13 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Config {
         .index_dim = try optional(text, "indexer_head_dim", 128),
         .index_budget = try optional(text, "indexer_budget", 2048),
         .index_ratio = try optional(text, "indexer_compress_ratio", 4),
-        .ple_dim = try optional(text, "ple_embed_dim", hidden),
-        .ple_conv = try optional(text, "ple_conv_kernel_size", 4),
-        .ngram = try optional(text, "ngram_size", 3),
-        .ngram_heads = try optional(text, "heads_per_ngram", 8),
-        .ngram_vocab = try optional(text, "ngram_vocab_size_base", 20_000_000),
-        .ngram_divisor = try optional(text, "make_ngram_vocab_size_divisible_by", 128),
-        .ngram_shards = try optional(text, "split_ngram_parts", 128),
+        .ple_dim = if (ple) try optional(text, "ple_embed_dim", hidden) else 0,
+        .ple_conv = if (ple) try optional(text, "ple_conv_kernel_size", 4) else 0,
+        .ngram = if (ple) try optional(text, "ngram_size", 3) else 0,
+        .ngram_heads = if (ple) try optional(text, "heads_per_ngram", 8) else 0,
+        .ngram_vocab = if (ple) try optional(text, "ngram_vocab_size_base", 20_000_000) else 0,
+        .ngram_divisor = if (ple) try optional(text, "make_ngram_vocab_size_divisible_by", 128) else 0,
+        .ngram_shards = if (ple) try optional(text, "split_ngram_parts", 128) else 0,
         .seed = try optional(text, "seed", 1234),
         .mtp = try mtpConfig(text),
         .mrope_interleaved = try boolean(rope, "mrope_interleaved", true),
@@ -320,9 +334,11 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Config {
     const sections = try std.math.add(usize, try std.math.add(usize, c.mrope_section[0], c.mrope_section[1]), c.mrope_section[2]);
     if (c.rotary_dim > 0 and try std.math.mul(usize, sections, 2) != c.rotary_dim and rope.get("mrope_section") != null) return error.UnsupportedFlashRope;
     if (c.eps <= 0 or !std.math.isFinite(c.eps) or c.rope_theta <= 0 or c.rotary_dim % 2 != 0 or c.rotary_dim > c.head_dim or c.rotary_dim > c.index_dim) return error.UnsupportedFlashRope;
-    if (c.ngram < 2 or c.ngram_heads == 0 or c.ngram_vocab == 0 or c.ngram_divisor == 0 or c.ngram_shards == 0 or c.ple_conv < 2) return error.InvalidFlashNgram;
-    const table_heads = try c.ngramHeadCount();
-    if (c.ple_dim == 0 or c.ple_dim % table_heads != 0) return error.InvalidFlashNgram;
+    if (ple) {
+        if (c.ngram < 2 or c.ngram_heads == 0 or c.ngram_vocab == 0 or c.ngram_divisor == 0 or c.ngram_shards == 0 or c.ple_conv < 2) return error.InvalidFlashNgram;
+        const table_heads = try c.ngramHeadCount();
+        if (c.ple_dim == 0 or c.ple_dim % table_heads != 0) return error.InvalidFlashNgram;
+    }
     _ = try c.wide();
     _ = try c.convWidth();
     try moeLayers(&c);
