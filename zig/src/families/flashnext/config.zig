@@ -15,6 +15,7 @@ pub const Config = struct {
     vocab: usize,
     layers: usize,
     kinds: [max_layers]Kind = undefined,
+    moe_layer: [max_layers]bool = @splat(false),
     eps: f32,
     heads: usize,
     kv_heads: usize,
@@ -27,7 +28,7 @@ pub const Config = struct {
     value_dim: usize,
     conv: usize,
     gate: Gate,
-    /// The MoE widths below are 0 for a dense config (`intermediate` > 0); isDense() says which.
+    /// The MoE widths are 0 without experts; `intermediate` is any dense layer's width (moe_layer says which).
     experts: usize,
     topk: usize,
     expert_width: usize,
@@ -73,8 +74,14 @@ pub const Config = struct {
         return parse(gpa, bytes);
     }
 
+    /// No layer is MoE (num_experts absent or 0, or every layer in mlp_only_layers).
     pub fn isDense(c: *const Config) bool {
-        return c.experts == 0;
+        return std.mem.indexOfScalar(bool, c.moe_layer[0..c.layers], true) == null;
+    }
+
+    /// Some layers are MoE and some dense.
+    pub fn isMixed(c: *const Config) bool {
+        return !c.isDense() and std.mem.indexOfScalar(bool, c.moe_layer[0..c.layers], false) != null;
     }
 
     pub fn wide(c: *const Config) !usize {
@@ -200,18 +207,43 @@ fn quantBlock(root: std.json.ObjectMap, text: std.json.ObjectMap) !std.json.Obje
 
 const Ffn = struct { experts: usize = 0, topk: usize = 0, expert_width: usize = 0, shared_width: usize = 0, intermediate: usize = 0 };
 
-/// With `num_experts` the config is MoE and needs every expert field; without, it is a provisional dense one.
+/// Intel's rule (vLLM qwen4_exp): num_experts absent or 0 leaves every layer dense, else the MoE fields are needed.
 fn ffnShape(text: std.json.ObjectMap) !Ffn {
-    if (text.get("num_experts") != null) return .{
-        .experts = try required(text, "num_experts"),
+    const experts = if (text.get("num_experts")) |v| (if (v == .null) 0 else try integer(v)) else 0;
+    if (experts > 0) return .{
+        .experts = experts,
         .topk = try required(text, "num_experts_per_tok"),
         .expert_width = try required(text, "moe_intermediate_size"),
         .shared_width = try required(text, "shared_expert_intermediate_size"),
+        .intermediate = try optional(text, "intermediate_size", 0),
     };
     for ([_][]const u8{ "num_experts_per_tok", "moe_intermediate_size", "shared_expert_intermediate_size" }) |name| {
         if (text.get(name) != null) return error.ProvisionalDenseHasMoeFields;
     }
-    return .{ .intermediate = required(text, "intermediate_size") catch return error.ProvisionalDenseNeedsIntermediateSize };
+    return .{ .intermediate = try optional(text, "intermediate_size", 0) };
+}
+
+/// Which layers are MoE: not in `mlp_only_layers`, experts exist, and (index + 1) divides by `decoder_sparse_step`.
+fn moeLayers(c: *Config) !void {
+    const step = try optional(c.text, "decoder_sparse_step", 1);
+    if (step == 0) return error.InvalidFlashShape;
+    var only: [max_layers]bool = @splat(false);
+    if (c.text.get("mlp_only_layers")) |v| if (v != .null) {
+        if (v != .array) return error.InvalidFlashLayers;
+        for (v.array.items) |item| {
+            const i = try integer(item);
+            if (i < c.layers) only[i] = true;
+        }
+    };
+    var dense_layers: usize = 0;
+    for (0..c.layers) |i| {
+        c.moe_layer[i] = !only[i] and c.experts > 0 and (i + 1) % step == 0;
+        if (!c.moe_layer[i]) dense_layers += 1;
+    }
+    if (dense_layers == 0) return;
+    // a provisional dense layer: Qwen3NextMLP(hidden_size, intermediate_size, hidden_act)
+    if (c.intermediate == 0) return error.ProvisionalDenseNeedsIntermediateSize;
+    if (c.text.get("hidden_act")) |v| if (v != .string or !std.mem.eql(u8, v.string, "silu")) return error.ProvisionalDenseActivation;
 }
 
 pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Config {
@@ -292,6 +324,7 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Config {
     if (c.ple_dim == 0 or c.ple_dim % table_heads != 0) return error.InvalidFlashNgram;
     _ = try c.wide();
     _ = try c.convWidth();
+    try moeLayers(&c);
     const kinds = text.get("layer_types") orelse return error.MissingFlashField;
     if (kinds != .array or kinds.array.items.len != c.layers) return error.InvalidFlashLayers;
     for (kinds.array.items, 0..) |v, i| {
