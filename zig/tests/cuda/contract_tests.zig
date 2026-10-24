@@ -34,6 +34,7 @@ const round_k = @import("contract_tree_round.zig");
 const act_k = @import("contract_act.zig");
 const vit_g4_group = @import("contract_gemma_group.zig");
 const gdn_k = @import("contract_gdn.zig");
+const qwen4_k = @import("contract_qwen4.zig");
 const qk_k = @import("contract_qk.zig");
 const wrows_k = @import("contract_window_rows.zig");
 const embed_k = @import("contract_embed.zig");
@@ -448,6 +449,9 @@ pub fn run(gpu: check.Gpu) !void {
     for (std.enums.values(glue_k.Kind), &glues) |kind, *m| m.* = .{ .rig = .{ .gpu = gpu, .s = s }, .kind = kind, .f = &glue_fns, .glue = &fglue };
     defer for (&glues) |*m| m.deinit();
     for (&glues) |*m| try kernels.append(a, m.kernel());
+    var qwen4 = try qwen4_k.Group.init(gpu, s, q35_mod, &fglue, hcf_mod);
+    defer qwen4.deinit();
+    try qwen4.append(a, &kernels);
     var wrows: [wrows_k.cfgs.len]wrows_k.Rows = undefined;
     for (&wrows, wrows_k.cfgs) |*x, f| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .f = f, .g = &window_fns, .ctl = mods[5], .arena = .init(a) };
     defer for (&wrows) |*x| x.deinit();

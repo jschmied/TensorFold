@@ -27,12 +27,15 @@ fn slicesOf(s: c.Shape) usize {
     return 1;
 }
 
+/// A provisional dense Qwen4 GDN layer at hidden 5120: its q|k|v|z|b|a input projection rows.
+const qwen4_gdn_in = 2 * 16 * 128 + 48 * 128 + 48 * 128 + 2 * 48;
+
 const tiles = [3]c.Tile{ .{ .size = 64 }, .{ .size = 128, .step = 32, .min = 32 }, .{ .size = 256, .step = 64, .min = 64 } };
 
 pub fn spec(kind: Kind) c.Spec {
     return switch (kind) {
-        .prompt => .{ .name = "cuda flashnext factored prompt matmul 64x128", .accum = .f32, .depth = depth, .ops = 2, .out = .bf16, .replaces = "qmm.cu's 16x64 lane tile", .tiles = tiles, .served = &.{ .{ .rows = 64, .n = 13952, .k = 2560 }, .{ .rows = 100, .n = 2560, .k = 2560 } } },
-        .fold => .{ .name = "cuda flashnext factored prompt matmul 64x128, K slices folded", .accum = .f32, .depth = depth, .ops = 2, .out = .f32, .replaces = "the lane tile's K slices then fn_sum_slices", .tiles = tiles, .served = &.{ .{ .rows = 64, .n = 2560, .k = 2560 }, .{ .rows = 100, .n = 2560, .k = 6144 } } },
+        .prompt => .{ .name = "cuda flashnext factored prompt matmul 64x128", .accum = .f32, .depth = depth, .ops = 2, .out = .bf16, .replaces = "qmm.cu's 16x64 lane tile", .tiles = tiles, .served = &.{ .{ .rows = 64, .n = 13952, .k = 2560 }, .{ .rows = 100, .n = 2560, .k = 2560 }, .{ .rows = 64, .n = qwen4_gdn_in, .k = 5120 } } },
+        .fold => .{ .name = "cuda flashnext factored prompt matmul 64x128, K slices folded", .accum = .f32, .depth = depth, .ops = 2, .out = .f32, .replaces = "the lane tile's K slices then fn_sum_slices", .tiles = tiles, .served = &.{ .{ .rows = 64, .n = 2560, .k = 2560 }, .{ .rows = 100, .n = 2560, .k = 6144 }, .{ .rows = 100, .n = 5120, .k = 6144 } } },
     };
 }
 
