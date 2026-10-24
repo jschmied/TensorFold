@@ -1,4 +1,4 @@
-//! A dense Flash Next config (no experts, one SwiGLU width) parses beside the MoE one without changing it.
+//! A dense Flash Next config (provisional: no released checkpoint) parses beside the MoE one without changing it.
 const std = @import("std");
 const config = @import("config.zig");
 const t = std.testing;
@@ -50,14 +50,14 @@ test "dense Flash Next config: the shipped MoE config is not dense and has no de
 test "dense Flash Next config: a dense config needs its width and refuses a half MoE description" {
     const no_width = try without(t.allocator, "intermediate_size");
     defer t.allocator.free(no_width);
-    try t.expectError(error.MissingFlashField, config.parse(t.allocator, no_width));
+    try t.expectError(error.ProvisionalDenseNeedsIntermediateSize, config.parse(t.allocator, no_width));
     const zero = try with(t.allocator, "intermediate_size", 0);
     defer t.allocator.free(zero);
-    try t.expectError(error.InvalidFlashInteger, config.parse(t.allocator, zero));
+    try t.expectError(error.ProvisionalDenseNeedsIntermediateSize, config.parse(t.allocator, zero));
     for ([_][]const u8{ "num_experts_per_tok", "moe_intermediate_size", "shared_expert_intermediate_size" }) |key| {
         const half = try with(t.allocator, key, 8);
         defer t.allocator.free(half);
-        try t.expectError(error.InvalidFlashShape, config.parse(t.allocator, half));
+        try t.expectError(error.ProvisionalDenseHasMoeFields, config.parse(t.allocator, half));
     }
 }
 
@@ -68,4 +68,17 @@ test "dense Flash Next config: experts without the rest of the MoE fields still 
     const none = try with(t.allocator, "num_experts", 0);
     defer t.allocator.free(none);
     try t.expectError(error.InvalidFlashInteger, config.parse(t.allocator, none));
+}
+
+test "dense Flash Next config: the HC rank is read, never defaulted to Flash Next's 320" {
+    const no_rank = try without(t.allocator, "hc_lowrank");
+    defer t.allocator.free(no_rank);
+    try t.expectError(error.MissingFlashField, config.parse(t.allocator, no_rank));
+    for ([_]i64{ 640, 320 }) |rank| {
+        const text = try with(t.allocator, "hc_lowrank", rank);
+        defer t.allocator.free(text);
+        var c = try config.parse(t.allocator, text);
+        defer c.deinit();
+        try t.expectEqual(@as(usize, @intCast(rank)), c.hc_lowrank);
+    }
 }

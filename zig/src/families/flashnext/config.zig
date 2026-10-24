@@ -200,7 +200,7 @@ fn quantBlock(root: std.json.ObjectMap, text: std.json.ObjectMap) !std.json.Obje
 
 const Ffn = struct { experts: usize = 0, topk: usize = 0, expert_width: usize = 0, shared_width: usize = 0, intermediate: usize = 0 };
 
-/// A config with `num_experts` is MoE and needs every expert field; one without is dense and needs `intermediate_size`.
+/// With `num_experts` the config is MoE and needs every expert field; without, it is a provisional dense one.
 fn ffnShape(text: std.json.ObjectMap) !Ffn {
     if (text.get("num_experts") != null) return .{
         .experts = try required(text, "num_experts"),
@@ -209,9 +209,9 @@ fn ffnShape(text: std.json.ObjectMap) !Ffn {
         .shared_width = try required(text, "shared_expert_intermediate_size"),
     };
     for ([_][]const u8{ "num_experts_per_tok", "moe_intermediate_size", "shared_expert_intermediate_size" }) |name| {
-        if (text.get(name) != null) return error.InvalidFlashShape;
+        if (text.get(name) != null) return error.ProvisionalDenseHasMoeFields;
     }
-    return .{ .intermediate = try required(text, "intermediate_size") };
+    return .{ .intermediate = required(text, "intermediate_size") catch return error.ProvisionalDenseNeedsIntermediateSize };
 }
 
 pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Config {
@@ -258,7 +258,7 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Config {
         .shared_width = moe.shared_width,
         .intermediate = moe.intermediate,
         .hc_count = try optional(text, "hc_count", 4),
-        .hc_lowrank = try optional(text, "hc_lowrank", 320),
+        .hc_lowrank = if (moe.experts == 0) try required(text, "hc_lowrank") else try optional(text, "hc_lowrank", 320),
         .index_heads = try optional(text, "indexer_n_heads", 4),
         .index_kv_heads = try optional(text, "indexer_kv_heads", 1),
         .index_dim = try optional(text, "indexer_head_dim", 128),
