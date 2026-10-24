@@ -50,7 +50,7 @@ pub const Shape = struct {
         return s.top_k + 1;
     }
 
-    /// The q|gate, k, v and indexer columns: Flash Next's combined layout, provisional for Qwen4 (Intel does not confirm).
+    /// The q|gate, k, v and indexer columns: Flash Next's layout, provisional for Qwen4 (Intel does not confirm it).
     pub fn projN(s: Shape) usize {
         return s.q_heads * 2 * s.head_dim + 2 * s.kv_heads * s.head_dim + (s.index_heads + 1) * s.index_dim;
     }

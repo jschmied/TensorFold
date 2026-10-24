@@ -1,4 +1,4 @@
-//! A dense Flash Next config (provisional, parser-only: its 6-bit quantization has no CUDA load) parses beside the MoE one.
+//! A provisional dense config (parser-only: its 6-bit quantization has no CUDA load) parses beside the MoE one.
 const std = @import("std");
 const config = @import("config.zig");
 const t = std.testing;
