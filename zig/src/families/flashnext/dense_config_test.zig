@@ -1,9 +1,10 @@
 //! A dense Flash Next config (provisional: no released checkpoint) parses beside the MoE one without changing it.
+//! The fixture is parser-only: its quantization.bits is 6, which cuda_config admits no CUDA load for (4-bit, group 32 only).
 const std = @import("std");
 const config = @import("config.zig");
 const t = std.testing;
 
-const dense = @embedFile("fixtures/dense_config.json");
+const dense = @embedFile("fixtures/dense_config_parser_only.json");
 const moe = @embedFile("fixtures/config.json");
 
 fn without(gpa: std.mem.Allocator, key: []const u8) ![]u8 {

@@ -24,7 +24,7 @@ test "shape: the shipped config yields the compiled shape and the constants the 
 }
 
 test "shape: the synthetic dense config yields the Qwen4-27B shape" {
-    var c = try config.parse(t.allocator, @embedFile("fixtures/dense_config.json"));
+    var c = try config.parse(t.allocator, @embedFile("fixtures/dense_config_parser_only.json"));
     defer c.deinit();
     const s = try shape.Shape.fromConfig(&c);
     try t.expectEqualDeep(shape.qwen4_dense, s);
@@ -67,7 +67,7 @@ test "shape: each kernel limit names the config field a shape breaks" {
 }
 
 test "shape: a layer schedule other than every fourth full attention is refused" {
-    var c = try config.parse(t.allocator, @embedFile("fixtures/dense_config.json"));
+    var c = try config.parse(t.allocator, @embedFile("fixtures/dense_config_parser_only.json"));
     defer c.deinit();
     c.kinds[3] = .linear_attention;
     try t.expectError(error.UnsupportedLayerSchedule, shape.Shape.fromConfig(&c));
