@@ -80,6 +80,8 @@ pub const Layer = struct {
     experts_up: cuda.DeviceBuffer,
     experts_down: cuda.DeviceBuffer,
     native_experts: ?mixed.Owned = null,
+    /// A dense layer's feed-forward in place of the experts (provisional; nothing loads it from a checkpoint yet).
+    ffn: ?@import("cuda_dense_ffn.zig").Ffn = null,
 
     pub fn free(self: *Layer, gpa: std.mem.Allocator) void {
         _ = gpa;
@@ -103,6 +105,7 @@ pub const Layer = struct {
         self.nc.free();
         self.ple_cw.free();
         if (self.native_experts) |*e| e.free();
+        if (self.ffn) |*f| f.free();
         self.experts_up.free();
         self.experts_down.free();
     }

@@ -19,6 +19,8 @@ pub const batch_state = @import("cuda_batch_state.zig");
 pub const tile_kernels = @import("cuda_tile_kernels.zig");
 pub const gdn = @import("cuda_gdn.zig");
 pub const mlp = @import("cuda_mlp.zig");
+/// The provisional dense feed-forward node (no released Qwen4 checkpoint).
+pub const dense_ffn = @import("cuda_dense_ffn.zig");
 pub const moe = @import("cuda_moe.zig");
 pub const attn = @import("cuda_attn.zig");
 pub const ple = @import("cuda_ple.zig");
@@ -420,6 +422,7 @@ test {
     _ = @import("cuda_config.zig");
     _ = @import("dense_config_test.zig");
     _ = @import("cuda_shape_test.zig");
+    _ = @import("cuda_batch_dense.zig");
     _ = @import("cuda_projection_load.zig");
     _ = @import("cuda_rank_engine.zig");
     _ = @import("cuda_round_graph.zig");

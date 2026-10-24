@@ -557,8 +557,10 @@ pub fn Pass(comptime Tri: type) type {
                 if (keep.mix_branch != 0) try self.sumSlices(s.part, keep.mix_branch, true, n * dims, self.out_slices);
                 try self.tri.hcWriteback(s.h, s.h, s.pss, s.part, "*fp32", s.inj, s.dummy, "*bf16", s.dummy, "*bf16", n * dims, n, dims, streams, 4, 1, 1, self.out_slices);
                 try self.readoutKeep(lw.mlp_hc, 0, n, keep.mlp_hc);
-                try self.moeBlockKeep(lw, keep);
-                try self.moeAdds(layer, keep);
+                if (lw.ffn) |*ffn| try @import("cuda_batch_dense.zig").block(self, ffn, layer, keep) else {
+                    try self.moeBlockKeep(lw, keep);
+                    try self.moeAdds(layer, keep);
+                }
                 self.pending = layer;
             }
             try self.head(logits_host);
