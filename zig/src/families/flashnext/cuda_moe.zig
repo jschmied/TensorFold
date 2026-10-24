@@ -228,6 +228,7 @@ fn maxUlp(got: []const f32, want: []const f32) struct { off: usize, ulp: u32 } {
 
 /// The 512 routed experts and the shared expert, on the mixed row already at `mixed`.
 pub fn experts(comptime Tri: type, gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Stream, mapped: *const embed.Mapped, tri: Tri, mixed: u64) !u32 {
+    if (comptime wt.experts_n == 0) return error.DenseShapeHasNoExperts; // the probe is layer 0's MoE; a dense shape has none
     if (!cuda.kernels.available) return error.BuiltWithoutKernels;
     const prefix = "language_model.model.layers.0.mlp.";
     var name: [180]u8 = undefined;

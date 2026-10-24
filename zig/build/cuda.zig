@@ -164,12 +164,20 @@ fn qwenVisionModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
 
 /// Flash Next's CUDA family, sharing the maintained runtime and lane core.
 fn flashnextModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, qwen_vision: *std.Build.Module) *std.Build.Module {
+    return flashnextShape(b, target, optimize, cuda, core, lanes, qwen_vision, "flash_next");
+}
+
+/// The Flash Next module for a cuda_shape.zig shape: "flash_next" serves, "qwen4_dense" is only a compile check.
+fn flashnextShape(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, qwen_vision: *std.Build.Module, shape: []const u8) *std.Build.Module {
     const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/flashnext/cuda_launch.zig"), .target = target, .optimize = optimize, .link_libc = true });
     m.addImport("cuda", cuda);
     m.addImport("core", core);
     m.addImport("lanes", lanes);
     m.addImport("qwen_vision", qwen_vision);
     m.addImport("living", core.import_table.get("living").?);
+    const picked = b.addOptions();
+    picked.addOption([]const u8, "name", shape);
+    m.addOptions("flashnext_shape", picked);
     return m;
 }
 
@@ -585,4 +593,5 @@ fn flashnextChecks(b: *std.Build, target: std.Build.ResolvedTarget, optimize: st
     if (embed_model != null and prompt_ids != null) learn_run.addArgs(&.{ embed_model.?, prompt_ids.? });
     b.step("flashnext-learn", "Trainer forward identity and all-path finite-difference gates").dependOn(&learn_run.step);
     b.step("compile-flashnext-learn", "Compile the real trainer runner without executing it").dependOn(&learn_exe.step);
+    @import("flashnext_dense_compile.zig").steps(b, target, optimize, cuda, core, flashnextShape(b, target, optimize, cuda, core, lanes, qwen_vision, "qwen4_dense"));
 }

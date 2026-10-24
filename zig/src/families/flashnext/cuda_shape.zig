@@ -159,8 +159,8 @@ pub const qwen4_dense: Shape = blk: {
     break :blk s;
 };
 
-/// The shape this build serves: the CUDA path's constants (cuda_prompt_wt, cuda_gdn) come from here.
-pub const compiled: Shape = flash_next;
+/// The shape this build serves (cuda_prompt_wt, cuda_gdn); step compile-flashnext-dense sets qwen4_dense to compile it.
+pub const compiled: Shape = if (std.mem.eql(u8, @import("flashnext_shape").name, "qwen4_dense")) qwen4_dense else flash_next;
 
 comptime {
     if (compiled.limits()) |field| @compileError("the compiled Flash Next shape is outside the kernels' limits at " ++ field);
