@@ -536,3 +536,145 @@ extern "C" __global__ void __launch_bounds__(tf_l2::NT) tf_slerp_rows(const __nv
                                                                       __nv_bfloat16* h, int width, float eps) {
     tf_l2::slerp_rows<tf_l2::A | tf_l2::B>(res, out, alpha, scale, h, width, eps);
 }
+
+// Strided rows (Nemotron's order): thread t of T holds elements t, t + T, ...; fixed-order fp32 sums.
+namespace tf_rms_strided {
+
+constexpr int MOST = 4096; // the widest row a block holds in shared memory
+
+__device__ __forceinline__ float bf(__nv_bfloat16 v) { return __bfloat162float(v); }
+__device__ __forceinline__ float rbf(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }
+
+// Each warp's share of xb's squares into red: a thread's fma chain in index order, then the warp's butterfly.
+template <int T>
+__device__ __forceinline__ void square_warps(const float* xb, int width, float* red) {
+    float acc = 0.f;
+    for (int i = threadIdx.x; i < width; i += T) acc = __fmaf_rn(xb[i], xb[i], acc);
+#pragma unroll
+    for (int m = 16; m > 0; m >>= 1) acc = __fadd_rn(acc, __shfl_xor_sync(0xFFFFFFFFu, acc, m));
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = acc;
+}
+
+// The row's sum of squares: the warps' shares in order.
+template <int T>
+__device__ __forceinline__ float warps_in_order(const float* red) {
+    float ss = red[0];
+    for (int w = 1; w < T / 32; ++w) ss = __fadd_rn(ss, red[w]);
+    return ss;
+}
+
+// 1 / sqrt(ss / n + eps) with IEEE division and square root.
+__device__ __forceinline__ float inv_rms(float ss, int n, float eps) {
+    return __fdiv_rn(1.f, __fsqrt_rn(__fadd_rn(__fdiv_rn(ss, static_cast<float>(n)), eps)));
+}
+
+// y = bf16((x inv) w), or bf16(w bf16(x inv)) with ROUND, over xb's row (left holding y), then y's 64-sums in order.
+template <int T, bool ROUND>
+__device__ __forceinline__ void scale_store(float* xb, int width, float inv, const __nv_bfloat16* __restrict__ w,
+                                            __nv_bfloat16* __restrict__ y, float* __restrict__ xs) {
+    for (int i = threadIdx.x; i < width; i += T) {
+        const float v = ROUND ? __fmul_rn(bf(w[i]), rbf(__fmul_rn(xb[i], inv))) : __fmul_rn(__fmul_rn(xb[i], inv), bf(w[i]));
+        const __nv_bfloat16 o = __float2bfloat16_rn(v);
+        y[i] = o;
+        xb[i] = bf(o);
+    }
+    if (xs == nullptr) return;
+    __syncthreads();
+    for (int g = threadIdx.x; g < width / 64; g += T) {
+        float s = 0.f;
+        for (int j = 0; j < 64; ++j) s = __fadd_rn(s, xb[g * 64 + j]);
+        xs[g] = s;
+    }
+}
+
+// Part p of row r at x + r x_ld + p x_part (w + p w_part; y and xs alike): y = its norm, xs y's 64-sums.
+template <int T, bool ROUND>
+__device__ __forceinline__ void parts(const __nv_bfloat16* x, long long x_ld, long long x_part, const __nv_bfloat16* w,
+                                      long long w_part, __nv_bfloat16* y, long long y_ld, long long y_part, float* xs,
+                                      int width, float eps) {
+    __shared__ float red[T / 32];
+    __shared__ float xb[MOST];
+    const int64_t r = blockIdx.x, p = blockIdx.y, yo = r * y_ld + p * y_part;
+    x += r * x_ld + p * x_part;
+    for (int i = threadIdx.x; i < width; i += T) xb[i] = bf(x[i]);
+    __syncthreads();
+    square_warps<T>(xb, width, red);
+    __syncthreads();
+    const float inv = inv_rms(warps_in_order<T>(red), width, eps);
+    scale_store<T, ROUND>(xb, width, inv, w + p * w_part, y + yo, xs != nullptr ? xs + yo / 64 : nullptr);
+}
+
+} // namespace tf_rms_strided
+
+// y = bf16((x inv) w) and xs its 64-value sums on strided parts of rows, Nemotron's order with 256 threads.
+extern "C" __global__ void __launch_bounds__(256) tf_rms_rows_bf16h_parts(
+    const __nv_bfloat16* x, long long x_ld, long long x_part, const __nv_bfloat16* w, long long w_part, __nv_bfloat16* y,
+    long long y_ld, long long y_part, float* xs, int width, float eps) {
+    tf_rms_strided::parts<256, false>(x, x_ld, x_part, w, w_part, y, y_ld, y_part, xs, width, eps);
+}
+
+// The same parts with MLX's bf16 steps, y = bf16(w * bf16(x * inv)), with 128 threads.
+extern "C" __global__ void __launch_bounds__(128) tf_rms_rows_bf16h_parts_round(
+    const __nv_bfloat16* x, long long x_ld, long long x_part, const __nv_bfloat16* w, long long w_part, __nv_bfloat16* y,
+    long long y_ld, long long y_part, float* xs, int width, float eps) {
+    tf_rms_strided::parts<128, true>(x, x_ld, x_part, w, w_part, y, y_ld, y_part, xs, width, eps);
+}
+
+// h = bf16(x + bf16(sum_k<routed fma(wt_k, y_k) + sum_k>=routed y_k)) over a row's expert slots, then the strided norm
+// of h with 256 threads: 1,024 threads load (every load in flight), slots up to 8, rows up to 4,096 wide.
+extern "C" __global__ void __launch_bounds__(1024) tf_moe_add_rms_rows_bf16h(
+    const __nv_bfloat16* __restrict__ x, const void* __restrict__ ys, int y_f32, const float* __restrict__ wt,
+    const __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ h, __nv_bfloat16* __restrict__ y,
+    float* __restrict__ xs, float eps, int width, int routed, int slots) {
+    namespace st = tf_rms_strided;
+    constexpr int LT = 1024, NT = 256, S = 8, E = st::MOST / LT; // load threads, norm threads, slots, elements a load thread
+    __shared__ float red[NT / 32];
+    __shared__ float xb[st::MOST];
+    const int64_t row = blockIdx.x;
+    float wk[S];
+#pragma unroll
+    for (int s = 0; s < S; ++s) wk[s] = s < routed ? wt[row * slots + s] : 0.f;
+    float yv[E][S], xv[E];
+#pragma unroll
+    for (int k = 0; k < E; ++k) {
+        const int i = threadIdx.x + k * LT;
+        xv[k] = i < width ? st::bf(x[row * width + i]) : 0.f;
+#pragma unroll
+        for (int s = 0; s < S; ++s) {
+            const int64_t at = (row * slots + s) * width + i;
+            yv[k][s] = i >= width || s >= slots ? 0.f
+                       : y_f32                  ? static_cast<const float*>(ys)[at]
+                                                : st::bf(static_cast<const __nv_bfloat16*>(ys)[at]);
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < E; ++k) {
+        const int i = threadIdx.x + k * LT;
+        if (i >= width) continue;
+        float rsum = 0.f, ssum = 0.f; // the routed slots by fma, the shared ones added, each in slot order
+#pragma unroll
+        for (int s = 0; s < S; ++s) {
+            if (s >= slots) break;
+            if (s < routed) rsum = __fmaf_rn(wk[s], yv[k][s], rsum);
+            else ssum = __fadd_rn(ssum, yv[k][s]);
+        }
+        const __nv_bfloat16 hv = __float2bfloat16_rn(__fadd_rn(xv[k], st::rbf(__fadd_rn(rsum, ssum))));
+        h[row * width + i] = hv;
+        xb[i] = st::bf(hv);
+    }
+    __syncthreads();
+    if (threadIdx.x < NT) st::square_warps<NT>(xb, width, red); // the first 256 threads take the norm's chains
+    __syncthreads();
+    const float inv = st::inv_rms(st::warps_in_order<NT>(red), width, eps);
+    for (int i = threadIdx.x; i < width; i += LT) {
+        const __nv_bfloat16 o = __float2bfloat16_rn(__fmul_rn(__fmul_rn(xb[i], inv), st::bf(w[i])));
+        y[row * width + i] = o;
+        xb[i] = st::bf(o);
+    }
+    __syncthreads();
+    for (int g = threadIdx.x; g < width / 64; g += LT) {
+        float s = 0.f;
+        for (int j = 0; j < 64; ++j) s = __fadd_rn(s, xb[g * 64 + j]);
+        xs[row * (width / 64) + g] = s;
+    }
+}

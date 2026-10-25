@@ -16,6 +16,8 @@ pub const Kind = enum(u8) { f32 = 0, f16 = 1, bf16 = 2 };
 const threads = 1024;
 /// norms.cu's 16-byte forms: VNT threads, VEC_MOST loads of 8 a thread.
 const vec_threads = 256;
+/// The strided rows' widest row (norms.cu tf_rms_strided::MOST): the row sits in shared memory.
+const strided_most = 4096;
 const vec_most = 4;
 
 /// The 16-byte forms take a bf16 row by its width alone: a multiple of 8 within VEC_MOST * 8 * VNT.
@@ -56,6 +58,8 @@ pub const Norms = struct {
     tail_fns: [2]Function, // each norm rounded once, MLX's bf16 steps
     l2_fn: Function,
     slerp_fn: Function,
+    parts_fns: [2]Function, // the strided norm on parts of rows: rounded once, MLX's bf16 steps
+    moe_add_fn: Function, // expert slots summed into the residual, then the strided norm
 
     pub fn load(d: *const Driver) !Norms {
         if (!kernels.available) return error.BuiltWithoutKernels;
@@ -74,6 +78,8 @@ pub const Norms = struct {
             .tail_fns = .{ try mod.function("tf_add_rms_rows_bf16h_tail"), try mod.function("tf_add_rms_rows_bf16h_tail_round") },
             .l2_fn = try mod.function("tf_l2_rows"),
             .slerp_fn = try mod.function("tf_slerp_rows"),
+            .parts_fns = .{ try mod.function("tf_rms_rows_bf16h_parts"), try mod.function("tf_rms_rows_bf16h_parts_round") },
+            .moe_add_fn = try mod.function("tf_moe_add_rms_rows_bf16h"),
         };
     }
 
@@ -170,6 +176,42 @@ pub const Norms = struct {
         a.add(eps);
         const f = n.tail_fns[@intFromBool(t.round)];
         try launch_.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = 1, .z = 1 }, .block = .{ .x = vec_threads } }, s, &a);
+    }
+
+    /// Strided rows' norm (Nemotron's order) on part p of row i at x + i x_ld + p x_part (bf16 w + p w_part), y and xs
+    /// alike, in elements; bf16(w bf16(x inv)) with `round`. Parts may sit anywhere: x_part and w_part are signed.
+    pub fn rmsParts(n: *const Norms, s: Stream, x: u64, x_ld: usize, x_part: isize, w: u64, w_part: isize, y: u64, y_ld: usize, y_part: usize, xs: ?u64, rows: usize, parts: usize, width: usize, eps: f32, round: bool) !void {
+        if (width % 64 != 0 or width > strided_most or x_ld < width or y_ld < width or (xs != null and (y_ld | y_part) % 64 != 0)) return error.RowShape;
+        if (rows == 0 or parts == 0) return;
+        var a: launch_.Args = .{};
+        a.add(x);
+        a.add(@as(i64, @intCast(x_ld)));
+        a.add(@as(i64, x_part));
+        a.add(w);
+        a.add(@as(i64, w_part));
+        a.add(y);
+        for ([_]usize{ y_ld, y_part }) |v| a.add(@as(i64, @intCast(v)));
+        a.add(xs orelse 0);
+        a.add(@as(i32, @intCast(width)));
+        a.add(eps);
+        const block: u32 = if (round) 128 else 256; // the instances' T: part of the order
+        try launch_.launch(n.parts_fns[@intFromBool(round)], .{ .grid = .{ .x = @intCast(rows), .y = @intCast(parts), .z = 1 }, .block = .{ .x = block } }, s, &a);
+    }
+
+    /// h = bf16(x + bf16(routed slots' fma chain + shared slots' sum)), y = bf16(rms(h) w), xs y's 64-sums: the expert
+    /// slots [rows, slots, width] (f32 or bf16) weighted by wt's first `routed`, then the strided norm of h.
+    pub fn moeAddRmsH(n: *const Norms, s: Stream, x: u64, ys: u64, y_f32: bool, wt: u64, w: u64, h: u64, y: u64, xs: u64, rows: usize, width: usize, eps: f32, routed: usize, slots: usize) !void {
+        if (width % 64 != 0 or width > strided_most) return error.RowShape;
+        if (slots > 8 or routed > slots) return error.TooManySlots; // the kernel's S
+        if (rows == 0) return;
+        var a: launch_.Args = .{};
+        a.add(x);
+        a.add(ys);
+        a.add(@as(i32, @intFromBool(y_f32)));
+        for ([_]u64{ wt, w, h, y, xs }) |v| a.add(v);
+        a.add(eps);
+        for ([_]usize{ width, routed, slots }) |v| a.add(@as(i32, @intCast(v)));
+        try launch_.launch(n.moe_add_fn, .{ .grid = .{ .x = @intCast(rows), .y = 1, .z = 1 }, .block = .{ .x = 1024 } }, s, &a);
     }
 
     /// nGPT rows: y = bf16(s / sqrt(sum(s^2) + eps)), s = x, or bf16(x + r) with r; width % 64, at most 8,192.
