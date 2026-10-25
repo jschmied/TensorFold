@@ -360,7 +360,9 @@ pub fn serial(c: *Cover, gpu: check.Gpu, e: *Engine, p: []const u32, w: []const 
     const base = @sqrt(bd / bw);
     std.debug.print("RESULT   served logits vs float64 (same picks): rel L2 {e:.3}, worst row {e:.3}, argmax {d}/{d}; vs bf16 points {e:.3}; bf16 points vs float64 {e:.3}\n", .{ d64.rel, d64.worst_row, d64.argmax, T, dbf.rel, base });
     if (e.mtp != null) try mtpLogits(c, gpu, e, ids, path);
-    try c.expect(nf == 0 and d64.rel <= 1.5 * base and dbf.rel <= base, "served logits within 1.5x the bf16 points' rel L2 of float64 ({e:.3} <= 1.5 x {e:.3}), within it of the bf16 points", .{ d64.rel, base });
+    // independent roundings of one function differ by their errors in quadrature (real weights); correlated: less
+    const apart = @sqrt(d64.rel * d64.rel + base * base);
+    try c.expect(nf == 0 and d64.rel <= 1.5 * base and dbf.rel <= apart, "served logits within 1.5x the bf16 points' rel L2 of float64 ({e:.3} <= 1.5 x {e:.3}), and {e:.3} <= {e:.3} from the bf16 points", .{ d64.rel, base, dbf.rel, apart });
 }
 
 /// The MTP layer's logits at every row but the last (hidden row t, token t + 1) against ling_forward.py --mtp REF.mtp.

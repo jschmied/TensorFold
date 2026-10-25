@@ -77,19 +77,19 @@ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
     var k: Tally = .{ .ck = &opened.ck, .c = c };
     try names.all(c, &k);
     const unknown = opened.ck.unused();
-    // the index's total_size, or without an index the files' data regions: every byte belongs to a checked tensor
+    // the shards' data regions: every byte belongs to a checked tensor; a differing index total_size is only reported
     var arena = std.heap.ArenaAllocator.init(gpu.gpa);
     defer arena.deinit();
     const index = if (rest.len > 1) rest[1] else try std.fs.path.join(arena.allocator(), &.{ dir, "model.safetensors.index.json" });
     var total: u64 = 0;
+    for (opened.ck.files.items) |f| total += f.map.memory.len - f.data;
     if (std.Io.Dir.cwd().readFileAlloc(gpu.io, index, arena.allocator(), .limited(1 << 26))) |text| {
         const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), text, .{});
-        total = @intCast(parsed.object.get("metadata").?.object.get("total_size").?.integer);
-    } else |_| for (opened.ck.files.items) |f| {
-        total += f.map.memory.len - f.data;
-    }
+        const said: u64 = @intCast(parsed.object.get("metadata").?.object.get("total_size").?.integer);
+        if (said != total) std.debug.print("NOTE the index's total_size is {d}, the shards' data regions hold {d}: the shards decide\n", .{ said, total });
+    } else |_| {}
     std.debug.print("RESULT ling-ckpt-check {t}: {d} shards, {d} tensors stored, {d} expected ({d} of the MTP layer): {d} weights, {d} scale tensors, {d} small tensors and convs\n", .{ c.quant, opened.ck.files.items.len, stored, k.expected, k.mtp, k.kinds[0], k.kinds[1], k.kinds[2] });
-    std.debug.print("RESULT   {d} missing, {d} stored but not expected, {d} of another dtype or shape; {d} bytes against {d} (the index's total_size, else the files' data regions)\n", .{ k.missing, unknown, k.wrong, k.bytes, total });
+    std.debug.print("RESULT   {d} missing, {d} stored but not expected, {d} of another dtype or shape; {d} bytes against {d} (the shards' data regions)\n", .{ k.missing, unknown, k.wrong, k.bytes, total });
     try check.expect(k.missing == 0 and unknown == 0 and k.wrong == 0 and stored == k.expected and k.bytes == total, "every stored tensor is one the loader reads, at its dtype and shape, and nothing is missing", .{});
     check.pass("ling-ckpt-check: all {d} tensors' names, dtypes and shapes as the loader takes them, {d} bytes (headers only)", .{ stored, k.bytes });
 }

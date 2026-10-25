@@ -107,7 +107,7 @@ const usage =
     \\  ling-route-old <fatbin>   group-limited select (Ling's shapes, odd groups, ties) vs an older glm_glue fatbin, byte for byte
     \\  glm-route-ling <fixture>  Ling's group-limited routing on captured layer-4 logits vs float64, HF and exllamav3
     \\  glm-synth <dir>          a synthetic GLM-5.3-Flash checkpoint (2 layers, 16 experts) and its dc.json for the lane checks
-    \\  ling-synth <dir> [--format bf16|fp8|nvfp4] [--layers N]   a tiny Ling-3.1 checkpoint with the real names and config schema
+    \\  ling-synth <dir> [--format bf16|fp8|nvfp4] [--layers N] [--tiny]   a small Ling checkpoint with the real names (--tiny: Ling-3.0-tiny's widths)
     \\  ling-weights <dir>        every layer of a Ling checkpoint loaded: projections vs float64, small tensors byte for byte
     \\  ling-forward-synth <dir> <ref> [picks]   a ling-synth checkpoint's forward vs oracle/ling_forward.py; cuts, windows, batches
     \\  ling-layer-real <dir> <fixture> [dump]   one real Ling-3.1 layer vs HF's captured output (oracle/ling_layer.py); exactness
@@ -115,6 +115,7 @@ const usage =
     \\  ling-layer-bytes <dir> <fixture> <out>   one real Ling-3.1 layer's outputs and states on every path into a file (cmp)
     \\  ling-clamp <dir>          Ling's SwiGLU order min(silu(g), L): glue and the dir's grouped experts vs float64
     \\  ling-clamp-old <dir> <fatbins>   the grouped expert instances vs an older build's fatbins, byte for byte
+    \\  ling-ids-logits <dir> <ids> <out> [--decode N]   a Ling checkpoint's logits for given i32 ids (prompt pass, then N decode rows) for hfref.py
     \\  ling-lanes <dir> <out> [ref] [--layers a,b] [--mtp]   Ling's lane backend: chunked, drafted, resumed, concurrent == plain
     \\  ling-slots                the lane backend's slots over reused map buckets, in this build's mode (no GPU work)
     \\  ling-ckpt-check <dir> [index]   every tensor's name, dtype and shape against the loader's, from the headers alone (no GPU work)
@@ -235,6 +236,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "ling-clamp")) return @import("ling_clamp.zig").run(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "ling-clamp-old")) return @import("ling_clamp.zig").old(gpu, try arg(rest, 0), try arg(rest, 1));
     if (std.mem.eql(u8, cmd, "ling-mtp-real")) return @import("ling_mtp_real.zig").run(gpu, try arg(rest, 0), try arg(rest, 1));
+    if (std.mem.eql(u8, cmd, "ling-ids-logits")) return @import("ling_ids_logits.zig").run(gpu, rest);
     if (std.mem.eql(u8, cmd, "ling-lanes")) return @import("ling_lanes.zig").run(gpu, rest);
     if (std.mem.eql(u8, cmd, "ling-slots")) return lingSlots(gpu);
     if (std.mem.eql(u8, cmd, "ling-ckpt-check")) return @import("ling_ckpt.zig").run(gpu, rest);

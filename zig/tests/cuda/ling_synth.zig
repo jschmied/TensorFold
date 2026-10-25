@@ -1,4 +1,4 @@
-//! `ling-synth DIR [--format bf16|fp8|nvfp4] [--layers N]`: a tiny Ling-3.1 checkpoint, every name from the weight map.
+//! `ling-synth DIR [--format bf16|fp8|nvfp4] [--layers N] [--tiny]`: a small Ling checkpoint, the weight map's names.
 const std = @import("std");
 const core = @import("core");
 const ling = @import("ling_cuda");
@@ -122,14 +122,23 @@ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
     if (rest.len == 0) return error.MissingArgument;
     var format: Quant = .fp8_block128;
     var layers: u32 = 4;
+    var base: ling.synth.Base = .flash;
     var i: usize = 1;
-    while (i + 1 < rest.len) : (i += 2) {
-        if (std.mem.eql(u8, rest[i], "--format")) format = try formatOf(rest[i + 1]) else if (std.mem.eql(u8, rest[i], "--layers")) layers = try std.fmt.parseInt(u32, rest[i + 1], 10) else return error.BadArgument;
+    while (i < rest.len) : (i += 1) {
+        if (std.mem.eql(u8, rest[i], "--tiny")) {
+            base = .tiny;
+        } else if (i + 1 < rest.len and std.mem.eql(u8, rest[i], "--format")) {
+            i += 1;
+            format = try formatOf(rest[i]);
+        } else if (i + 1 < rest.len and std.mem.eql(u8, rest[i], "--layers")) {
+            i += 1;
+            layers = try std.fmt.parseInt(u32, rest[i], 10);
+        } else return error.BadArgument;
     }
     var arena = std.heap.ArenaAllocator.init(gpu.gpa);
     defer arena.deinit();
     const a = arena.allocator();
-    const json = try ling.synth.configJson(a, format, layers);
+    const json = try ling.synth.configJsonOf(a, base, format, layers);
     var why: ling.config.Why = .{};
     const c = ling.config.parse(a, json, &why) catch |e| {
         std.debug.print("the tiny config does not parse: {s}\n", .{why.text()});
@@ -147,5 +156,5 @@ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
     for (o.list.items, all) |t, *n| n.* = t.name;
     const r = try ling.names.check(a, &c, all);
     try check.expect(r.missing.items.len == 0 and r.unknown.items.len == 0, "ling-synth names: {d} missing, {d} unaccounted", .{ r.missing.items.len, r.unknown.items.len });
-    check.pass("ling-synth {t}: {d} layers + MTP, {d} tensors, {d} KiB in {s}", .{ format, layers, o.list.items.len, o.bytes >> 10, dir });
+    check.pass("ling-synth {t}: {d} layers{s}, {d} tensors, {d} KiB in {s}", .{ format, layers, if (c.mtp > 0) " + MTP" else "", o.list.items.len, o.bytes >> 10, dir });
 }

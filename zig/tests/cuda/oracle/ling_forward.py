@@ -15,14 +15,24 @@ class Ckpt:
     """Every tensor of model.safetensors; linears dequantized to float64 by the side tensors beside them."""
 
     def __init__(self, path):
-        self.f = safe_open(path, "pt")
-        self.keys = set(self.f.keys())
+        self.keys = set()
+        if os.path.isdir(path):  # a sharded release: model.safetensors.index.json maps each tensor to its file
+            index = json.load(open(os.path.join(path, "model.safetensors.index.json")))["weight_map"]
+            self.files = {f: safe_open(os.path.join(path, f), "pt") for f in sorted(set(index.values()))}
+            self.where = {k: self.files[f] for k, f in index.items()}
+            self.keys = set(index)
+        else:
+            f = safe_open(path, "pt")
+            self.where = {k: f for k in f.keys()}
+            self.keys = set(self.where)
         self.cache = {}
 
     def t(self, name):
-        return self.f.get_tensor(name)
+        return self.where[name].get_tensor(name)
 
     def lin(self, module):
+        if ".experts." in module:  # 128 experts in float64 would not fit beside the rest: converted at each use
+            return self.dequant(module)
         if module not in self.cache:
             self.cache[module] = self.dequant(module)
         return self.cache[module]
@@ -137,7 +147,7 @@ class Model:
         w = s.gather(1, idx)
         w = w / (w.sum(-1, keepdim=True) + 1e-20) * c["routed_scaling_factor"]
         lists = c["expert_swiglu_limit_list"], c["share_expert_swiglu_limit_list"]
-        le, ls = (x[i] if i < len(x) else 0 for x in lists)  # the lists cover the backbone: the MTP layer runs unclamped
+        le, ls = (x[i] if x and i < len(x) else 0 for x in lists)  # null (Ling-3.0-tiny): no clamp  # the lists cover the backbone: the MTP layer runs unclamped
         y = torch.zeros_like(x)
         for t in range(x.shape[0]):
             for j in range(top):
@@ -173,7 +183,7 @@ class Model:
 
 def main():
     a = argparse.ArgumentParser(description=__doc__)
-    a.add_argument("ckpt", help="a ling-synth directory (config.json, model.safetensors)")
+    a.add_argument("ckpt", help="a ling-synth directory (config.json, model.safetensors) or a sharded checkpoint's")
     a.add_argument("out", help="the reference file: ids, float64 and bf16-point logits, the picks it routed on")
     a.add_argument("--tokens", type=int, default=88)
     a.add_argument("--picks", help="route on these picks (i32 [MoE layers][tokens][top_k], the graph's) instead")
@@ -181,7 +191,8 @@ def main():
     a.add_argument("--ids", help="these tokens (i32, ling-lanes' OUT.ids) instead of the fixed walk; --tokens follows")
     o = a.parse_args()
     c = json.load(open(os.path.join(o.ckpt, "config.json")))
-    ck = Ckpt(os.path.join(o.ckpt, "model.safetensors"))
+    one = os.path.join(o.ckpt, "model.safetensors")
+    ck = Ckpt(one if os.path.exists(one) else o.ckpt)
     V = c["vocab_size"]
     if o.ids:
         ids = torch.frombuffer(bytearray(open(o.ids, "rb").read()), dtype=torch.int32).long()

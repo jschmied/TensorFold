@@ -153,14 +153,14 @@ pub fn run(gpu: check.Gpu, rest: []const [:0]const u8) !void {
 /// Each concurrent stream on one lanes.Engine equals its solo run.
 fn concurrent(c: *Cover, ll: *ling.lanes.Lanes, a: std.mem.Allocator, V: usize) !void {
     const n = 96;
-    var ps: [3][]const u32 = undefined;
+    var ps: [4][]const u32 = undefined;
     for (&ps, 0..) |*p, k| {
         const base = try walk(a, 60 + 23 * k, V, k + 1);
         p.* = try std.mem.concat(a, u32, &.{ base, base[0..40], base });
     }
-    const seeds = [_]lanes.Sampling{ .{ .seed = 11 }, .{ .seed = 22 }, .{ .seed = 33 } };
-    var solo: [3][]const u32 = undefined;
-    var solo_s: [3][]const u32 = undefined;
+    const seeds = [_]lanes.Sampling{ .{ .seed = 11 }, .{ .seed = 22 }, .{ .seed = 33 }, .{ .seed = 44 } };
+    var solo: [4][]const u32 = undefined;
+    var solo_s: [4][]const u32 = undefined;
     for (ps, &solo, &solo_s, 0..) |p, *g, *gs, k| {
         g.* = (try c.run(.{ .prompt = p, .max_new = n, .drafts = false })).ids;
         gs.* = (try c.run(.{ .prompt = p, .max_new = n, .drafts = false, .sampling = seeds[k] })).ids;
@@ -175,6 +175,9 @@ fn concurrent(c: *Cover, ll: *ling.lanes.Lanes, a: std.mem.Allocator, V: usize) 
         .{ .name = "sampled, drafted", .joins = &.{ .{ .p = 0, .sampled = true, .drafts = true }, .{ .p = 1, .sampled = true }, .{ .p = 2, .sampled = true, .drafts = true } } },
         .{ .name = "the second discarded after 6 rounds", .joins = &.{ .{ .p = 0 }, .{ .p = 1, .discard_at = 6 }, .{ .p = 2, .drafts = true } } },
         .{ .name = "prompts a chunk at a time while the others decode", .joins = &.{ .{ .p = 0, .drafts = true }, .{ .p = 1, .at = 2, .filled = true }, .{ .p = 2, .at = 4, .filled = true, .drafts = true } } },
+        .{ .name = "four at once", .joins = &.{ .{ .p = 0 }, .{ .p = 1 }, .{ .p = 2 }, .{ .p = 3 } } },
+        .{ .name = "four staggered, drafted", .joins = &.{ .{ .p = 0, .drafts = true }, .{ .p = 1, .at = 3 }, .{ .p = 2, .at = 6, .drafts = true }, .{ .p = 3, .at = 9, .drafts = true } } },
+        .{ .name = "four sampled, drafted", .joins = &.{ .{ .p = 0, .sampled = true, .drafts = true }, .{ .p = 1, .sampled = true }, .{ .p = 2, .sampled = true, .drafts = true }, .{ .p = 3, .sampled = true } } },
         .{ .name = "sampled, prompts a chunk at a time", .joins = &.{ .{ .p = 0, .sampled = true }, .{ .p = 1, .at = 2, .sampled = true, .filled = true }, .{ .p = 2, .at = 4, .sampled = true, .filled = true, .drafts = true } } },
     };
     const before = ll.shared;

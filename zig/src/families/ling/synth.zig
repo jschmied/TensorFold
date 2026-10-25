@@ -3,6 +3,11 @@ const std = @import("std");
 const config = @import("config.zig");
 
 pub const real_config = @embedFile("fixtures/config.json");
+/// Ling-3.0-tiny's config.json, the base of `--tiny` checkpoints: its real widths with a 1,024-token vocabulary.
+pub const tiny_config = @embedFile("fixtures/tiny_config.json");
+
+/// Which model's schema a synthetic checkpoint follows: Ling-3.1-flash's, shrunk, or Ling-3.0-tiny's own widths.
+pub const Base = enum { flash, tiny };
 
 /// The shrunk widths; KDA's head dim 128, MLA's 512 latent, 64 rope and 128-wide heads stay as the kernels take them.
 pub const shape = .{
@@ -21,12 +26,28 @@ pub const shape = .{
 
 /// The tiny config for `layers` backbone layers (at least 2: layer 0 KDA + dense, 1 MLA + MoE) and one MTP layer.
 pub fn configJson(gpa: std.mem.Allocator, format: config.Quant, layers: u32) ![]u8 {
+    return configJsonOf(gpa, .flash, format, layers);
+}
+
+/// `configJson` for either base; tiny's is its real widths (hidden 1536, 128 experts, q_lora_rank 256) and has no MTP.
+pub fn configJsonOf(gpa: std.mem.Allocator, base: Base, format: config.Quant, layers: u32) ![]u8 {
     if (layers < 2 or layers > config.max_layers - 1) return error.BadLayerCount;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
-    var root = try std.json.parseFromSliceLeaky(std.json.Value, a, real_config, .{});
+    var root = try std.json.parseFromSliceLeaky(std.json.Value, a, if (base == .tiny) tiny_config else real_config, .{});
     const o = &root.object;
+    if (base == .tiny) {
+        const tiny_ints = .{ .{ "vocab_size", shape.vocab }, .{ "eos_token_id", shape.vocab - 1 }, .{ "pad_token_id", shape.vocab - 2 }, .{ "num_hidden_layers", layers } };
+        inline for (tiny_ints) |kv| try o.put(a, kv[0], .{ .integer = kv[1] });
+        const group: u32 = @intCast(o.get("layer_group_size").?.integer);
+        switch (format) {
+            .bf16 => {},
+            .fp8_block128 => try o.put(a, "quantization_config", try quant(a, fp8_block, layers, group, false)),
+            .nvfp4 => try o.put(a, "quantization_config", try quant(a, modelopt_block, layers, group, false)),
+        }
+        return std.json.Stringify.valueAlloc(gpa, root, .{ .whitespace = .indent_2 });
+    }
     const ints = .{
         .{ "hidden_size", shape.hidden },            .{ "num_attention_heads", shape.heads },       .{ "num_key_value_heads", shape.heads },
         .{ "intermediate_size", shape.dense_inter }, .{ "moe_intermediate_size", shape.moe_inter }, .{ "moe_shared_expert_intermediate_size", shape.moe_inter },
@@ -44,8 +65,8 @@ pub fn configJson(gpa: std.mem.Allocator, format: config.Quant, layers: u32) ![]
     }
     switch (format) {
         .bf16 => _ = o.orderedRemove("quantization_config"),
-        .fp8_block128 => try o.put(a, "quantization_config", try quant(a, fp8_block, layers)),
-        .nvfp4 => try o.put(a, "quantization_config", try quant(a, modelopt_block, layers)),
+        .fp8_block128 => try o.put(a, "quantization_config", try quant(a, fp8_block, layers, shape.group, true)),
+        .nvfp4 => try o.put(a, "quantization_config", try quant(a, modelopt_block, layers, shape.group, true)),
     }
     return std.json.Stringify.valueAlloc(gpa, root, .{ .whitespace = .indent_2 });
 }
@@ -64,13 +85,13 @@ const modelopt_block =
 ;
 
 /// The block with the real file's per-layer exceptions added: each MLA layer's g_proj and the MTP layer's eh_proj.
-fn quant(a: std.mem.Allocator, block: []const u8, layers: u32) !std.json.Value {
+fn quant(a: std.mem.Allocator, block: []const u8, layers: u32, group: u32, mtp: bool) !std.json.Value {
     var q = try std.json.parseFromSliceLeaky(std.json.Value, a, block, .{});
     const key = if (q.object.contains("ignore")) "ignore" else "modules_to_not_convert";
     const list = &q.object.getPtr(key).?.array;
-    var i: u32 = 1;
-    while (i < layers) : (i += shape.group) try list.append(.{ .string = try std.fmt.allocPrint(a, "model.layers.{d}.attention.g_proj", .{i}) });
-    try list.append(.{ .string = try std.fmt.allocPrint(a, "model.layers.{d}.eh_proj", .{layers}) });
+    var i: u32 = group - 1;
+    while (i < layers) : (i += group) try list.append(.{ .string = try std.fmt.allocPrint(a, "model.layers.{d}.attention.g_proj", .{i}) });
+    if (mtp) try list.append(.{ .string = try std.fmt.allocPrint(a, "model.layers.{d}.eh_proj", .{layers}) });
     return q;
 }
 
@@ -95,5 +116,23 @@ test "the tiny configs parse in every format: KDA dense 0, MLA MoE 1, two groups
         try std.testing.expectEqual(f, c.format("model.layers.2.attention.g_proj"));
         try std.testing.expectEqual(f, c.format("model.layers.1.mlp.experts.3.down_proj"));
         try std.testing.expectEqual(if (f == .nvfp4) .bf16 else f, c.format("model.layers.0.mlp.up_proj"));
+    }
+}
+
+test "tiny-shaped configs parse in every format: groups of 4, 128 experts, q_lora_rank 256, no MTP, g_proj on layer 3" {
+    const gpa = std.testing.allocator;
+    for ([_]config.Quant{ .bf16, .fp8_block128, .nvfp4 }) |f| {
+        const json = try configJsonOf(gpa, .tiny, f, 4);
+        defer gpa.free(json);
+        var why: config.Why = .{};
+        const c = config.parse(gpa, json, &why) catch |e| {
+            std.debug.print("{t}: {s}\n", .{ f, why.text() });
+            return e;
+        };
+        try std.testing.expectEqual(f, c.quant);
+        try std.testing.expect(c.kind(2) == .kda and c.kind(3) == .mla and !c.isMoe(0) and c.isMoe(1) and c.mtp == 0);
+        try std.testing.expect(c.experts == 128 and c.q_lora == 256 and c.hidden == 1536 and c.layers == 4);
+        try std.testing.expectEqual(config.Quant.bf16, c.format("model.layers.3.attention.g_proj"));
+        try std.testing.expectEqual(f, c.format("model.layers.2.attention.g_proj"));
     }
 }

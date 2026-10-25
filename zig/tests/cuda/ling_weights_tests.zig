@@ -336,5 +336,5 @@ pub fn run(gpu: check.Gpu, dir: []const u8) !void {
     defer w.deinit();
     try check.expect(o.ck.unused() == 0, "{s}: every tensor read", .{dir});
     const n = try layers(&r, &kit, &o.ck, &w);
-    check.pass("ling-weights {t}: {d} layers + MTP, {d} projections within float64 bounds (worst {d:.3}), {d} small tensors byte-equal", .{ o.c.quant, o.c.layers, n.proj, r.worst, n.small });
+    check.pass("ling-weights {t}: {d} layers{s}, {d} projections within float64 bounds (worst {d:.3}), {d} small tensors byte-equal", .{ o.c.quant, o.c.layers, if (o.c.mtp > 0) " + MTP" else "", n.proj, r.worst, n.small });
 }
