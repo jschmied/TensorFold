@@ -395,7 +395,7 @@ pub fn run(gpu: check.Gpu) !void {
     try fprompt.allowDynamicShared(ftk.fact_smem);
     const ffold = try fact_mod.function(ftk.cubin_fact_fold);
     try ffold.allowDynamicShared(ftk.fact_smem);
-    var facts: [2]fact_k.Fact = undefined;
+    var facts: [std.enums.values(fact_k.Kind).len]fact_k.Fact = undefined;
     for (std.enums.values(fact_k.Kind), &facts) |kind, *m| m.* = .{ .rig = .{ .gpu = gpu, .s = s }, .kind = kind, .lane = flane, .prompt = fprompt, .fold = ffold, .sum = try batch.function("fn_sum_slices") };
     defer for (&facts) |*m| m.deinit();
     for (&facts) |*m| try kernels.append(a, m.kernel());

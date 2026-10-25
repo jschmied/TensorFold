@@ -12,7 +12,8 @@ const Affine = contract.affine.Affine;
 const parts = flash.batch_state;
 const tk = flash.tile_kernels;
 
-pub const Kind = enum { prompt, fold };
+/// The first two replace a kernel (bit-equal); the last two are the provisional Qwen4 GDN shapes against float64.
+pub const Kind = enum { prompt, fold, gdn_in, gdn_out };
 
 /// A group's 32 products from zero in two k16 steps, two fmas a group, then up to 8 slices added in order.
 fn depth(s: c.Shape) usize {
@@ -32,8 +33,14 @@ const qwen4_gdn_in = 2 * 16 * 128 + 48 * 128 + 48 * 128 + 2 * 48;
 
 const tiles = [3]c.Tile{ .{ .size = 64 }, .{ .size = 128, .step = 32, .min = 32 }, .{ .size = 256, .step = 64, .min = 64 } };
 
+fn folds(kind: Kind) bool {
+    return kind == .fold or kind == .gdn_out;
+}
+
 pub fn spec(kind: Kind) c.Spec {
     return switch (kind) {
+        .gdn_in => .{ .name = "cuda qwen4 synthetic GDN input projection 5120 -> q|k|v|z|b|a, factored prompt tile", .accum = .f32, .depth = depth, .ops = 2, .out = .bf16, .tiles = tiles, .served = &.{ .{ .rows = 64, .n = qwen4_gdn_in, .k = 5120 } } },
+        .gdn_out => .{ .name = "cuda qwen4 synthetic GDN out projection 6144 -> 5120, factored prompt tile, K slices folded", .accum = .f32, .depth = depth, .ops = 2, .out = .f32, .tiles = tiles, .served = &.{ .{ .rows = 100, .n = 5120, .k = 6144 } } },
         .prompt => .{ .name = "cuda flashnext factored prompt matmul 64x128", .accum = .f32, .depth = depth, .ops = 2, .out = .bf16, .replaces = "qmm.cu's 16x64 lane tile", .tiles = tiles, .served = &.{ .{ .rows = 64, .n = 13952, .k = 2560 }, .{ .rows = 100, .n = 2560, .k = 2560 }, .{ .rows = 64, .n = qwen4_gdn_in, .k = 5120 } } },
         .fold => .{ .name = "cuda flashnext factored prompt matmul 64x128, K slices folded", .accum = .f32, .depth = depth, .ops = 2, .out = .f32, .replaces = "the lane tile's K slices then fn_sum_slices", .tiles = tiles, .served = &.{ .{ .rows = 64, .n = 2560, .k = 2560 }, .{ .rows = 100, .n = 2560, .k = 6144 }, .{ .rows = 100, .n = 5120, .k = 6144 } } },
     };
@@ -76,8 +83,8 @@ pub const Fact = struct {
         self.rig.reset();
         // two groups a stage: K in 64s (every served K is)
         if (shape.rows == 0 or shape.n == 0 or shape.n % 8 != 0 or shape.k == 0 or shape.k % 64 != 0) return false;
-        self.sk = if (self.kind == .prompt) 1 else slicesOf(shape);
-        if (self.kind == .fold and self.sk == 1) return false;
+        self.sk = if (!folds(self.kind)) 1 else slicesOf(shape);
+        if (folds(self.kind) and self.sk == 1) return false;
         self.shape = shape;
         const a = self.rig.gpu.gpa;
         const k = shape.k;
@@ -106,14 +113,14 @@ pub const Fact = struct {
         const esize = c.size(spec(self.kind).out);
         self.out = try self.rig.output(shape.rows * shape.n * esize);
         self.base = try self.rig.scratch(shape.rows * shape.n * esize);
-        if (self.kind == .fold) self.part = try self.rig.scratch(self.sk * shape.rows * shape.n * 4);
+        if (folds(self.kind)) self.part = try self.rig.scratch(self.sk * shape.rows * shape.n * 4);
         return true;
     }
 
     pub fn run(self: *Fact) !void {
         switch (self.kind) {
-            .prompt => try self.launch(self.prompt, 64, 128, 256, tk.fact_smem, self.out, 0, 1, 1),
-            .fold => try self.launch(self.fold, 64, 128, 256, tk.fact_smem, 0, self.out, self.sk, 1),
+            .prompt, .gdn_in => try self.launch(self.prompt, 64, 128, 256, tk.fact_smem, self.out, 0, 1, 1),
+            .fold, .gdn_out => try self.launch(self.fold, 64, 128, 256, tk.fact_smem, 0, self.out, self.sk, 1),
         }
         try self.rig.s.synchronize();
     }
@@ -134,12 +141,12 @@ pub const Fact = struct {
     pub fn replaced(self: *Fact) ![]const u8 {
         const n = self.shape.rows * self.shape.n;
         switch (self.kind) {
-            .prompt => {
+            .prompt, .gdn_in => {
                 try self.launch(self.lane, 16, 64, 128, parts.qmm_smem, self.base, 0, 1, 1);
                 try self.rig.s.synchronize();
                 return self.rig.bytes(self.base, n * 2);
             },
-            .fold => {
+            .fold, .gdn_out => {
                 try self.launch(self.lane, 16, 64, 128, parts.qmm_smem, 0, self.part, self.sk, self.sk);
                 var a: cuda.Args = .{};
                 a.add(self.part);
