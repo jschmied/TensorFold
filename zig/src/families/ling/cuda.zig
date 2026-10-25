@@ -44,6 +44,7 @@ pub fn route(c: *const Config, i: u32, l: *glm.moe.Layer) void {
 test {
     _ = @import("config_test.zig");
     _ = @import("names_test.zig");
+    _ = @import("tiny_test.zig");
     _ = @import("synth.zig");
     std.testing.refAllDecls(weights); // the loader compiles on hosts without a GPU
     std.testing.refAllDecls(@import("weights_proj.zig"));

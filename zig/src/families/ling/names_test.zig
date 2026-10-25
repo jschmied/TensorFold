@@ -18,10 +18,15 @@ fn lessThan(_: void, a: []const u8, b: []const u8) bool {
 
 /// Each `{L}` line over its layer ranges, each `{E}` line over its expert count; the header holds count and sha256.
 fn unfold(arena: std.mem.Allocator) ![]const []const u8 {
+    return unfoldOf(arena, folded, "ling31-names");
+}
+
+/// `unfold` for any folded fixture: `tag` is the header's first word (tiny_test.zig folds Ling-3.0-tiny's index).
+pub fn unfoldOf(arena: std.mem.Allocator, text: []const u8, tag: []const u8) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
-    var lines = std.mem.tokenizeScalar(u8, folded, '\n');
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
     var head = std.mem.tokenizeScalar(u8, lines.next().?, ' ');
-    if (!std.mem.eql(u8, head.next().?, "ling31-names")) return error.BadFixture;
+    if (!std.mem.eql(u8, head.next().?, tag)) return error.BadFixture;
     const count = try std.fmt.parseInt(usize, head.next().?, 10);
     const digest = head.next().?;
     while (lines.next()) |line| {
