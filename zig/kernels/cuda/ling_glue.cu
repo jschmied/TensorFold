@@ -55,3 +55,24 @@ extern "C" __global__ void tf_ling_copy_rows(const unsigned char* __restrict__ s
     }
   }
 }
+
+// Rows by index: dst[i] = src[idx[i]] for i < n, row_bytes each (a multiple of 16, addresses 16-aligned).
+extern "C" __global__ void tf_ling_gather_rows(const unsigned char* __restrict__ src, const int* __restrict__ idx,
+                                               unsigned char* __restrict__ dst, int n, int row_bytes) {
+  const int i = blockIdx.x;
+  if (i >= n) return;
+  const uint4* s = reinterpret_cast<const uint4*>(src + static_cast<int64_t>(idx[i]) * row_bytes);
+  uint4* d = reinterpret_cast<uint4*>(dst + static_cast<int64_t>(i) * row_bytes);
+  for (int c = threadIdx.x; c < row_bytes / 16; c += blockDim.x) d[c] = s[c];
+}
+
+// The inverse: dst[idx[i]] = src[i] for i < n, dst rows dst_pitch bytes apart (idx distinct).
+extern "C" __global__ void tf_ling_scatter_rows(const unsigned char* __restrict__ src, const int* __restrict__ idx,
+                                                unsigned char* __restrict__ dst, int64_t dst_pitch, int n,
+                                                int row_bytes) {
+  const int i = blockIdx.x;
+  if (i >= n) return;
+  const uint4* s = reinterpret_cast<const uint4*>(src + static_cast<int64_t>(i) * row_bytes);
+  uint4* d = reinterpret_cast<uint4*>(dst + static_cast<int64_t>(idx[i]) * dst_pitch);
+  for (int c = threadIdx.x; c < row_bytes / 16; c += blockDim.x) d[c] = s[c];
+}

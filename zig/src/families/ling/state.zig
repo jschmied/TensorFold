@@ -109,6 +109,9 @@ pub const Buffers = struct {
     plan: cuda.grouped.Plan,
     eact: u64, // bf16 [pairs][moe_inter]
     ey: u64, // bf16 [pairs][hidden], or every expert's rows [experts][rows][hidden] for per-expert lanes
+    gx: u64, // bf16 [rows][hidden]: the rows one per-expert lane takes, gathered
+    gy: u64, // bf16 [rows][hidden]: its output rows before they are scattered
+    gi: u64, // i32 [rows x top_k]: the rows each picked expert takes, expert after expert
     logits: u64, // bf16 [rows][vocab]
 
     pub fn init(d: *const cuda.Driver, m: *const graph.Modules, w: *const weights.Weights, rows: usize, prompt: bool, capacity: usize) !Buffers {
@@ -130,18 +133,19 @@ pub const Buffers = struct {
         const nch = latent.chunksFor(capacity);
         const hist = if (pairs > cuda.grouped.small) (pairs + cuda.grouped.small - 1) / cuda.grouped.small * (E + 1) else 1;
         const sizes = [_]usize{
-            rows * 4,                                        rows * D * 2,                   rows * D * 2,                rows * D * 2,
-            rows * D * 2,                                    rows * @max(n, width) * 2,      partBytes(m, w, rows),       if (prompt) rows * kdaStride(w) * 2 else 16,
-            rows * n * 2,                                    rows * n * 2,                   rows * n * 2,                rows * n * 4,
-            rows * n * 2,                                    rows * n * 4,                   rows * H * 4,                rows * n * 4,
-            rows * n * 2,                                    rows * ql * 2,                  rows * ql * 2,               rows * HM * c.qkDim() * 2,
-            rows * cache_width * 2,                          rows * cache_width * 2,         rows * HM * cache_width * 2, rows * HM * 512 * 2,
-            rows * HM * c.v_dim * 2,                         rows * HM * 2,                  nch * ar * HM * 512 * 4,     nch * ar * HM * 4,
-            nch * ar * HM * 4,                               4,                              4,                           rows * 2 * width * 2,
-            rows * width * 2,                                rows * (width / 64 + 1) * 4,    rows * E * 4,                glue_router_ks * rows * E * 4,
-            pairs * 4,                                       pairs * 4,                      pairs * 4,                   cuda.grouped.maxItems(pairs, E + 1, 16) * 12,
-            8,                                               pairs * 4,                      hist * 4,                    pairs * c.moe_inter * 2,
-            @max(pairs, if (lanes) E * rows else 0) * D * 2, rows * @as(usize, c.vocab) * 2,
+            rows * 4,                                        rows * D * 2,                   rows * D * 2,                    rows * D * 2,
+            rows * D * 2,                                    rows * @max(n, width) * 2,      partBytes(m, w, rows),           if (prompt) rows * kdaStride(w) * 2 else 16,
+            rows * n * 2,                                    rows * n * 2,                   rows * n * 2,                    rows * n * 4,
+            rows * n * 2,                                    rows * n * 4,                   rows * H * 4,                    rows * n * 4,
+            rows * n * 2,                                    rows * ql * 2,                  rows * ql * 2,                   rows * HM * c.qkDim() * 2,
+            rows * cache_width * 2,                          rows * cache_width * 2,         rows * HM * cache_width * 2,     rows * HM * 512 * 2,
+            rows * HM * c.v_dim * 2,                         rows * HM * 2,                  nch * ar * HM * 512 * 4,         nch * ar * HM * 4,
+            nch * ar * HM * 4,                               4,                              4,                               rows * 2 * width * 2,
+            rows * width * 2,                                rows * (width / 64 + 1) * 4,    rows * E * 4,                    glue_router_ks * rows * E * 4,
+            pairs * 4,                                       pairs * 4,                      pairs * 4,                       cuda.grouped.maxItems(pairs, E + 1, 16) * 12,
+            8,                                               pairs * 4,                      hist * 4,                        pairs * c.moe_inter * 2,
+            @max(pairs, if (lanes) E * rows else 0) * D * 2, rows * @as(usize, c.vocab) * 2, if (lanes) rows * D * 2 else 16, if (lanes) rows * D * 2 else 16,
+            if (lanes) rows * c.topk * 4 else 16,
         };
         var p: [sizes.len]u64 = undefined;
         const a = try Arena.init(d, &sizes, &p);
@@ -185,6 +189,9 @@ pub const Buffers = struct {
             .eact = p[43],
             .ey = p[44],
             .logits = p[45],
+            .gx = p[46],
+            .gy = p[47],
+            .gi = p[48],
         };
     }
 

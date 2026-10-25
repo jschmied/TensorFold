@@ -21,6 +21,8 @@ pub const Modules = struct {
     x4: cuda.experts.Nvfp4Experts,
     router: cuda.grouped.Router,
     copy_rows: cuda.Function,
+    gather_rows: cuda.Function,
+    scatter_rows: cuda.Function,
     add_i32: cuda.Function,
     add: cuda.Function,
     gate: cuda.Function,
@@ -40,6 +42,8 @@ pub const Modules = struct {
         m.glue = try glue.Kernels.load(m.mods[0]);
         m.kda = try kda.Kernels.load(m.mods[1]);
         m.copy_rows = try m.mods[4].function("tf_ling_copy_rows");
+        m.gather_rows = try m.mods[4].function("tf_ling_gather_rows");
+        m.scatter_rows = try m.mods[4].function("tf_ling_scatter_rows");
         m.add_i32 = try m.mods[2].function("tf_glm_add_i32");
         m.router = try cuda.grouped.Router.resolve(m.mods[3]);
         m.add = try m.mods[4].function("tf_ling_add");
