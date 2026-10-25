@@ -1,9 +1,10 @@
-# Ling-3.1-flash
+# Ling-3.1-flash and Ling-3.0-tiny
 
 Work in progress on the Zig engine's CUDA side. The family is registered with the native CUDA server
-(`model_type` `bailing_hybrid`) and serves requests through the lane core at TP=1, but the whole model does not fit
-one GB10, so serving is verified on synthetic checkpoints and a thin real model. This page lists what exists, what is
-missing, and how to test without the 572 GB checkpoint. Everything below was measured on one GB10.
+(`model_type` `bailing_hybrid`) and serves requests through the lane core at TP=1. Ling-3.1-flash does not fit one
+GB10, so it is verified on synthetic checkpoints and a thin real model; Ling-3.0-tiny (same architecture, 7.9 B
+parameters) fits one GB10 and is verified whole, see [Ling-3.0-tiny](#ling-30-tiny). This page lists what exists, what
+is missing, and how to test without the 572 GB checkpoint. Everything below was measured on one GB10.
 
 Ling-3.1-flash (`BailingMoeV3ForCausalLM`, `bailing_hybrid`) has 72 layers plus one MTP layer: Kimi delta attention
 (KDA) on layers with `(i + 1) % 8 != 0`, MLA on every eighth, dense MLPs on layers 0-3 and 512 routed experts (top 8,
@@ -99,14 +100,15 @@ A file tensor whose dtype or shape disagrees with the format the config gives it
 both formats. Each projection loads as a `qlinear.Weight` (`bf16`, `fp8g` or `nvfp4`) through main's packers
 (`modelopt.Packer`, `fp8.packScales`); routed experts load as `experts.Layer` (`fp8g` or `nvfp4`, packed by
 `Fp8Experts`/`Nvfp4Experts`'s layouts on the GPU: `Packer.fp8Experts` and `Packer.fp4Experts`). There is no grouped bf16 expert kernel, so bf16 routed experts load as one lane weight
-per projection. The router must be bf16 (GLM's router kernel reads bf16); a quantized router is refused.
+per projection, run only on the rows that picked them (`block_ffn.picked`). The router must be bf16 (GLM's router
+kernel reads bf16); a quantized router is refused.
 
 ### Shapes
 
 `config.parse` refuses, with a named error and the reason, every shape the kernels don't take, before anything is
 allocated or launched: KDA heads other than 128 wide, short convs other than 4 taps, key/value heads other than the
 query heads (`KdaGeometry`); a latent other than 512, nope or value heads other than 128, rope columns other than 64,
-NeoX rope pairs, a `q_lora_rank` without a norm instance (`MlaGeometry`); a hidden width other than 512, 1536 or 4096,
+NeoX rope pairs, a `q_lora_rank` other than 256, 512, 1536 or 4096 (`MlaGeometry`); a hidden width other than 512, 1536 or 4096,
 MLP and expert widths outside whole 128-column blocks (`Width`); a tied head (`TiedHead`); routing past `glue.select`'s
 bounds (`Routing`).
 
@@ -222,11 +224,81 @@ a 16-row window == 16 decode rows byte for byte; 8.4 GB peak, 153 s to load from
 rollback of the chain's rows, `hnorm` with `enorm`'s weight, prompt rows absorbing their own token, kept states
 without the MTP cache, the chain's hidden row taken from row 0.
 
+## Ling-3.0-tiny
+
+`inclusionAI/Ling-3.0-tiny` at `9a98e35f` (MIT, 7.9 B parameters, 1.1-1.4 B active, bf16 15.8 GB) is the same architecture
+at a smaller size, and runs whole on one GB10 at TP=1. The loader takes it from its `config.json` and index with no
+flag. What differs from Ling-3.1-flash, and what the engine does about each:
+
+| Value | Ling-3.1-flash | Ling-3.0-tiny | Handled by |
+| --- | --- | --- | --- |
+| Layers, group size | 72 + 1 MTP, groups of 8 | 24, groups of 4: MLA on 3, 7, 11, 15, 19, 23 (6), KDA on the other 18 | `Config.kind`, unchanged |
+| Dense layers, `intermediate_size` | 0-3, 10240 | 0, 4608 (36 blocks of 128) | `first_k_dense_replace`, the width check |
+| `hidden_size` | 4096 | 1536 | `glue.rmsnorm_1536`, the router's 8 x 64 slices (3 x 64 each) |
+| Heads (KDA and MLA) | 64 | 16 (one 16-head tile of the latent attention) | head counts are launch grids |
+| `q_lora_rank` | 1536 | 256 | new `glue.rmsnorm_256` instance (2 warps, 4 values a thread, one tile), `config.q_lora_widths` |
+| Experts, groups, top-k | 512, 8 groups of 64 keep 4, 8 | 128, 8 groups of 16 keep 4, 8 | `glue.select`'s group pass takes groups that are not whole lane columns |
+| `moe_intermediate_size`, shared | 1280, 1 shared | 512, 1 shared | the width check |
+| SwiGLU limit lists | 0 / 10 per layer | `null` | read as no clamp (`limits`) |
+| MTP | one layer | none (`num_nextn_predict_layers` 0) | the engine loads no draft head; drafts come from the lane core's copies |
+| Quantization | block FP8 | none: bf16 | bf16 lanes; routed experts as per-expert lane weights |
+| Tokenizer | `tokenizer.json`, possessive `?+` and `++` in the split regex | the same file | not in this branch: `core/tokenizer/regex.zig` takes possessive quantifiers on main (`79ba3f58c`); the server needs it to open either model. Zig vs `tokenizers`, tiny's file: 2,784 of 2,784 encodes and 5,367 of 5,367 decodes equal with an equivalent change |
+
+Everything else the config carries is the same as flash's: head_dim 128, 4-tap short convs, the 512-wide latent, 128 nope
+columns, 64 GPT-J roped columns, the head-wise gate, sigmoid scores with a pick bias, `routed_scaling_factor` 2.5,
+`kda_lower_bound` -5. Anything that is not stays a named refusal at load; `tiny_test.zig` holds the tiny config and its
+9,283 index names against the loader, and a one-edit copy of each refusal.
+
+bf16 routed experts have no grouped kernel. Run on every row they cost the whole model's bandwidth per token (11 tok/s),
+so `block_ffn.picked` brings the picks to the host once a layer and runs each expert on just the rows that picked it,
+gathered into contiguous rows and scattered back into its rows of the combine's input (`TF_LING_DENSE_EXPERTS=1` runs
+the old loop). A row's bytes are the same either way: 480 prompt rows' logits and picks are byte-identical, and so are
+the 32 decode rows after them.
+
+Checked on the GB10 (one hold of the model, 15.8 GB; checkpoint bytes by `lfs.sha256`):
+
+- `tf-cuda-test ling-ckpt-check`: 32 shards, 9,283 tensors, 0 missing, 0 extra, 0 of another dtype or shape. The index's
+  own `total_size` says 3,869,925,683,584; the shards hold 15,786,865,792 bytes and the check goes by them.
+- `ling-lanes` (the lane backend under upstream's round loop; chunked == whole at 512, 37 and 16 rows, drafted == plain
+  greedy and sampled (drafts cut from the plain reply: the checkpoint has no MTP head), resumed == fresh at marks 37 to
+  349, concurrent == solo for 2, 3 and 4 streams, cancels, discards, the capacity refusals): 117 checks pass (115 without the reference). The reply equals the serial forward's argmax at all 160 of 160 rows.
+- Logits of 480 tokens of real text (`ling-ids-logits`, the first 480 tokens of `modeling_bailing_moe_v3.py`) against
+  `oracle/ling_forward.py`'s float64 on the same top-8 picks: rel L2 1.05e-2, where the HF model's own bf16 rounding points
+  sit 1.04e-2 from float64; argmax 477 of 480 (the 3 others are 0.04-0.11 apart in float64, one a tie in bf16). The 150-token prompt and 159
+  decode rows of `ling-lanes`' reply: 4.24e-3 (the rounding points 3.80e-3), argmax 308 of 309. Decode rows equal prompt
+  rows byte for byte.
+- Against the transformers model in bf16 on the GPU (fla's kernels need a GPU; `hfref.py`'s load keeps the router bias
+  in fp32): rel L2 3.46e-2 and argmax 475 of 480, all 5 differences within 0.75 in logit of the runner-up. That model is
+  3.33e-2 from float64 on the same picks, three times as far as this engine.
+- Greedy chat through the server (`tensorfold-native serve`, "Explain in two sentences why the sky is blue."): the first 64
+  reply tokens equal the transformers model's, character for character.
+- `kernel-contract`: `tf_glm_rmsnorm_256` is registered (rows 1, 37 and 1,024 of width 256) and passes gates 1 to 4 (the
+  shapes gate at 0.970 of its bound, which counts the bf16 rounding between the norm and the weight) and gate 5 live.
+  Only kernels were added: on sm_121 the 47 older functions of `glm_glue.fatbin` and the 4 of `ling_glue.fatbin` have the same SASS and
+  registers as at `e99e6505` (`cuobjdump -sass`), beside `tf_glm_rmsnorm_256`, `tf_ling_gather_rows` and `tf_ling_scatter_rows`.
+- `ling-weights` on the real checkpoint: 442 projections within the float64 bounds (worst 0.428 of the bound), 180 small
+  tensors byte-equal.
+- `bench_concurrent.py --alone` at 1, 2 and 4 streams, 128 tokens, two prompts, two reps: every reply equals its solo run.
+
+| bf16, one GB10 | Dense experts loop | Picked experts |
+| --- | --- | --- |
+| Decode, 1 stream (tok/s) | 11.2 | 76.6 |
+| Decode, 2 streams (aggregate / per stream) | | 108.6-111.4 / 55-57 |
+| Decode, 4 streams (aggregate / per stream) | | 149.0-157.0 / 38.5-40.5 |
+| TTFT, 8,189-token prompt | 4.55 s | 1.74 s |
+
+Not covered: this is TP=1 CUDA only. The official FP8 release should load through the FP8 grouped experts; it has not
+been run here. The synthetic tiny-shaped checkpoints (`ling-synth --tiny`: 4 layers at tiny's widths, 128 experts in 8
+groups of 16, `q_lora_rank` 256) in bf16, FP8 and NVFP4 have: `ling-lanes` 115 checks and 117 against float64,
+`ling-forward-synth` exact and 2.4e-2 to 2.8e-2 of float64 on the same picks, `ling-weights` and `ling-ckpt-check`. Quantized variants, MTP (none in the
+checkpoint), a Metal engine and an Arm CPU or Adreno backend are separate work.
+
 ## What is missing
 
 - A full-checkpoint run: 574 GB in FP8 needs five Sparks and tensor parallelism.
-- Speed: nothing is tuned. Projections land in their columns through a byte copy, bf16 routed experts run densely,
-  and the RMS norms take hidden and `q_lora_rank` widths 512, 1536 and 4096 only (`glue.rmsnorm`).
+- Speed: little is tuned. Projections land in their columns through a byte copy, and the RMS norms take hidden widths
+  512, 1536 and 4096 and `q_lora_rank` 256, 512, 1536 and 4096 only (`glue.rmsnorm`). There is no grouped bf16 expert
+  kernel: bf16 routed experts run as lane weights on just the rows that picked them (see Ling-3.0-tiny).
 - EXL3, through ashhart's EXL3 module (tracker #832).
 - Tensor parallelism: the loader is TP=1; shares and transport would come from #804's `cuda_shard.zig` and #855.
 
