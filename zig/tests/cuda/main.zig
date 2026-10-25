@@ -87,6 +87,7 @@ const flashnext_shared_tests = @import("flashnext_shared_tests.zig");
 const flashnext_nvfp4_tp_tests = @import("flashnext_nvfp4_tp_tests.zig");
 const flashnext_dense_hc_tests = @import("flashnext_dense_hc_tests.zig");
 const flashnext_dense_ffn_tests = @import("flashnext_dense_ffn_tests.zig");
+const flashnext_dense_fixture_tests = @import("flashnext_dense_fixture_tests.zig");
 const flashnext_hc_tests = @import("flashnext_hc_tests.zig");
 const flashnext_attn_tests = @import("flashnext_attn_tests.zig");
 const ggml_tests = @import("ggml_tests.zig");
@@ -122,6 +123,7 @@ const usage =
     \\  flashnext-nvfp4-tp        rank-local expert cuts and FP32 partials against FP64 (one GPU)
     \\  flashnext-dense-hc        dense connection weights and FP32 normalization against FP64
     \\  flashnext-dense-ffn       the provisional dense feed-forward on synthetic weights against FP64
+    \\  flashnext-dense-fixture   the dense node's hooks, and its ops against an external tiny dense fixture: <config dir> <raw dir>
     \\  flashnext-hc              Flash Next's own hyper-connection and n-gram glue against float64 (synthetic rows)
     \\  flashnext-attn            Flash Next's own attention glue, pooling and block scores against float64 (synthetic)
     \\  info                      driver, device and library versions
@@ -297,6 +299,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "flashnext-nvfp4-tp")) return flashnext_nvfp4_tp_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "flashnext-dense-hc")) return flashnext_dense_hc_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "flashnext-dense-ffn")) return flashnext_dense_ffn_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "flashnext-dense-fixture")) return flashnext_dense_fixture_tests.run(gpu, rest);
     if (std.mem.eql(u8, cmd, "flashnext-hc")) return flashnext_hc_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "flashnext-attn")) return flashnext_attn_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "info")) return info(gpu);

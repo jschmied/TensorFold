@@ -31,18 +31,21 @@ pub const Rows = struct {
     scratch_rows: usize,
     mode: []u8,
     experts: cuda.Module,
+    lane: ?cuda.qmmf.Lane,
     plan_fn: cuda.Function,
     up_fn: cuda.Function,
     down_fn: cuda.Function,
 
     pub fn init(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Stream) !Rows {
-        var r: Rows = .{ .gpa = gpa, .driver = driver, .scratch = try Scratch.alloc(driver, 1), .scratch_rows = 1, .mode = undefined, .experts = undefined, .plan_fn = undefined, .up_fn = undefined, .down_fn = undefined };
+        var r: Rows = .{ .gpa = gpa, .driver = driver, .scratch = try Scratch.alloc(driver, 1), .scratch_rows = 1, .mode = undefined, .experts = undefined, .lane = null, .plan_fn = undefined, .up_fn = undefined, .down_fn = undefined };
         errdefer r.scratch.free();
         try r.scratch.dummy.fill8(0, stream.handle);
         r.mode = try gpa.alloc(u8, 1);
         errdefer gpa.free(r.mode);
         r.experts = try cuda.Module.load(driver, cuda.kernels.experts);
         errdefer r.experts.unload();
+        if (comptime weights.experts_n == 0) r.lane = try cuda.qmmf.Lane.load(driver, (try driver.capability(0)) / 10); // dense feed-forward
+        errdefer if (r.lane) |*l| l.unload();
         r.plan_fn = try r.experts.function(weights.plan_symbol);
         r.up_fn = try r.experts.function(weights.up_symbol);
         r.down_fn = try r.experts.function(weights.down_symbol);
@@ -50,6 +53,7 @@ pub const Rows = struct {
     }
 
     pub fn deinit(r: *Rows) void {
+        if (r.lane) |*l| l.unload();
         r.experts.unload();
         r.gpa.free(r.mode);
         r.scratch.free();
@@ -75,7 +79,7 @@ pub const Rows = struct {
         // dense attention only: the reference stops where the indexer would start choosing
         if (seq.fed + ids.len > weights.dense_nch * 512) return error.UnexpectedTensor;
         try r.grow(e.stream.*, ids.len);
-        var pass = Pass{ .gpa = e.gpa, .io = e.io, .driver = e.driver, .stream = e.stream, .model_dir = e.model_dir, .s = &r.scratch, .table = e.table, .mode = r.mode, .history = &seq.history, .conv = seq.conv, .state = seq.state, .kc = seq.kc, .vc = seq.vc, .ikc = seq.ikc, .tail = seq.tail, .mixer = e.mixer, .head_q = e.head_q, .logits = seq.logits, .plan_fn = r.plan_fn, .up_fn = r.up_fn, .down_fn = r.down_fn };
+        var pass = Pass{ .gpa = e.gpa, .io = e.io, .driver = e.driver, .stream = e.stream, .model_dir = e.model_dir, .s = &r.scratch, .table = e.table, .mode = r.mode, .history = &seq.history, .conv = seq.conv, .state = seq.state, .kc = seq.kc, .vc = seq.vc, .ikc = seq.ikc, .tail = seq.tail, .lane = if (r.lane) |*l| l else null, .mixer = e.mixer, .head_q = e.head_q, .logits = seq.logits, .plan_fn = r.plan_fn, .up_fn = r.up_fn, .down_fn = r.down_fn };
         @memset(pass.mode, 0);
         for (ids, 0..) |token, t| try embedRow(Tri, &pass, tri, token, pass.s.h.ptr + @as(u64, t) * wide * 2);
         for (e.layers[0..e.n_layers], 0..) |*lw, layer| try runLayer(Tri, &pass, tri, lw, layer, ids, seq.fed);
@@ -100,6 +104,7 @@ const Pass = struct {
     vc: []cuda.DeviceBuffer,
     ikc: []cuda.DeviceBuffer,
     tail: cuda.DeviceBuffer,
+    lane: ?*const cuda.qmmf.Lane,
     mixer: HcW,
     head_q: Q4,
     logits: []u8,
@@ -116,21 +121,21 @@ fn embedRow(comptime Tri: type, p: *Pass, tri: Tri, token: u32, h: u64) !void {
     try tri.embed(p.s.ids.ptr, p.table.w.ptr, p.table.s.ptr, p.table.b.ptr, h, dims, streams, 1);
 }
 
+/// The row's pending feed-forward written back: mode 2 the experts' sum, mode 3 a dense layer's branch (held in y).
+fn flush(comptime Tri: type, p: *Pass, tri: Tri, t: usize, h: u64, inj: u64, y: u64, wt: u64) !void {
+    if (p.mode[t] == 3) try step.writebackDense(tri, p.s, h, inj, y) else try step.writeback(tri, p.s, h, 2, inj, y, wt);
+    p.mode[t] = 0;
+}
+
 fn runLayer(comptime Tri: type, p: *Pass, tri: Tri, lw: *Layer, layer: usize, ids: []const u32, pos0: usize) !void {
     for (ids, 0..) |token, t| {
         const h = p.s.h.ptr + @as(u64, t) * wide * 2;
         const inj = p.s.inj.ptr + @as(u64, t) * inj_stride;
         const y = p.s.y.ptr + @as(u64, t) * slots * dims * 4;
         const wt = p.s.wts.ptr + @as(u64, t) * wts_stride;
-        if (layer == ple_layer and p.mode[t] == 2) {
-            try step.writeback(tri, p.s, h, 2, inj, y, wt);
-            p.mode[t] = 0;
-        }
+        if (layer == ple_layer and p.mode[t] != 0) try flush(Tri, p, tri, t, h, inj, y, wt);
         if (layer == ple_layer) try step.pleStep(Tri, p.gpa, p.io, p.driver, p.stream, tri, p.s, p.model_dir, p.history, token, h, lw.key, lw.val, lw.nk.ptr, lw.nq.ptr, lw.nc.ptr, lw.ple_cw.ptr, &p.tail);
-        if (p.mode[t] == 2) {
-            try step.writeback(tri, p.s, h, 2, inj, y, wt);
-            p.mode[t] = 0;
-        } else try step.writeback(tri, p.s, h, 0, inj, y, wt);
+        if (p.mode[t] != 0) try flush(Tri, p, tri, t, h, inj, y, wt) else try step.writeback(tri, p.s, h, 0, inj, y, wt);
         try step.readout(tri, p.s, lw.attn_hc, h, inj);
         if (lw.linear) {
             const li = weights.linearIndex(layer);
@@ -141,19 +146,23 @@ fn runLayer(comptime Tri: type, p: *Pass, tri: Tri, lw: *Layer, layer: usize, id
         }
         try step.writeback(tri, p.s, h, 4, inj, y, wt);
         try step.readout(tri, p.s, lw.mlp_hc, h, inj);
-        try step.moeStep(Tri, tri, p.s, p.stream, p.plan_fn, p.up_fn, p.down_fn, lw.router.ptr, lw.experts_up.ptr, lw.experts_down.ptr, y, wt);
-        p.mode[t] = 2;
+        if (lw.ffn) |*ffn| {
+            try step.denseStep(p.stream, p.lane orelse return error.UnexpectedTensor, ffn, p.s, y);
+            p.mode[t] = 3;
+        } else {
+            try step.moeStep(Tri, tri, p.s, p.stream, p.plan_fn, p.up_fn, p.down_fn, lw.router.ptr, lw.experts_up.ptr, lw.experts_down.ptr, y, wt);
+            p.mode[t] = 2;
+        }
     }
 }
 
 fn head(comptime Tri: type, p: *Pass, tri: Tri, row: usize) !void {
-    if (p.mode[row] != 2) return error.UnexpectedTensor;
+    if (p.mode[row] == 0) return error.UnexpectedTensor;
     const h = p.s.h.ptr + @as(u64, row) * wide * 2;
     const inj = p.s.inj.ptr + @as(u64, row) * inj_stride;
     const y = p.s.y.ptr + @as(u64, row) * slots * dims * 4;
     const wt = p.s.wts.ptr + @as(u64, row) * wts_stride;
-    try step.writeback(tri, p.s, h, 2, inj, y, wt);
-    p.mode[row] = 0;
+    try flush(Tri, p, tri, row, h, inj, y, wt);
     try step.readout(tri, p.s, p.mixer, h, inj);
     try qmm.matmul(p.driver, p.stream.*, p.s.mixed.ptr, p.s.xsm.ptr, p.head_q.w.ptr, p.head_q.s.ptr, p.head_q.b.ptr, p.s.logits.ptr, 1, vocab, dims);
     try p.stream.synchronize();

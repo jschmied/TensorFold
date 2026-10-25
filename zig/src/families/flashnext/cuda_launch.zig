@@ -21,6 +21,12 @@ pub const gdn = @import("cuda_gdn.zig");
 pub const mlp = @import("cuda_mlp.zig");
 /// The provisional dense feed-forward node (no released Qwen4 checkpoint).
 pub const dense_ffn = @import("cuda_dense_ffn.zig");
+/// The dense node's hook and row steps, the shape table and the config, for its tests.
+pub const batch_dense = @import("cuda_batch_dense.zig");
+pub const prompt_step = @import("cuda_prompt_step.zig");
+pub const prompt_wt = wt;
+pub const shape = @import("cuda_shape.zig");
+pub const config = @import("config.zig");
 pub const moe = @import("cuda_moe.zig");
 pub const attn = @import("cuda_attn.zig");
 pub const ple = @import("cuda_ple.zig");

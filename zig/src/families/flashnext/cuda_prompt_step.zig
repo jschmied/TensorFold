@@ -6,6 +6,7 @@ const qmm = @import("cuda_qmm.zig");
 const gdn = @import("cuda_gdn.zig");
 const ple = @import("cuda_ple.zig");
 const wt = @import("cuda_prompt_wt.zig");
+const dense = @import("cuda_dense_ffn.zig");
 
 const dims = wt.dims;
 const streams = wt.streams;
@@ -138,7 +139,7 @@ pub const Scratch = struct {
         s.moe_members = try cuda.DeviceBuffer.alloc(driver, slots * 4);
         s.moe_items = try cuda.DeviceBuffer.alloc(driver, slots * 3 * 4);
         s.moe_counts = try cuda.DeviceBuffer.alloc(driver, 8);
-        s.moe_act = try cuda.DeviceBuffer.alloc(driver, slots * moe_w * 2);
+        s.moe_act = try cuda.DeviceBuffer.alloc(driver, @max(slots * moe_w * 2, 16)); // a dense shape has no expert width
         return s;
     }
 
@@ -200,6 +201,17 @@ pub fn writeback(tri: anytype, s: *Scratch, h: u64, mode: usize, inj: u64, y: u6
     } else if (mode == 4) {
         try tri.hcWriteback(h, h, s.pss.ptr, s.part.ptr, "*fp32", inj, dummy, "*bf16", dummy, "*bf16", dims, 1, dims, streams, 4, 1, 1, out_sk);
     } else return error.UnexpectedTensor;
+}
+
+/// Mode 4 over the dense branch in `branch` (one fp32 row, a slice of one), rounded once as the shared pass rounds it.
+pub fn writebackDense(tri: anytype, s: *Scratch, h: u64, inj: u64, branch: u64) !void {
+    const dummy = s.dummy.ptr;
+    try tri.hcWriteback(h, h, s.pss.ptr, branch, "*fp32", inj, dummy, "*bf16", dummy, "*bf16", dims, 1, dims, streams, 4, 1, 1, 1);
+}
+
+/// A dense layer's feed-forward on the mixed row: the fp32 branch lands in `branch` (the row's y slot).
+pub fn denseStep(stream: *cuda.Stream, lane: *const cuda.qmmf.Lane, ffn: *const dense.Ffn, s: *Scratch, branch: u64) !void {
+    try ffn.run(lane, stream.*, s.mixed.ptr, dims, 1, branch);
 }
 
 pub fn readout(tri: anytype, s: *Scratch, hc_w: HcW, h: u64, inj: u64) !void {
