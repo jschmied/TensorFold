@@ -116,7 +116,8 @@ __device__ void rmsnorm(const __nv_bfloat16* x, int64_t x_stride, const __nv_bfl
     glm_glue::rmsnorm<D, BLOCK, NW, S>(x, x_stride, w, out, o_stride, xs, eps, sums);                              \
   }
 
-// The model's norms: hidden 4096 (8 warps), q_lora 1536 and kv_lora 512 (4 warps), as glue.rmsnorm launches them.
+// The model's norms: hidden 4096 (8 warps), q_lora 1536, kv_lora 512 (4 warps); 256 (2 warps): Ling-3.0-tiny's q_lora.
 RMSNORM(4096, 4096, 8, 8)
 RMSNORM(1536, 2048, 4, 8)
 RMSNORM(512, 512, 4, 4)
+RMSNORM(256, 256, 2, 4)

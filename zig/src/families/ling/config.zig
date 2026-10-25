@@ -195,6 +195,7 @@ fn must(o: std.json.ObjectMap, key: []const u8, want: []const u8, err: anyerror,
 fn limits(o: std.json.ObjectMap, key: []const u8, layers: u32, out: *[max_layers]f32, why: *Why) !void {
     out.* = @splat(0);
     const v = o.get(key) orelse return; // absent: no clamp anywhere, as the reference reads it
+    if (v == .null) return; // Ling-3.0-tiny writes null: the same, no clamp
     if (v != .array or v.array.items.len != layers) {
         why.set("{s} has {d} entries for {d} layers", .{ key, if (v == .array) v.array.items.len else 0, layers });
         return error.LimitList;
@@ -463,7 +464,9 @@ fn parseConfig(gpa: std.mem.Allocator, json: []const u8, why: *Why) !Config {
 
 /// The widths the kernels are built for (cuda.zig's tests hold them to glm_kda, glm_glue and the latent cache).
 pub const fixed = .{ .kda_dim = 128, .conv = 4, .kv_lora = 512, .nope = 128, .v_dim = 128, .rope = 64, .block = 128 };
-/// glue.rmsnorm's instances: the hidden width and q_lora_rank take one of these.
+/// glue.rmsnorm's instances for q_lora_rank (256 is Ling-3.0-tiny's); the hidden width takes the router's three.
+pub const q_lora_widths = [_]u32{ 256, 512, 1536, 4096 };
+/// The hidden width: the norms' 512, 1536 and 4096, which the router's slices (8 x 64 inputs) also divide.
 pub const norm_widths = [_]u32{ 512, 1536, 4096 };
 
 fn normWidth(w: u32) bool {
@@ -501,8 +504,8 @@ fn geometry(o: std.json.ObjectMap, c: *const Config, why: *Why) !void {
         why.set("rope_interleave false: the MLA rope kernel pairs adjacent columns (GPT-J) only", .{});
         return error.MlaGeometry;
     }
-    if (c.q_lora != 0 and !normWidth(c.q_lora)) {
-        why.set("q_lora_rank {d}: q_a_layernorm runs at 512, 1536 or 4096", .{c.q_lora});
+    if (c.q_lora != 0 and std.mem.indexOfScalar(u32, &q_lora_widths, c.q_lora) == null) {
+        why.set("q_lora_rank {d}: q_a_layernorm runs at 256, 512, 1536 or 4096", .{c.q_lora});
         return error.MlaGeometry;
     }
     // widths: the norms' instances, and every linear's inputs in whole 128-column blocks (FP8's, the lanes' 64)

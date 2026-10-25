@@ -11,6 +11,7 @@ pub const Kernels = struct {
     rmsnorm_4096: cuda.Function,
     rmsnorm_1536: cuda.Function,
     rmsnorm_512: cuda.Function,
+    rmsnorm_256: cuda.Function,
     residual_add: cuda.Function,
     stream_mean: cuda.Function,
     rank_sum: cuda.Function,
@@ -96,6 +97,7 @@ pub fn rmsnorm(set: Set, stream: cuda.Stream, x: u64, x_stride: usize, w: u64, o
         4096 => .{ set.glue.rmsnorm_4096, 8 },
         1536 => .{ set.glue.rmsnorm_1536, 4 },
         512 => .{ set.glue.rmsnorm_512, 4 },
+        256 => .{ set.glue.rmsnorm_256, 2 },
         else => return error.NoRmsnormWidth,
     };
     var a: cuda.Args = .{};

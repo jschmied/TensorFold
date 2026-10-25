@@ -8,6 +8,7 @@ const rows_k = @import("contract_rows.zig");
 const router_k = @import("contract_router.zig");
 const mm_k = @import("contract_mm.zig");
 const rank_k = @import("contract_rank.zig");
+const glm = @import("glm_cuda");
 
 const contract = core.contract;
 const g = contract.gates;
@@ -21,7 +22,7 @@ const controls = struct {
 
 /// The embedded image a registration names (the controls' only when this binary was built with -Dnvcc).
 fn image(name: []const u8) []const u8 {
-    inline for (.{ "norms", "nemotron_route", "qmm_group", "lane_gemv", "prompt16", "qmmf", "rank_sum", "prefill_attention", "vit" }) |n| if (std.mem.eql(u8, name, n)) return @field(kk, n);
+    inline for (.{ "norms", "nemotron_route", "qmm_group", "lane_gemv", "prompt16", "qmmf", "rank_sum", "prefill_attention", "vit", "glm_glue" }) |n| if (std.mem.eql(u8, name, n)) return @field(kk, n);
     return if (options.controls) &controls.bytes else &.{};
 }
 
@@ -37,10 +38,10 @@ pub fn run(gpu: check.Gpu) !void {
     defer s.deinit();
     var norms = try cuda.norms.Norms.load(gpu.d);
     defer norms.unload();
-    var mods: [6]cuda.Module = undefined;
+    var mods: [7]cuda.Module = undefined;
     var loaded: usize = 0;
     defer for (mods[0..loaded]) |*m| m.unload();
-    for ([_][]const u8{ kk.nemotron_route, kk.qmm_group, kk.qmm_prefill, kk.lane_gemv, kk.affine4_pack, &controls.bytes }, 0..) |img, i| {
+    for ([_][]const u8{ kk.nemotron_route, kk.qmm_group, kk.qmm_prefill, kk.lane_gemv, kk.affine4_pack, &controls.bytes, kk.glm_glue }, 0..) |img, i| {
         mods[i] = try cuda.Module.load(gpu.d, img);
         loaded += 1;
     }
@@ -60,11 +61,12 @@ pub fn run(gpu: check.Gpu) !void {
     defer rank_sum.unload();
     var kernels: std.ArrayList(g.Kernel) = .empty;
     defer kernels.deinit(a);
-    var row_list: [7]rows_k.Row = undefined;
+    const glue = try glm.glue.Kernels.load(mods[6]);
+    var row_list: [std.enums.values(rows_k.Which).len]rows_k.Row = undefined;
     var nrows: usize = 0;
     defer for (row_list[0..nrows]) |*r| r.deinit();
     for (std.enums.values(rows_k.Which)) |w| {
-        row_list[nrows] = try rows_k.Row.init(gpu, s, &norms, mods[5], w);
+        row_list[nrows] = try rows_k.Row.init(gpu, s, &norms, &glue, mods[5], w);
         nrows += 1;
     }
     for (row_list[0..nrows]) |*r| try kernels.append(a, r.kernel());
