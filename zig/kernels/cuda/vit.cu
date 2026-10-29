@@ -7,6 +7,7 @@
 #include "glue_math.cuh"
 #include "vit_norm.cuh"
 #include "vit_gemma.cuh"
+#include "vit_dwconv.cuh"
 
 using namespace tf_glue;
 
@@ -151,4 +152,11 @@ extern "C" __global__ void __launch_bounds__(NT) tf_vit_g4_pool(const __nv_bfloa
                                                                 const __nv_bfloat16* scale, __nv_bfloat16* out, int gw, int C,
                                                                 float root) {
     tf_vit_g4::pool_std(x, bias, scale, out, gw, C, root, tf_vit_g4::POOL_ALL);
+}
+
+// LFM3-VL's gated depthwise conv: a block a row and NT channels (vit_dwconv.cuh), one picture's rows a launch.
+extern "C" __global__ void __launch_bounds__(NT) tf_vit_dwconv3(const __nv_bfloat16* __restrict__ P,
+                                                                const __nv_bfloat16* __restrict__ W,
+                                                                __nv_bfloat16* __restrict__ Y, int gh, int gw, int C, int merge) {
+    tf_vit_dwconv::dwconv3<0>(P, W, Y, gh, gw, C, merge);
 }

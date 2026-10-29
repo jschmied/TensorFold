@@ -34,6 +34,7 @@ pub const Kernels = struct {
     unshuffle_fn: module.Function,
     cast_fn: module.Function,
     position_fn: module.Function,
+    dwconv_fn: module.Function,
 
     pub fn load(d: *const Driver) !Kernels {
         if (!kernels.available) return error.BuiltWithoutKernels;
@@ -52,6 +53,7 @@ pub const Kernels = struct {
             .unshuffle_fn = try mod.function("tf_vit_unshuffle"),
             .cast_fn = try mod.function("tf_vit_cast"),
             .position_fn = try mod.function("tf_vit_position_add"),
+            .dwconv_fn = try mod.function("tf_vit_dwconv3"),
         };
     }
 
@@ -144,6 +146,17 @@ pub const Kernels = struct {
         a.add(int(w));
         a.add(int(c));
         try go(k.unshuffle_fn, s, h * w / 4, 1, &a);
+    }
+
+    /// y = bf16(C * bf16(conv3x3(bf16(B * x)))) over a picture's merge-ordered patches, p = B | C | x (vit_dwconv.cuh).
+    pub fn dwconv3(k: *const Kernels, s: Stream, p: u64, w: u64, y: u64, gh: usize, gw: usize, c: usize, merge: usize) !void {
+        if (merge == 0 or gh % merge != 0 or gw % merge != 0) return error.RowShape;
+        var a: Args = .{};
+        a.add(p);
+        a.add(w);
+        a.add(y);
+        for ([_]usize{ gh, gw, c, merge }) |v| a.add(int(v));
+        try go(k.dwconv_fn, s, gh * gw, (c + threads - 1) / threads, &a);
     }
 
     /// y [count] = bf16(x), x f32, rounded to nearest even.
@@ -272,10 +285,11 @@ const Full = struct {
     }
 };
 
-/// A tower's attention by head dim: SigLIP2's 72, and RADIO's 80 (full_kernel's bits in one barrier a tile).
+/// A tower's attention by head dim: SigLIP2's 72, RADIO's 80 and LFM3-VL's 64 (one barrier a tile).
 const fulls = [_]Full{
     .{ .dim = 72, .warps = 8, .slots = 8 },
     .{ .dim = 80, .warps = 8 },
+    .{ .dim = 64, .warps = 8 },
 };
 
 /// Every row of a picture over every key (no mask), a block a head and 128 rows.

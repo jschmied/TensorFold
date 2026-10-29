@@ -372,6 +372,13 @@ extern "C" __global__ void __launch_bounds__(256) tf_ctl_liquid_commit_7(__nv_bf
 }
 
 // LFM2.5-24B-A2B's router, one planted fault: ties go to the higher expert id.
+#include "vit_dwconv.cuh"
+
+extern "C" __global__ void __launch_bounds__(256) tf_ctl_vit_dwconv3(const __nv_bfloat16* P, const __nv_bfloat16* W,
+                                                                     __nv_bfloat16* Y, int gh, int gw, int C, int merge) {
+    tf_vit_dwconv::dwconv3<1>(P, W, Y, gh, gw, C, merge);
+}
+
 #include "lfm2_moe.cuh"
 
 extern "C" __global__ void __launch_bounds__(256) tf_ctl_lfm2m_route(const __nv_bfloat16* X, const float* W, const float* BIAS, int* PICK,
