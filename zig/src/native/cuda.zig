@@ -27,6 +27,7 @@ const cuda_disk = @import("cuda_disk.zig");
 const vision_offer = @import("cuda_vision_offer.zig");
 const drafted = @import("cuda_drafted.zig");
 const kv_pages = @import("cuda_kv_pool.zig");
+const kept_pages = @import("core").kv_kept;
 /// CUDA families provide metadata, open their lane backend and explain their refusals.
 const registry = .{ nemotron.native, nemotron.omni, glm.native, qwen35.native, qwen35.native_moe, flashnext.native, kolibri1.native, gemma4.native, gemma4.native31, spark25.native, dory.native };
 /// --record opens here (engines.zig refuses it for a backend without this).
@@ -75,6 +76,7 @@ pub const Host = struct {
     startup: []u8 = &.{},
     lone: ?LoneRun = null, // the family's driver for a lone drafted stream, called with `family`
     store: ?*api.prompt_cache.Store = null, // kept Nemotron states; null when the budget is 0
+    reclaim: ?*kept_pages.Reclaim(api.prompt_cache.Store) = null, // TF_KV_SHARE: the pool sheds kept states before a promise fails
     learn: ?api.Learner = null, // the family's Sliding Weights learner (--slide), called with the context current
     slide: ?*anyopaque = null, // that learner's adapter, freed by slide_free before the family
     slide_free: ?*const fn (Allocator, *anyopaque) void = null,
@@ -429,12 +431,23 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         }
         try kv_pages.store(F, store, loaded.target, kept); // its snapshot slots, before a disk probe takes one
         h.store = store;
+        if (comptime @hasDecl(F, "snap_pool")) if (kept_pages.sharing()) if (F.snap_pool(loaded.target)) |kv_pool| {
+            const r = try gpa.create(kept_pages.Reclaim(api.prompt_cache.Store));
+            r.* = .{ .store = store, .pool = kv_pool };
+            r.wire();
+            h.reclaim = r;
+        };
         if (o.learn_conversations) if (o.learn) |root| {
             if (F == nemotron.native) try cuda_disk.attach(a, io, &g.ctx, o, root, kernels, loaded, store);
             if (comptime cuda_disk.keptDisk(F)) |K| try cuda_disk.attachKept(K, F.model_type, a, io, &g.ctx, o, root, kernels, loaded, store);
         };
     }
     errdefer if (h.store) |store| kv_pages.closeStore(gpa, store);
+    errdefer if (h.reclaim) |r| { // before the store's states go, so no promise reaches a closed store
+        r.unwire();
+        gpa.destroy(r);
+        h.reclaim = null;
+    };
     var conversations = false;
     if (@hasDecl(F, "slide")) if (loaded.learns != null) {
         const Slide = slide_adapter.Adapter(F.slide);
