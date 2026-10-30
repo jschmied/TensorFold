@@ -7,6 +7,10 @@ pub fn close(h: anytype) void {
     h.cfg.deinit(h.gpa);
     if (h.recording) |r| r.free(h.gpa);
     failed_load.closeEntry(if (h.gpu) |g| &g.ctx else null) catch {};
+    if (h.reclaim) |r| {
+        r.unwire();
+        h.gpa.destroy(r);
+    }
     if (h.store) |s| kv_pages.closeStore(h.gpa, s);
     if (h.slide) |s| h.slide_free.?(h.gpa, s);
     h.gpa.free(h.dir);
