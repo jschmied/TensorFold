@@ -99,7 +99,7 @@ fn pass(gpu: Gpu, model: []const u8, drafter: ?[]const u8, paged: bool, prompts:
         var sequential: usize = 0;
         for (lens) |n| sequential += be.pagesFor(n, count);
         try check.expect(sequential > pool, "gemma4 pages: the solo runs take more pages than the pool holds", .{});
-        try native.attach(loaded.ctx, 1, pool);
+        try native.attach(loaded.ctx, 1, pool + gb.keptPages(mark)); // TF_KV_SHARE: the kept rows
         gb.shufflePages(0x6e4);
     }
     var drafted: ?lanes.drafted.Drafted = if (opened) |o| try lanes.drafted.Drafted.init(gpa, loaded.backend, o.drafter) else null;

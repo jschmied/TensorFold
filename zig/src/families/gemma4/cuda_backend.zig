@@ -9,6 +9,7 @@ const snap = @import("cuda_snap.zig");
 const cv = @import("cuda_vision.zig");
 const kv = @import("core").kv_pool;
 const kept = @import("core").kv_kept;
+const pg = @import("cuda_backend_pages.zig");
 
 const be = lanes.backend;
 const Stream = lanes.Stream;
@@ -23,7 +24,7 @@ pub const max_window = 16;
 /// Drawn tokens a handle names (a ring; read before the round loop could wrap it).
 const ring = 1024;
 
-const Lane = struct {
+pub const Lane = struct {
     slot: usize,
     len: u64 = 0, // the cache length: positions [0, len) hold this stream's keys
     base: u64 = 0, // the cache length the last verify started from
@@ -44,7 +45,7 @@ pub fn pagesFor(prompt: usize, max_new: usize) usize {
 }
 
 /// Pages that hold positions [0, positions).
-fn pagesOf(positions: usize) usize {
+pub fn pagesOf(positions: usize) usize {
     return (positions + fwd.page_tokens - 1) / fwd.page_tokens;
 }
 
@@ -104,22 +105,20 @@ pub const Gemma = struct {
         return .{ .gpa = gpa, .d = d, .m = m, .k = k, .s = s, .free = free, .tok = tok, .picks = picks, .greedy = greedy, .meta = meta, .slot_bufs = bufs };
     }
 
+    pub const heldBelow = pg.heldBelow;
+    pub const keptPages = pg.keptPages;
+    pub const shufflePages = pg.shufflePages;
+    const holdBlob = pg.holdBlob;
+    const releaseKept = pg.releaseKept;
+    const putHeld = pg.putHeld;
+    const adoptHeld = pg.adoptHeld;
+    const reach = pg.reach;
+
     /// Makes a paged model's arena of `pages` pages for `extra + 1` slots, and the pool that leases them.
     pub fn attach(x: *Gemma, extra: usize, pages: usize) !void {
         try x.m.attach(x.s, extra, pages);
         x.pool = try kv.Pool.init(x.gpa, pages, x.m.pageBytes());
         x.share = kept.sharing();
-    }
-
-    /// Positions a state kept at `at` holds as whole pages (0: it copies them all).
-    pub fn heldBelow(x: *const Gemma, at: usize) usize {
-        return if (x.share) kept.whole(at, fwd.page_tokens) * fwd.page_tokens else 0;
-    }
-
-    /// The pool's free pages in a seeded random order, leased in that order (a check's hook).
-    pub fn shufflePages(x: *Gemma, seed: u64) void {
-        var prng = std.Random.DefaultPrng.init(seed);
-        if (x.pool) |*p| prng.random().shuffle(u32, p.free[0..p.nfree]);
     }
 
     pub fn deinit(x: *Gemma) void {
@@ -240,7 +239,11 @@ pub const Gemma = struct {
         const l = x.lanes.getPtr(s) orelse return error.UnknownStream;
         if ((l.fill orelse l.len) != at) return error.NotAtMark; // a state is copied only where the pass stands
         const from = x.heldBelow(at);
-        const k = try snap.save(x.gpa, x.m, x.s, l.slot, at, @intCast(from));
+        const blob = try x.holdBlob(snap.blobPages(x.m, at, from)); // TF_KV_SHARE: the copied rows in pool pages too
+        const k = snap.save(x.gpa, x.m, x.s, l.slot, at, @intCast(from), blob) catch |e| {
+            if (blob.len > 0) kept.release(x.gpa, &x.pool.?, blob);
+            return e;
+        };
         errdefer x.dropState(k);
         if (from > 0) k.pages = try kept.retain(x.gpa, &x.pool.?, l.lease.ids.items, from / fwd.page_tokens);
         if (x.keeper) |kp| try kp.keep(kp.ctx, s, k);
@@ -255,21 +258,8 @@ pub const Gemma = struct {
         l.len = k.at;
     }
 
-    /// A state's held pages into a lane that did not adopt them: their rows copied into the lane's own pages.
-    fn putHeld(x: *Gemma, l: *Lane, k: *const snap.Saved) !void {
-        if (k.pages.len == 0) return;
-        const ids = l.lease.ids.items;
-        if (ids.len >= k.pages.len and std.mem.eql(u32, ids[0..k.pages.len], k.pages)) return; // adopted: nothing to copy
-        try x.reach(l, k.from);
-        try snap.copyPages(x.m, x.s, l.slot, k.pages);
-    }
-
     pub fn dropState(x: *Gemma, k: *snap.Saved) void {
-        if (k.pages.len > 0) {
-            x.s.synchronize() catch {}; // a restore's queued copies out of them are done
-            kept.release(x.gpa, &x.pool.?, k.pages);
-            k.pages = &.{};
-        }
+        x.releaseKept(k);
         snap.drop(x.gpa, x.s, k);
     }
 
@@ -288,35 +278,11 @@ pub const Gemma = struct {
         return x.freeSlot() != null and p.fits(pagesFor(prompt, max_new));
     }
 
-    const Map = struct {
-        x: *Gemma,
-        slot: usize,
-        fn write(ctx: *anyopaque, ids: []const u32, from: usize) anyerror!void {
-            const m: *const Map = @ptrCast(@alignCast(ctx));
-            try m.x.m.mapPages(m.x.s, m.slot, ids[from..], from);
-        }
-    };
-
-    /// The lane's pages cover positions [0, end): pages taken from its promise as its context grows.
-    fn reach(x: *Gemma, l: *Lane, end: usize) !void {
-        const p = if (x.pool) |*p| p else return;
-        const n = pagesOf(end);
-        if (n <= l.lease.ids.items.len) return;
-        var map: Map = .{ .x = x, .slot = l.slot };
-        try p.cover(&l.lease, n, .{ .ctx = &map, .write = Map.write });
-    }
-
-    /// A free slot for the request, its pages promised now (taken as its rows need them, `held` adopted); LaneMemory: not yet.
+    /// A free slot for the request, its pages promised now (taken as rows need them, `held` adopted); LaneMemory: wait.
     fn takeSlot(x: *Gemma, lease: *kv.Lease, prompt: usize, max_new: usize, held: usize) !usize {
         const slot = x.freeSlot() orelse return error.NoFreeSlot;
         if (x.pool) |*p| try p.promise(lease, pagesFor(prompt, max_new) - held);
         return slot;
-    }
-
-    /// A new lane's table starts with the kept state's pages, held once more by its lease (rows below `from`, never written).
-    fn adoptHeld(x: *Gemma, l: *Lane, k: *const snap.Saved) !void {
-        try kept.adopt(&x.pool.?, &l.lease, k.pages);
-        try x.m.mapPages(x.s, l.slot, k.pages, 0);
     }
 
     /// The kept state a new lane adopts the pages of: the one its pass resumes, holding pages.
@@ -402,7 +368,7 @@ pub const Gemma = struct {
         return k;
     }
 
-    /// The kept state's position, restored into the slot (0: none, or not this prompt's); its adopted pages are never rewritten.
+    /// The kept state's position, restored into the slot (0: none, or not this prompt's); adopted pages stay unwritten.
     fn resumeAt(x: *Gemma, s: *Stream, l: *Lane, len: usize) !usize {
         if (s.reuse.saved == null) return 0;
         const k = x.resumable(s, len) orelse {
@@ -612,7 +578,7 @@ pub const Gemma = struct {
         }
     }
 
-    /// The idle server's line: nothing promised, every page free or a kept state's (TF_KV_SHARE: kept states hold pages).
+    /// The idle server's line: nothing promised, every page free or a kept state's (TF_KV_SHARE).
     fn report(x: *const Gemma) void {
         if (@import("builtin").is_test) return;
         const p = x.pool orelse return;
