@@ -404,3 +404,33 @@ test "combined page cap: all three windows and only the two extra streams' recur
     b.engine_paged = false;
     try expectEqual(@as(usize, 10), (try kv.plan(l, b)).pages);
 }
+
+test "TF_KV_SHARE's plan: the cache's kept share becomes pool pages past the windows, the rest stays copies" {
+    const l: kv.Layout = .{ .fixed_bytes = 10, .token_bytes = 3, .page_tokens = 4, .snap_bytes = 0 };
+    const b: kv.Budget = .{ .room = 10_000, .engine = 5, .lanes = 3, .cache = 120, .window = 9, .engine_paged = true };
+    const copies = try kv.plan(l, b);
+    var shared = b;
+    shared.kept_ppm = 500_000; // half the cache's bytes are kept states' pages
+    const pages = try kv.plan(l, shared);
+    try expectEqual(copies.lanes, pages.lanes);
+    try expectEqual(copies.copied - 60, pages.copied);
+    try expectEqual(copies.pages + 60 / l.pageBytes(), pages.pages);
+    try expectEqual(@as(u64, 60), pages.kept);
+    shared.kept_ppm = 0;
+    try expectEqual(copies, try kv.plan(l, shared));
+}
+
+test "the store holds free pages itself: never promised ones, released back to the free list" {
+    var p = try kv.Pool.init(std.testing.allocator, 4, 1);
+    defer p.deinit();
+    var l: kv.Lease = .{};
+    try p.promise(&l, 2);
+    var ids: [2]u32 = undefined;
+    try expect(p.hold(&ids)); // two free past the promise
+    try expect(!p.hold(ids[0..1])); // none left unpromised
+    try expectEqual(@as(usize, 2), p.census().kept);
+    for (ids) |id| p.release(id);
+    p.finish(&l);
+    try expect(p.idle());
+    try expectEqual(@as(usize, 4), p.available());
+}

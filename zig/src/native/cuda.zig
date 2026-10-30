@@ -365,7 +365,9 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     const layout = wrapped.layout;
     var paged: ?kv_pages.Plan = null;
     const streams = if (layout) |l| blk: {
-        paged = try kv_pages.plan(F, a, l, wrapped.room, o, @intCast(window), problem, host_cache, kv_pages.enginePaged(loaded)) orelse return null;
+        // TF_KV_SHARE: the share of a kept state at the window its pages hold goes to the pool, not the copies
+        const kept_ppm: u32 = if (comptime @hasDecl(F, "snap_kept_ppm")) (if (kept_pages.sharing()) F.snap_kept_ppm(loaded.target, @intCast(window)) else 0) else 0;
+        paged = try kv_pages.plan(F, a, l, wrapped.room, o, @intCast(window), problem, host_cache, kv_pages.enginePaged(loaded), kept_ppm) orelse return null;
         break :blk paged.?.lanes;
     } else budget.admit(grow, served.stream_bytes, free, o.lanes, o.lanes_fixed) catch |e| {
         problem.* = switch (e) {
