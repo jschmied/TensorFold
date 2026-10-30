@@ -157,7 +157,15 @@ fn kolibri(ptr: *anyopaque) *be.Kolibri {
 
 /// Bytes a state at `at` prompt tokens takes.
 pub fn snap_bytes(ptr: *anyopaque, at: u32) u64 {
-    return snap.bytes(kolibri(ptr).m, at);
+    const x = kolibri(ptr);
+    return snap.bytes(x.m, at, x.heldBelow(at));
+}
+
+/// TF_KV_SHARE: the pool kept states hold pages of, which sheds them before a promise fails (null: copies).
+pub fn snap_pool(ptr: *anyopaque) ?*kv.Pool {
+    const x = kolibri(ptr);
+    if (!x.share) return null;
+    return if (x.pool) |*p| p else null;
 }
 
 /// The prompt pass stands at `at` (a chunk start): copy the stream's caches there.
