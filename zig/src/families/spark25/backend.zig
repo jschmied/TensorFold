@@ -7,6 +7,7 @@ const fwd = @import("forward.zig");
 const kern = @import("kernels.zig");
 const snap = @import("snap.zig");
 const kv = @import("core").kv_pool;
+const kept = @import("core").kv_kept;
 
 const be = lanes.backend;
 const Stream = lanes.Stream;
@@ -58,6 +59,7 @@ pub const Spark = struct {
     slot_bufs: []cuda.DeviceBuffer, // a slot's last-row logits, then its rule: two a slot
     next: u64 = 0,
     pool: ?kv.Pool = null, // paged: the pages every slot leases (attach)
+    share: bool = false, // TF_KV_SHARE on a paged model: kept states hold the full layers' whole pages
 
     /// The device bytes `init` allocates: the token and pick rings, metas, each slot's last row and rule.
     pub fn openBytes(slots: usize) usize {
@@ -92,6 +94,12 @@ pub const Spark = struct {
     pub fn attach(x: *Spark, extra: usize, pages: usize) !void {
         try x.m.attach(x.s, extra, pages);
         x.pool = try kv.Pool.init(x.gpa, pages, x.m.pageBytes());
+        x.share = kept.sharing();
+    }
+
+    /// Positions a state kept at `at` holds as whole pages (0: it copies them all).
+    pub fn heldBelow(x: *const Spark, at: usize) usize {
+        return if (x.share) kept.whole(at, fwd.page_tokens) * fwd.page_tokens else 0;
     }
 
     /// The pool's free pages in a seeded random order, leased in that order (a check's hook).
@@ -164,18 +172,41 @@ pub const Spark = struct {
         const s: *const Stream = @ptrCast(@alignCast(owner orelse return error.NoOwner));
         const l = x.lanes.getPtr(s) orelse return error.UnknownStream;
         if ((l.fill orelse l.len) != at) return error.NotAtMark; // a state is copied only where the pass stands
-        return snap.save(x.gpa, x.m, x.s, l.slot, at);
+        const from = x.heldBelow(at);
+        const k = try snap.save(x.gpa, x.m, x.s, l.slot, at, @intCast(from));
+        errdefer x.dropState(k);
+        if (from > 0) k.pages = try kept.retain(x.gpa, &x.pool.?, l.lease.ids.items, from / fwd.page_tokens);
+        return k;
     }
 
     pub fn restoreState(x: *Spark, owner: ?*anyopaque, k: *const snap.Saved) !void {
         const s: *const Stream = @ptrCast(@alignCast(owner orelse return error.NoOwner));
         const l = x.lanes.getPtr(s) orelse return error.UnknownStream;
+        try x.putHeld(l, k);
         try x.reach(l, k.at); // the state's pages (a restore writes into them)
         try snap.restore(x.m, x.s, l.slot, k);
         l.len = k.at;
     }
 
+    /// Whether the lane's lease starts with the state's held pages (adopted, never rewritten).
+    fn adopted(l: *const Lane, k: *const snap.Saved) bool {
+        const ids = l.lease.ids.items;
+        return k.pages.len > 0 and ids.len >= k.pages.len and std.mem.eql(u32, ids[0..k.pages.len], k.pages);
+    }
+
+    /// A state's held pages into a lane that did not adopt them: their rows copied into the lane's own pages.
+    fn putHeld(x: *Spark, l: *Lane, k: *const snap.Saved) !void {
+        if (k.pages.len == 0 or adopted(l, k)) return;
+        try x.reach(l, k.from);
+        try snap.copyPages(x.m, x.s, l.slot, k.pages);
+    }
+
     pub fn dropState(x: *Spark, k: *snap.Saved) void {
+        if (k.pages.len > 0) {
+            x.s.synchronize() catch {}; // a restore's queued copies out of them are done
+            kept.release(x.gpa, &x.pool.?, k.pages);
+            k.pages = &.{};
+        }
         snap.drop(x.gpa, x.s, k);
     }
 
@@ -212,11 +243,23 @@ pub const Spark = struct {
         try p.cover(&l.lease, n, .{ .ctx = &map, .write = Map.write });
     }
 
-    /// A free slot for the request, its pages promised now (taken as its rows need them); LaneMemory: not yet.
-    fn takeSlot(x: *Spark, lease: *kv.Lease, prompt: usize, max_new: usize) !usize {
+    /// A free slot for the request, its pages promised now (as rows need them, `held` adopted); LaneMemory: not yet.
+    fn takeSlot(x: *Spark, lease: *kv.Lease, prompt: usize, max_new: usize, held: usize) !usize {
         const slot = x.freeSlot() orelse return error.NoFreeSlot;
-        if (x.pool) |*p| try p.promise(lease, pagesFor(prompt, max_new));
+        if (x.pool) |*p| try p.promise(lease, pagesFor(prompt, max_new) - held);
         return slot;
+    }
+
+    /// A new lane's table starts with the kept state's pages, held once more by its lease (rows below `from`)
+    fn adoptHeld(x: *Spark, l: *Lane, k: *const snap.Saved) !void {
+        try kept.adopt(&x.pool.?, &l.lease, k.pages);
+        try x.m.mapPages(x.s, l.slot, k.pages, 0);
+    }
+
+    /// The kept state a new lane adopts the pages of: the one its pass resumes, holding pages.
+    fn adoptable(x: *const Spark, s: *const Stream, len: usize) ?*const snap.Saved {
+        const k = resumable(s, len) orelse return null;
+        return if (k.pages.len > 0 and x.pool != null) k else null;
     }
 
     /// A prompt pass begins: a slot, the stream's rule, a kept state restored; where its first chunk starts.
@@ -228,12 +271,17 @@ pub const Spark = struct {
         const got = try x.lanes.getOrPut(x.gpa, s);
         if (!got.found_existing) {
             var lease: kv.Lease = .{};
-            const slot = x.takeSlot(&lease, p.len, s.max_new) catch |e| {
+            const held = x.adoptable(s, p.len);
+            const slot = x.takeSlot(&lease, p.len, s.max_new, if (held) |k| k.pages.len else 0) catch |e| {
                 x.lanes.removeByPtr(got.key_ptr);
                 return e;
             };
             x.free[slot] = false;
             got.value_ptr.* = .{ .slot = slot, .last = x.slot_bufs[2 * slot].ptr, .rule = x.slot_bufs[2 * slot + 1].ptr, .lease = lease };
+            if (held) |k| x.adoptHeld(got.value_ptr, k) catch |e| {
+                x.dropLane(s);
+                return e;
+            };
         }
         const l = got.value_ptr;
         try x.reach(l, p.len); // the prompt's pages (a kept state's restore writes into them too)
@@ -244,20 +292,34 @@ pub const Spark = struct {
             l.sampled = true;
         };
         s.cached = 0;
-        l.fill = x.resumeAt(s, l, p.len);
+        l.fill = try x.resumeAt(s, l, p.len);
         s.fill_at.store(@intCast(l.fill.?), .monotonic);
         return l;
     }
 
-    /// The kept state's position, restored into the slot (0: none, or not this prompt's).
-    fn resumeAt(x: *Spark, s: *Stream, l: *const Lane, len: usize) usize {
-        const saved = s.reuse.saved orelse return 0;
+    /// The stream's kept state when its pass can resume it: this prompt's, short of its end.
+    fn resumable(s: *const Stream, len: usize) ?*const snap.Saved {
+        const saved = s.reuse.saved orelse return null;
         const k: *const snap.Saved = @ptrCast(@alignCast(saved));
-        if (k.at != s.reuse.at or k.at == 0 or k.at >= len) {
+        if (k.at != s.reuse.at or k.at == 0 or k.at >= len) return null;
+        return k;
+    }
+
+    /// The kept state's position, restored into the slot (0: none, or not this prompt's), adopted pages untouched.
+    fn resumeAt(x: *Spark, s: *Stream, l: *Lane, len: usize) !usize {
+        if (s.reuse.saved == null) return 0;
+        const k = resumable(s, len) orelse {
             s.reuse_failed = true;
             return 0;
-        }
-        snap.restore(x.m, x.s, l.slot, k) catch {
+        };
+        x.putHeld(l, k) catch {
+            s.reuse_failed = true;
+            return 0;
+        };
+        // a pass from 0 would write the shared pages this lane adopted: a failed restore fails the request instead
+        const shared = adopted(l, k);
+        snap.restore(x.m, x.s, l.slot, k) catch |e| {
+            if (shared) return e;
             s.reuse_failed = true;
             return 0;
         };
@@ -411,12 +473,12 @@ pub const Spark = struct {
         }
     }
 
-    /// The idle server's line: nothing promised, every page free (kept states are copies, not pages).
+    /// The idle server's line: nothing promised, every page free or (TF_KV_SHARE) a kept state's.
     fn report(x: *const Spark) void {
         if (@import("builtin").is_test) return;
         const p = x.pool orelse return;
         const c = p.census();
-        const ok = p.idle() and c.free == c.total;
+        const ok = p.idle() and (x.share or c.free == c.total);
         std.log.info("kv pool idle{s}: promised {d}, free {d} + store {d} == total {d}", .{ if (ok) "" else " (UNEVEN)", c.promised, c.free, c.kept, c.total });
     }
 

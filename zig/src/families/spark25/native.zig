@@ -148,7 +148,15 @@ fn spark(ptr: *anyopaque) *be.Spark {
 }
 
 pub fn snap_bytes(ptr: *anyopaque, at: u32) u64 {
-    return snap.bytes(spark(ptr).m, at);
+    const x = spark(ptr);
+    return snap.bytes(x.m, at, x.heldBelow(at));
+}
+
+/// TF_KV_SHARE: the pool kept states hold pages of, which sheds them before a promise fails (null: copies).
+pub fn snap_pool(ptr: *anyopaque) ?*kv.Pool {
+    const x = spark(ptr);
+    if (!x.share) return null;
+    return if (x.pool) |*p| p else null;
 }
 
 pub fn snap_save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {
