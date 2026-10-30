@@ -134,7 +134,14 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     gemma4.addImport("xpu_gemma4_kernels", embedded_g4);
     gemma4.addImport("core", core);
     gemma4.addImport("ze", ze_mod);
-    const engines = b.createModule(.{ .root_source_file = b.path("zig/src/native/xpu.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "engine_api", .module = api }, .{ .name = "xpu_qwen27", .module = qwen27 }, .{ .name = "lanes", .module = lanes }, .{ .name = "xpu", .module = nem.xpu }, .{ .name = "nemotron_xpu", .module = nem.nemotron }, .{ .name = "gemma4_xpu", .module = gemma4 } } });
+    const engines = b.createModule(.{ .root_source_file = b.path("zig/src/native/xpu.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "engine_api", .module = api }, .{ .name = "lanes", .module = lanes }, .{ .name = "xpu", .module = nem.xpu }, .{ .name = "nemotron_xpu", .module = nem.nemotron } } });
+    // the Qwen3.8-27B runner and Gemma 4 E4B (DPAS, nGEN) only where the device has DPAS: a Gen12LP server serves Nemotron
+    const engine_options = b.addOptions();
+    engine_options.addOption(bool, "qwen27", dpas);
+    engine_options.addOption(bool, "gemma4", dpas);
+    engines.addOptions("xpu_engine_options", engine_options);
+    if (dpas) engines.addImport("xpu_qwen27", qwen27);
+    if (dpas) engines.addImport("gemma4_xpu", gemma4);
     const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
     const template = b.createModule(.{ .root_source_file = b.path("zig/src/core/template/template.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
     const checkpoint_cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cli.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true, .imports = &.{ .{ .name = "native_engines", .module = engines }, exlr8_build.cliImport(b, target, .ReleaseSafe, core), .{ .name = "core", .module = core } } });
@@ -172,6 +179,7 @@ const kernels = [_]Kernel{
     .{ .name = "nem_rows_r4", .src = "nem_rows", .options = cl3 ++ " -DMAXR=4" },
     .{ .name = "nem_rows_r8", .src = "nem_rows", .options = cl3 ++ " -DMAXR=8" },
     .{ .name = "nem_prow", .options = cl3 },
+    .{ .name = "nem_prow_t4", .src = "nem_prow", .options = cl3 ++ " -DPR=4 -DPO=4" },
     .{ .name = "nem_attn_dec", .options = cl3 },
 };
 
