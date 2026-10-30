@@ -1,4 +1,4 @@
-//! TF_KV_SHARE: a kept prompt state holds its stream's whole pages by reference in the core pool, copying only the rest.
+//! TF_KV_SHARE: a kept prompt state holds its stream's whole pages by reference in the core pool, copies the rest.
 const std = @import("std");
 const kv = @import("kv_pool.zig");
 const Allocator = std.mem.Allocator;
@@ -35,7 +35,34 @@ pub fn adopt(pool: *kv.Pool, lease: *kv.Lease, ids: []const u32) !void {
     try pool.adopt(lease, ids); // releases them again if it fails
 }
 
-/// The pool's reclaim over prompt_cache's `Store`: kept states leave, least valuable first, until `want` pages are free.
+/// A kept state's copied rows in store-held pages: byte o in chunk c = o / chunk, region c % regions, page c / regions.
+pub const Blob = struct {
+    ids: []const u32,
+    chunk: u64, // the bytes one page holds in one region (a layer's K or V)
+    regions: usize,
+
+    /// Pages that hold `bytes` this way.
+    pub fn pagesFor(bytes: u64, chunk: u64, regions: usize) usize {
+        const page = chunk * regions;
+        return @intCast((bytes + page - 1) / page);
+    }
+
+    /// Bytes [off, off + len) as pieces inside one chunk: f(ctx, region, page id, in-chunk offset, from `off`, len).
+    pub fn each(b: Blob, off: u64, len: u64, ctx: anytype, comptime f: fn (@TypeOf(ctx), usize, u32, u64, u64, u64) anyerror!void) !void {
+        var o = off;
+        while (o < off + len) {
+            const c = o / b.chunk;
+            const within = o % b.chunk;
+            const n = @min(off + len - o, b.chunk - within);
+            const k: usize = @intCast(c / b.regions);
+            if (k >= b.ids.len) return error.PastBlob;
+            try f(ctx, @intCast(c % b.regions), b.ids[k], within, o - off, n);
+            o += n;
+        }
+    }
+};
+
+/// The pool's reclaim over prompt_cache's `Store`: kept states leave, least valuable first, until `want` pages free.
 pub fn Reclaim(comptime Store: type) type {
     return struct {
         const Self = @This();
@@ -153,4 +180,21 @@ test "a promise past the free pages sheds kept states, oldest first, borrowed on
     fake.borrowed = 0;
     fake.remove(0);
     try testing.expect(pool.idle());
+}
+
+const Pieces = struct {
+    got: *std.ArrayList([5]u64),
+    fn add(p: Pieces, region: usize, id: u32, within: u64, from: u64, n: u64) anyerror!void {
+        try p.got.append(testing.allocator, .{ region, id, within, from, n });
+    }
+};
+
+test "a blob's bytes walk its regions a chunk at a time, then its next page; a run splits at chunk edges" {
+    const b: Blob = .{ .ids = &.{ 7, 3 }, .chunk = 10, .regions = 2 };
+    try testing.expectEqual(@as(usize, 2), Blob.pagesFor(21, 10, 2));
+    var got: std.ArrayList([5]u64) = .empty;
+    defer got.deinit(testing.allocator);
+    try b.each(5, 30, Pieces{ .got = &got }, Pieces.add); // bytes 5..35: chunks 0 (page 7, K), 1 (page 7, V), 2 (page 3, K), 3 (page 3, V)
+    try testing.expectEqualSlices([5]u64, &.{ .{ 0, 7, 5, 0, 5 }, .{ 1, 7, 0, 5, 10 }, .{ 0, 3, 0, 15, 10 }, .{ 1, 3, 0, 25, 5 } }, got.items);
+    try testing.expectError(error.PastBlob, b.each(39, 2, Pieces{ .got = &got }, Pieces.add));
 }
