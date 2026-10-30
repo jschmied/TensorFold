@@ -1,4 +1,4 @@
-//! Nemotron on the XPU server: its lane host (one family behind the lane core, one stream, host sampling).
+//! Nemotron and LFM3 on the XPU server: their lane host (a family behind the lane core, one stream, host sampling).
 const std = @import("std");
 const xpu = @import("xpu");
 const api = @import("engine_api");
@@ -9,6 +9,7 @@ const Allocator = std.mem.Allocator;
 /// The families this host serves, each a file with its table row, loader and prompt window.
 const specs = .{
     @import("xpu_nemotron.zig"),
+    @import("xpu_lfm3.zig"),
 };
 
 /// Prompt plus reply tokens when --context names none (and the model's window is larger).
@@ -151,7 +152,8 @@ fn openFamily(comptime S: type, a: Allocator, gpa: Allocator, io: std.Io, o: api
     h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = S.name, .lanes = h.backend.streams, .context_window = @intCast(window), .context_fitted = true, .startup = h.startup, .prefill_step = if (drafted) S.promptRows(h.engine) else 0 });
     // kept prompt states (with sequences): --prompt-cache-gib, else 4 GiB, inside the device memory left past 2 GiB
     const want: u64 = @intFromFloat((o.prompt_cache_gib orelse 4) * (1 << 30));
-    const free = freeMemory(&h.ctx);
+    // Sysman only when a cache can use it: zesInit faults inside the driver under WSL2 (Iris Xe, NEO 23.43)
+    const free = if (drafted) freeMemory(&h.ctx) else 0;
     const budget: u64 = if (free > 2 << 30) @min(want, free - (2 << 30)) else 0;
     h.cache = null;
     if (drafted and budget > 0) {
