@@ -1,4 +1,4 @@
-//! Nemotron on the XPU server: its lane host (one family behind the lane core, one stream, host sampling).
+//! Nemotron and LFM3 on the XPU server: their lane host (a family behind the lane core, one stream, host sampling).
 const std = @import("std");
 const xpu = @import("xpu");
 const api = @import("engine_api");
@@ -10,7 +10,8 @@ const Allocator = std.mem.Allocator;
 const specs = if (@import("xpu_engine_options").gemma4) .{
     @import("xpu_nemotron.zig"),
     @import("xpu_gemma4.zig"),
-} else .{@import("xpu_nemotron.zig")}; // Gemma 4 E4B needs DPAS: a Gen12LP server leaves it out
+    @import("xpu_lfm3.zig"),
+} else .{ @import("xpu_nemotron.zig"), @import("xpu_lfm3.zig") }; // Gemma 4 E4B needs DPAS: a Gen12LP server leaves it out
 
 /// Prompt plus reply tokens when --context names none (and the model's window is larger).
 const default_context: i64 = 32768;
