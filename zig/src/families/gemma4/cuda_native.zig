@@ -36,6 +36,7 @@ pub fn Family(comptime name: []const u8) type {
         pub const snap_save = native.snap_save;
         pub const snap_restore = native.snap_restore;
         pub const snap_drop = native.snap_drop;
+        pub const snap_pool = native.snap_pool;
         pub const explain = native.explain;
         /// A request's last verify window: its pages hold that many rows past its prompt and reply.
         pub const window_rows: u32 = be.max_window;
@@ -208,7 +209,14 @@ fn gemma(ptr: *anyopaque) *be.Gemma {
 
 pub fn snap_bytes(ptr: *anyopaque, at: u32) u64 {
     const g = gemma(ptr);
-    return snap.bytes(g.m, at) + (if (g.keeper) |kp| kp.bytes(kp.ctx, at) else 0);
+    return snap.bytes(g.m, at, g.heldBelow(at)) + (if (g.keeper) |kp| kp.bytes(kp.ctx, at) else 0);
+}
+
+/// TF_KV_SHARE: the pool kept states hold pages of, which sheds them before a promise fails (null: copies).
+pub fn snap_pool(ptr: *anyopaque) ?*kv.Pool {
+    const g = gemma(ptr);
+    if (!g.share) return null;
+    return if (g.pool) |*p| p else null;
 }
 
 pub fn snap_save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {

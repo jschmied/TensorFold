@@ -16,7 +16,7 @@ const lens = [_]usize{ 200, 1300, 700 };
 const mark: u32 = 1000;
 
 const Out = struct { ids: []u32, logits: []u8, cached: u64 };
-const Result = struct { solo: [lens.len]Out, sampled: Out, pair: [2][]u32, resumed: Out };
+const Result = struct { solo: [lens.len]Out, sampled: Out, pair: [2][]u32, resumed: Out, held: usize = 0 };
 const Opened = @typeInfo(@typeInfo(@TypeOf(native.openDrafter)).@"fn".return_type.?).error_union.payload;
 
 const Keep = struct {
@@ -65,11 +65,11 @@ fn pair(gpu: Gpu, engine: *lanes.Engine, gb: *be.Gemma, a: []const u32, b: []con
     return .{ ra, try gpa.dupe(u32, sb.emitted()) };
 }
 
-/// Paged: every stream ended, so nothing is promised and every page is free again.
+/// Paged: every stream ended, so nothing is promised and every page is free again (TF_KV_SHARE: or a kept state's).
 fn idle(gb: *const be.Gemma) !void {
     const p = gb.pool orelse return;
     const c = p.census();
-    try check.expect(p.idle() and c.free == c.total, "gemma4 pages: the idle pool holds promised {d}, free {d} of {d}", .{ c.promised, c.free, c.total });
+    try check.expect(p.idle() and (c.free == c.total or gb.share), "gemma4 pages: the idle pool holds promised {d}, free {d} of {d}", .{ c.promised, c.free, c.total });
 }
 
 fn free(gpa: std.mem.Allocator, o: Out) void {
@@ -126,13 +126,18 @@ fn pass(gpu: Gpu, model: []const u8, drafter: ?[]const u8, paged: bool, prompts:
     errdefer for (r.pair) |p| gpa.free(p);
     // a state kept at the mark, another prompt through the slot, then the prompt resumed from it
     var keep: Keep = .{ .gb = gb };
-    defer if (keep.saved) |v| gb.dropState(v);
+    defer if (keep.saved) |sv| gb.dropState(sv);
     var ms = [_]u32{mark};
     const kept = try run(gpu, &engine, gb, .{ .prompt = prompts[1][0 .. mark + 100], .drafts = drafts, .reuse = .{ .marks = &ms, .hook = .{ .ptr = &keep, .at = Keep.hook } } }, 2); // two: a reply of one ends at its first token
     free(gpa, kept);
     const v = keep.saved orelse return error.NothingKept;
     free(gpa, try run(gpu, &engine, gb, .{ .prompt = scrub, .drafts = drafts }, 2));
     r.resumed = try run(gpu, &engine, gb, .{ .prompt = prompts[1], .drafts = drafts, .reuse = .{ .saved = v, .at = mark } }, count);
+    errdefer free(gpa, r.resumed);
+    r.held = v.pages.len; // TF_KV_SHARE: the pages the state held and the resumed stream adopted
+    keep.saved = null;
+    gb.dropState(v);
+    if (gb.pool) |*p| try check.expect(p.idle() and p.census().free == p.census().total, "gemma4 pages: the kept state's pages went back when it was dropped", .{});
     return r;
 }
 
@@ -185,6 +190,9 @@ pub fn pages(gpu: Gpu, rest: []const []const u8) !void {
     same(&bad, "paged resumed == paged fresh", std.mem.sliceAsBytes(paged.resumed.ids), std.mem.sliceAsBytes(paged.solo[1].ids));
     if (paged.resumed.cached != mark or linear.resumed.cached != mark) bad += 1;
     std.debug.print("RESULT gemma4 pages resumed rows: linear {d}, paged {d} (want {d})\n", .{ linear.resumed.cached, paged.resumed.cached, mark });
+    const share = paged.held > 0;
+    std.debug.print("RESULT gemma4 pages kept state: {d} whole pages held by reference, {s}\n", .{ paged.held, if (share) "adopted by the resume (TF_KV_SHARE)" else "copied (TF_KV_SHARE unset)" });
+    if (share != core.kv_kept.sharing()) bad += 1;
     try check.expect(bad == 0, "gemma4 pages: {d} checks failed", .{bad});
-    check.pass("gemma4 pages: global caches in shuffled pool pages give the linear caches' replies and logits ({d} tokens{s}), shared rounds and a kept state's resume included, ended streams' pages reused", .{ count, if (drafter != null) ", drafted" else "" });
+    check.pass("gemma4 pages: global caches in shuffled pool pages give the linear caches' replies and logits ({d} tokens{s}), shared rounds and a kept state's resume included{s}, ended streams' pages reused", .{ count, if (drafter != null) ", drafted" else "", if (share) " (its whole pages adopted)" else "" });
 }
