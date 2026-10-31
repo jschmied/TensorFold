@@ -74,9 +74,14 @@ The phase scorer's prompt phase is a single row. `prompt_row_sweep.py` scores ma
 causal sequence instead: produce FP32 and official-BF16 rows once with `full_model_reference.py --rows`, capture
 native `prompt:N` on `tokens[:N]` for each N, and run
 `prompt_row_sweep.py --fp32 ... --reference-bf16 ... --positions ... --route NAME=DIR/PREFIX --lengths ...`.
-It reports per-row RMS/max/top-20 probability and top-1 agreement with no pass/fail rule. The retained TEXT6
+It reports per-row RMS/max/top-20 probability, top-1 agreement and margins with no pass/fail rule. The retained TEXT6
 result (25 rows, baseline vs tiled attention vs official BF16) is in
 [the route-isolation receipt](../../docs/receipts/lfm3/m5-text6-route-isolation-row-sweep.json).
+
+For vision checkpoints, `tf-lfm3-forward MODEL TOKENS.npy out.bf16 prompt:N IMAGE_ROWS.bf16 START` injects
+the projected BF16 image rows at absolute position START; pass the same rows as float32 NPY plus `--image-start`
+to `full_model_reference.py`. TEXT8 and VL4/6/8 comparisons (including text after real image rows) are in
+[the width/image route receipt](../../docs/receipts/lfm3/m5-width-image-route-comparison.json).
 
 ```sh
 python3 -m unittest discover -s tools/lfm3 -p 'test_*envelope.py'

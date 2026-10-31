@@ -55,11 +55,18 @@ def main():
         f, b = fp32[positions.index(n - 1)], ref[positions.index(n - 1)]
         top = np.argsort(-f, kind='stable')[:20]
         pf = softmax(f)[top]
-        entry = {'prompt_length': n, 'fp32_top1': int(f.argmax())}
+        def margin(x):
+            two = np.sort(np.partition(x.astype(np.float64), -2)[-2:])
+            return float(two[1] - two[0])
+
+        entry = {'prompt_length': n, 'fp32_top1': int(f.argmax()), 'fp32_top1_margin': margin(f)}
 
         def score(x):
             d = x.astype(np.float64) - f
             return {
+                'top1': int(x.argmax()),
+                'top1_margin': margin(x),
+                'fp32_margin_of_this_top1': float(f[x.argmax()] - f.max()),
                 'rms': float(np.sqrt((d**2).mean())),
                 'max': float(np.abs(d).max()),
                 'top20_probability_max': float(np.abs(softmax(x)[top] - pf).max()),

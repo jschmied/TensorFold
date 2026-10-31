@@ -27,7 +27,7 @@ pub fn main(init: std.process.Init) !void {
     const residual_ffn_only = raw_args.len > 1 and std.mem.eql(u8, raw_args[raw_args.len - 1], "--residual-ffn");
     const args = raw_args[0 .. raw_args.len - @intFromBool(tiles or binned or tiled_prompt or tiled_attention_only or residual_ffn_only)];
     if (args.len < 4 or args.len > 8) return error.ExpectedModelTokensOutput;
-    if (args.len >= 7 and !std.mem.eql(u8, args[4], "images")) return error.ExpectedImageRowsAndStart;
+    if (args.len >= 7 and !std.mem.eql(u8, args[4], "images") and !std.mem.startsWith(u8, args[4], "prompt:")) return error.ExpectedImageRowsAndStart;
     if (args.len == 5 and !std.mem.eql(u8, args[4], "embedding") and !std.mem.eql(u8, args[4], "prefix") and !std.mem.eql(u8, args[4], "decode") and !std.mem.startsWith(u8, args[4], "prompt:")) return error.ExpectedEmbeddingPrefixOrDecode;
     if (args.len == 6 and !std.mem.eql(u8, args[4], "trace")) return error.ExpectedTraceDirectory;
     const pool = mtl.objc.Pool.push();
@@ -111,7 +111,7 @@ pub fn main(init: std.process.Init) !void {
         try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = args[3], .data = scratch.h.contents()[0 .. ids.len * q.config.hidden * 2] });
         return;
     }
-    if (args.len == 5 and std.mem.startsWith(u8, args[4], "prompt:")) {
+    if ((args.len == 5 or args.len == 7) and std.mem.startsWith(u8, args[4], "prompt:")) {
         const prompt_rows = try std.fmt.parseInt(usize, args[4][7..], 10);
         if (prompt_rows == 0 or prompt_rows > ids.len) return error.InvalidPromptRows;
         var prompt_scratch = try q.state.Scratch.init(init.gpa, m.device, &m.config.layer_types, 128);
@@ -122,7 +122,7 @@ pub fn main(init: std.process.Init) !void {
         var done: usize = 0;
         while (done < prompt_rows) {
             const n = @min(prompt_rows - done, 128);
-            try q.forward.run(m, &prompt_scratch, &.{.{ .cache = &cache, .rows = n }}, ids[done..][0..n], false, .last);
+            try q.forward.runWithImages(m, &prompt_scratch, &.{.{ .cache = &cache, .rows = n }}, ids[done..][0..n], false, .last, images);
             done += n;
         }
         @memcpy(logits[0 .. q.config.vocab * 2], prompt_scratch.logits.contents()[0 .. q.config.vocab * 2]);
