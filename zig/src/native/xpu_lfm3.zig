@@ -10,6 +10,9 @@ pub const formats: []const []const u8 = &.{"mlx-q4g64"};
 pub const name = "xpu-lfm3";
 pub const Engine = lfm3.engine.Engine;
 
+/// Windows cut at any row give the same bits: states are kept and resumed anywhere, short prompts too.
+pub const cache_rules: api.prompt_cache.Rules = .{ .min_prompt = 0, .min_gap = 64 };
+
 /// Rows of one prompt window (pdense above one row; the scratch is sized for it): 128 beat 32 and 64 on Iris Xe.
 const prompt_rows: u32 = 128;
 
@@ -19,7 +22,7 @@ pub fn promptRows(_: *const Engine) u32 {
 
 /// What the startup line adds about the engine's settings.
 pub fn note(a: Allocator, e: *const Engine) ![]const u8 {
-    return std.fmt.allocPrint(a, ", prompt windows of {d} rows, no draft head", .{e.window_rows});
+    return std.fmt.allocPrint(a, ", prompt windows of {d} rows, copy drafts of the lane core (no head)", .{e.window_rows});
 }
 
 /// The engine for `o.dir`, or null with `problem` set (the caller releases the device).
