@@ -4,7 +4,7 @@
   "build": {
     "command": "zig build native tf-kernel-contract test-lfm3-host -Dcpu=apple_m1 --summary all",
     "actual_exit": 0,
-    "log": "/private/tmp/lfm3-range-text-build.log"
+    "log": "$TMPDIR/lfm3-range-text-build.log"
   },
   "format_check": "passed",
   "lean": {
