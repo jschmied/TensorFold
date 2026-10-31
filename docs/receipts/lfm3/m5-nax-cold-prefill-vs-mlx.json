@@ -1,16 +1,16 @@
 {
- "description": "Cold prefill, client time to first token, one request at a time, prompt cache disabled, tensor-unit route versus mlx-vlm on the same machine and checkpoints. Medians of 2 runs after a warm-up; the binary predates the key-parallel decode attention, which does not touch prefill.",
+ "description": "Cold prefill, client time to first token, one request at a time, prompt cache disabled, tensor-unit route versus mlx-vlm on the same machine and checkpoints. Medians of 2 runs after a warm-up, with the final kernels (BF16 projections, whole-segment tiled prompt attention, key-parallel decode attention).",
  "machine": "M5 Ultra",
  "server_flags": "--prompt-cache-gib 0",
  "rows": [
   {
    "checkpoint": "text4",
    "prompt_tokens": 2048,
-   "native_ttft_s": 0.1116,
-   "mlx_ttft_s": 0.1207,
-   "native_over_mlx": 0.925,
-   "native_prefill_tok_s": 18346,
-   "mlx_prefill_tok_s": 16965,
+   "native_ttft_s": 0.1107,
+   "mlx_ttft_s": 0.1172,
+   "native_over_mlx": 0.945,
+   "native_prefill_tok_s": 18496,
+   "mlx_prefill_tok_s": 17471,
    "runs": [
     2,
     2
@@ -19,11 +19,11 @@
   {
    "checkpoint": "text4",
    "prompt_tokens": 8192,
-   "native_ttft_s": 0.3883,
-   "mlx_ttft_s": 0.3498,
-   "native_over_mlx": 1.11,
-   "native_prefill_tok_s": 21096,
-   "mlx_prefill_tok_s": 23421,
+   "native_ttft_s": 0.3773,
+   "mlx_ttft_s": 0.3497,
+   "native_over_mlx": 1.079,
+   "native_prefill_tok_s": 21715,
+   "mlx_prefill_tok_s": 23423,
    "runs": [
     2,
     2
@@ -32,11 +32,11 @@
   {
    "checkpoint": "text4",
    "prompt_tokens": 32768,
-   "native_ttft_s": 1.8289,
-   "mlx_ttft_s": 1.623,
-   "native_over_mlx": 1.127,
-   "native_prefill_tok_s": 17917,
-   "mlx_prefill_tok_s": 20189,
+   "native_ttft_s": 1.6873,
+   "mlx_ttft_s": 1.624,
+   "native_over_mlx": 1.039,
+   "native_prefill_tok_s": 19420,
+   "mlx_prefill_tok_s": 20177,
    "runs": [
     2,
     2
@@ -45,11 +45,11 @@
   {
    "checkpoint": "text4",
    "prompt_tokens": 65536,
-   "native_ttft_s": 4.5759,
-   "mlx_ttft_s": 3.966,
-   "native_over_mlx": 1.154,
-   "native_prefill_tok_s": 14322,
-   "mlx_prefill_tok_s": 16525,
+   "native_ttft_s": 4.0433,
+   "mlx_ttft_s": 3.9676,
+   "native_over_mlx": 1.019,
+   "native_prefill_tok_s": 16209,
+   "mlx_prefill_tok_s": 16518,
    "runs": [
     2,
     2
@@ -58,11 +58,11 @@
   {
    "checkpoint": "text6",
    "prompt_tokens": 2048,
-   "native_ttft_s": 0.1164,
+   "native_ttft_s": 0.1151,
    "mlx_ttft_s": 0.1239,
-   "native_over_mlx": 0.94,
-   "native_prefill_tok_s": 17590,
-   "mlx_prefill_tok_s": 16531,
+   "native_over_mlx": 0.929,
+   "native_prefill_tok_s": 17792,
+   "mlx_prefill_tok_s": 16529,
    "runs": [
     2,
     2
@@ -71,11 +71,11 @@
   {
    "checkpoint": "text6",
    "prompt_tokens": 8192,
-   "native_ttft_s": 0.4047,
-   "mlx_ttft_s": 0.3755,
-   "native_over_mlx": 1.078,
-   "native_prefill_tok_s": 20243,
-   "mlx_prefill_tok_s": 21815,
+   "native_ttft_s": 0.3933,
+   "mlx_ttft_s": 0.375,
+   "native_over_mlx": 1.049,
+   "native_prefill_tok_s": 20827,
+   "mlx_prefill_tok_s": 21847,
    "runs": [
     2,
     2
@@ -84,11 +84,11 @@
   {
    "checkpoint": "text6",
    "prompt_tokens": 32768,
-   "native_ttft_s": 1.8947,
-   "mlx_ttft_s": 1.7221,
-   "native_over_mlx": 1.1,
-   "native_prefill_tok_s": 17294,
-   "mlx_prefill_tok_s": 19028,
+   "native_ttft_s": 1.7568,
+   "mlx_ttft_s": 1.7213,
+   "native_over_mlx": 1.021,
+   "native_prefill_tok_s": 18652,
+   "mlx_prefill_tok_s": 19037,
    "runs": [
     2,
     2
@@ -97,11 +97,11 @@
   {
    "checkpoint": "text6",
    "prompt_tokens": 65536,
-   "native_ttft_s": 4.7216,
-   "mlx_ttft_s": 4.1667,
-   "native_over_mlx": 1.133,
-   "native_prefill_tok_s": 13880,
-   "mlx_prefill_tok_s": 15728,
+   "native_ttft_s": 4.1561,
+   "mlx_ttft_s": 4.173,
+   "native_over_mlx": 0.996,
+   "native_prefill_tok_s": 15769,
+   "mlx_prefill_tok_s": 15705,
    "runs": [
     2,
     2
@@ -110,11 +110,11 @@
   {
    "checkpoint": "text8",
    "prompt_tokens": 2048,
-   "native_ttft_s": 0.117,
-   "mlx_ttft_s": 0.1224,
-   "native_over_mlx": 0.956,
-   "native_prefill_tok_s": 17506,
-   "mlx_prefill_tok_s": 16727,
+   "native_ttft_s": 0.1161,
+   "mlx_ttft_s": 0.1229,
+   "native_over_mlx": 0.945,
+   "native_prefill_tok_s": 17640,
+   "mlx_prefill_tok_s": 16664,
    "runs": [
     2,
     2
@@ -123,11 +123,11 @@
   {
    "checkpoint": "text8",
    "prompt_tokens": 8192,
-   "native_ttft_s": 0.4059,
-   "mlx_ttft_s": 0.3662,
-   "native_over_mlx": 1.108,
-   "native_prefill_tok_s": 20181,
-   "mlx_prefill_tok_s": 22370,
+   "native_ttft_s": 0.3946,
+   "mlx_ttft_s": 0.3654,
+   "native_over_mlx": 1.08,
+   "native_prefill_tok_s": 20762,
+   "mlx_prefill_tok_s": 22420,
    "runs": [
     2,
     2
@@ -136,11 +136,11 @@
   {
    "checkpoint": "text8",
    "prompt_tokens": 32768,
-   "native_ttft_s": 1.8985,
-   "mlx_ttft_s": 1.6808,
-   "native_over_mlx": 1.13,
-   "native_prefill_tok_s": 17260,
-   "mlx_prefill_tok_s": 19496,
+   "native_ttft_s": 1.7546,
+   "mlx_ttft_s": 1.6882,
+   "native_over_mlx": 1.039,
+   "native_prefill_tok_s": 18675,
+   "mlx_prefill_tok_s": 19411,
    "runs": [
     2,
     2
@@ -149,11 +149,11 @@
   {
    "checkpoint": "text8",
    "prompt_tokens": 65536,
-   "native_ttft_s": 4.7106,
-   "mlx_ttft_s": 4.0889,
-   "native_over_mlx": 1.152,
-   "native_prefill_tok_s": 13913,
-   "mlx_prefill_tok_s": 16028,
+   "native_ttft_s": 4.184,
+   "mlx_ttft_s": 4.0794,
+   "native_over_mlx": 1.026,
+   "native_prefill_tok_s": 15663,
+   "mlx_prefill_tok_s": 16065,
    "runs": [
     2,
     2
@@ -162,11 +162,11 @@
   {
    "checkpoint": "vl4",
    "prompt_tokens": 2048,
-   "native_ttft_s": 0.1123,
-   "mlx_ttft_s": 0.1248,
-   "native_over_mlx": 0.9,
-   "native_prefill_tok_s": 18240,
-   "mlx_prefill_tok_s": 16409,
+   "native_ttft_s": 0.1115,
+   "mlx_ttft_s": 0.125,
+   "native_over_mlx": 0.892,
+   "native_prefill_tok_s": 18366,
+   "mlx_prefill_tok_s": 16387,
    "runs": [
     2,
     2
@@ -175,11 +175,11 @@
   {
    "checkpoint": "vl4",
    "prompt_tokens": 8192,
-   "native_ttft_s": 0.3914,
-   "mlx_ttft_s": 0.3559,
-   "native_over_mlx": 1.1,
-   "native_prefill_tok_s": 20930,
-   "mlx_prefill_tok_s": 23016,
+   "native_ttft_s": 0.3806,
+   "mlx_ttft_s": 0.356,
+   "native_over_mlx": 1.069,
+   "native_prefill_tok_s": 21526,
+   "mlx_prefill_tok_s": 23008,
    "runs": [
     2,
     2
@@ -188,11 +188,11 @@
   {
    "checkpoint": "vl4",
    "prompt_tokens": 32768,
-   "native_ttft_s": 1.8454,
-   "mlx_ttft_s": 1.6447,
-   "native_over_mlx": 1.122,
-   "native_prefill_tok_s": 17756,
-   "mlx_prefill_tok_s": 19923,
+   "native_ttft_s": 1.7013,
+   "mlx_ttft_s": 1.6446,
+   "native_over_mlx": 1.034,
+   "native_prefill_tok_s": 19261,
+   "mlx_prefill_tok_s": 19925,
    "runs": [
     2,
     2
@@ -201,11 +201,11 @@
   {
    "checkpoint": "vl4",
    "prompt_tokens": 65536,
-   "native_ttft_s": 4.6079,
-   "mlx_ttft_s": 4.0125,
-   "native_over_mlx": 1.148,
-   "native_prefill_tok_s": 14222,
-   "mlx_prefill_tok_s": 16333,
+   "native_ttft_s": 4.0615,
+   "mlx_ttft_s": 4.01,
+   "native_over_mlx": 1.013,
+   "native_prefill_tok_s": 16136,
+   "mlx_prefill_tok_s": 16343,
    "runs": [
     2,
     2
@@ -214,11 +214,11 @@
   {
    "checkpoint": "vl6",
    "prompt_tokens": 2048,
-   "native_ttft_s": 0.1163,
-   "mlx_ttft_s": 0.1305,
-   "native_over_mlx": 0.891,
-   "native_prefill_tok_s": 17604,
-   "mlx_prefill_tok_s": 15691,
+   "native_ttft_s": 0.1153,
+   "mlx_ttft_s": 0.1308,
+   "native_over_mlx": 0.881,
+   "native_prefill_tok_s": 17769,
+   "mlx_prefill_tok_s": 15654,
    "runs": [
     2,
     2
@@ -227,11 +227,11 @@
   {
    "checkpoint": "vl6",
    "prompt_tokens": 8192,
-   "native_ttft_s": 0.4045,
-   "mlx_ttft_s": 0.3761,
-   "native_over_mlx": 1.076,
-   "native_prefill_tok_s": 20254,
-   "mlx_prefill_tok_s": 21784,
+   "native_ttft_s": 0.3933,
+   "mlx_ttft_s": 0.376,
+   "native_over_mlx": 1.046,
+   "native_prefill_tok_s": 20829,
+   "mlx_prefill_tok_s": 21790,
    "runs": [
     2,
     2
@@ -240,11 +240,11 @@
   {
    "checkpoint": "vl6",
    "prompt_tokens": 32768,
-   "native_ttft_s": 1.9001,
-   "mlx_ttft_s": 1.7187,
-   "native_over_mlx": 1.106,
-   "native_prefill_tok_s": 17245,
-   "mlx_prefill_tok_s": 19066,
+   "native_ttft_s": 1.7475,
+   "mlx_ttft_s": 1.7257,
+   "native_over_mlx": 1.013,
+   "native_prefill_tok_s": 18752,
+   "mlx_prefill_tok_s": 18989,
    "runs": [
     2,
     2
@@ -253,11 +253,11 @@
   {
    "checkpoint": "vl6",
    "prompt_tokens": 65536,
-   "native_ttft_s": 4.7136,
-   "mlx_ttft_s": 4.168,
-   "native_over_mlx": 1.131,
-   "native_prefill_tok_s": 13903,
-   "mlx_prefill_tok_s": 15724,
+   "native_ttft_s": 4.1781,
+   "mlx_ttft_s": 4.1702,
+   "native_over_mlx": 1.002,
+   "native_prefill_tok_s": 15685,
+   "mlx_prefill_tok_s": 15715,
    "runs": [
     2,
     2
@@ -266,11 +266,11 @@
   {
    "checkpoint": "vl8",
    "prompt_tokens": 2048,
-   "native_ttft_s": 0.1169,
-   "mlx_ttft_s": 0.1292,
-   "native_over_mlx": 0.905,
-   "native_prefill_tok_s": 17514,
-   "mlx_prefill_tok_s": 15852,
+   "native_ttft_s": 0.1158,
+   "mlx_ttft_s": 0.1299,
+   "native_over_mlx": 0.892,
+   "native_prefill_tok_s": 17682,
+   "mlx_prefill_tok_s": 15771,
    "runs": [
     2,
     2
@@ -279,11 +279,11 @@
   {
    "checkpoint": "vl8",
    "prompt_tokens": 8192,
-   "native_ttft_s": 0.4059,
-   "mlx_ttft_s": 0.3663,
-   "native_over_mlx": 1.108,
-   "native_prefill_tok_s": 20180,
-   "mlx_prefill_tok_s": 22366,
+   "native_ttft_s": 0.3944,
+   "mlx_ttft_s": 0.3656,
+   "native_over_mlx": 1.079,
+   "native_prefill_tok_s": 20772,
+   "mlx_prefill_tok_s": 22409,
    "runs": [
     2,
     2
@@ -292,11 +292,11 @@
   {
    "checkpoint": "vl8",
    "prompt_tokens": 32768,
-   "native_ttft_s": 1.8994,
-   "mlx_ttft_s": 1.6894,
-   "native_over_mlx": 1.124,
-   "native_prefill_tok_s": 17252,
-   "mlx_prefill_tok_s": 19397,
+   "native_ttft_s": 1.7537,
+   "mlx_ttft_s": 1.6837,
+   "native_over_mlx": 1.042,
+   "native_prefill_tok_s": 18685,
+   "mlx_prefill_tok_s": 19462,
    "runs": [
     2,
     2
@@ -305,11 +305,11 @@
   {
    "checkpoint": "vl8",
    "prompt_tokens": 65536,
-   "native_ttft_s": 4.7192,
-   "mlx_ttft_s": 4.0828,
-   "native_over_mlx": 1.156,
-   "native_prefill_tok_s": 13887,
-   "mlx_prefill_tok_s": 16052,
+   "native_ttft_s": 4.1701,
+   "mlx_ttft_s": 4.0884,
+   "native_over_mlx": 1.02,
+   "native_prefill_tok_s": 15716,
+   "mlx_prefill_tok_s": 16030,
    "runs": [
     2,
     2
