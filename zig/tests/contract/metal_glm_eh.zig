@@ -8,7 +8,6 @@ const rig_ = @import("rig.zig");
 const c = contract.spec;
 const g = contract.gates;
 const Dense = contract.dense.Dense;
-const reference_threads = contract.reference_threads;
 
 fn convertRow(d: Dense, slice: usize, row: usize, values: []f64) void {
     for (values, slice * (d.shape.k / d.slices)..) |*v, i| v.* = c.fromBf16(d.x[row * d.shape.k + i]);
@@ -48,7 +47,7 @@ pub const RowReferenceCache = struct {
 
     pub fn reference(self: *RowReferenceCache, a: std.mem.Allocator, d: Dense, want: []f64, mag: []f64) !void {
         self.invalidate();
-        if (d.shape.rows > 1) return parallelReference(a, d, want, mag, reference_threads.maximum, .normal);
+        if (d.shape.rows > 1) return parallelReference(a, d, want, mag, 8, .normal);
         return self.referenceSerial(a, d, want, mag);
     }
 
@@ -83,7 +82,7 @@ const ReferenceJob = struct {
     terms: []f64,
     want: []f64,
     mag: []f64,
-    pub fn run(job: *@This()) void {
+    fn run(job: *@This()) void {
         const d = job.d;
         const per = d.shape.k / d.slices;
         for (0..d.slices) |slice| for (job.first..job.end) |row| {
@@ -105,15 +104,16 @@ const ReferenceJob = struct {
         };
     }
 };
-const SpawnMode = reference_threads.Mode;
+const SpawnMode = enum { normal, partial_failure, all_failure };
 
 fn parallelReference(a: std.mem.Allocator, d: Dense, want: []f64, mag: []f64, requested: usize, mode: SpawnMode) !void {
-    const count = reference_threads.count(requested, d.shape.rows);
+    const count = @min(@min(@max(requested, 1), 8), d.shape.rows);
     if (count == 0) return;
     const per = d.shape.k / d.slices;
     const scratch = try a.alloc(f64, count * per * 2);
     defer a.free(scratch);
-    var jobs: [reference_threads.maximum]ReferenceJob = undefined;
+    var jobs: [8]ReferenceJob = undefined;
+    var threads: [8]?std.Thread = @splat(null);
     for (0..count) |worker| {
         jobs[worker] = .{
             .d = d,
@@ -125,7 +125,16 @@ fn parallelReference(a: std.mem.Allocator, d: Dense, want: []f64, mag: []f64, re
             .mag = mag,
         };
     }
-    reference_threads.run(ReferenceJob, jobs[0..count], mode);
+    // Thread creation failure changes scheduling only; already-started jobs still join.
+    for (1..count) |worker| {
+        threads[worker] = (if (mode == .all_failure or (mode == .partial_failure and worker % 2 == 0))
+            error.ReferenceThreadUnavailable
+        else
+            std.Thread.spawn(.{}, ReferenceJob.run, .{&jobs[worker]})) catch null;
+        if (threads[worker] == null) jobs[worker].run();
+    }
+    jobs[0].run();
+    for (threads[0..count]) |thread| if (thread) |t| t.join();
 }
 
 /// One 8-wide MMA step a k-tile (products round entering the fp32 dot); tail guard: k/8 steps at k = 8192.
