@@ -109,6 +109,22 @@ pub const Kolibri = struct {
         return if (x.share) kept.whole(at, fwd.page_tokens) * fwd.page_tokens else 0;
     }
 
+    /// The most pool pages a state kept at `at` holds for its copied rows (none unless sharing); asked before attach.
+    pub fn keptPages(x: *const Kolibri, at: usize) usize {
+        return if (kept.sharing()) snap.blobPages(x.m, at, 0) else 0;
+    }
+
+    /// `n` free pool pages the store holds for a state's copied rows (none unless sharing); NoCachePages: all leased.
+    fn holdBlob(x: *Kolibri, n: usize) ![]u32 {
+        if (!x.share or n == 0) return &.{};
+        const ids = try x.gpa.alloc(u32, n);
+        if (!x.pool.?.hold(ids)) {
+            x.gpa.free(ids);
+            return error.NoCachePages;
+        }
+        return ids;
+    }
+
     /// The pool's free pages in a seeded random order, leased in that order (a check's hook).
     pub fn shufflePages(x: *Kolibri, seed: u64) void {
         var prng = std.Random.DefaultPrng.init(seed);
@@ -181,7 +197,11 @@ pub const Kolibri = struct {
         const l = x.lanes.getPtr(s) orelse return error.UnknownStream;
         if ((l.fill orelse l.len) != at) return error.NotAtMark; // a state is copied only where the pass stands
         const from = x.heldBelow(at);
-        const k = try snap.save(x.gpa, x.m, x.s, l.slot, at, @intCast(from));
+        const blob = try x.holdBlob(snap.blobPages(x.m, at, from)); // TF_KV_SHARE: the copied rows in pool pages too
+        const k = snap.save(x.gpa, x.m, x.s, l.slot, at, @intCast(from), blob) catch |e| {
+            if (blob.len > 0) kept.release(x.gpa, &x.pool.?, blob);
+            return e;
+        };
         errdefer x.dropState(k);
         if (from > 0) k.pages = try kept.retain(x.gpa, &x.pool.?, l.lease.ids.items, from / fwd.page_tokens);
         return k;
@@ -210,10 +230,14 @@ pub const Kolibri = struct {
     }
 
     pub fn dropState(x: *Kolibri, k: *snap.Saved) void {
+        if (k.pages.len > 0 or k.blob.len > 0) x.s.synchronize() catch {}; // a restore's queued copies out of them are done
         if (k.pages.len > 0) {
-            x.s.synchronize() catch {}; // a restore's queued copies out of them are done
             kept.release(x.gpa, &x.pool.?, k.pages);
             k.pages = &.{};
+        }
+        if (k.blob.len > 0) {
+            kept.release(x.gpa, &x.pool.?, k.blob);
+            k.blob = &.{};
         }
         snap.drop(x.gpa, x.s, k);
     }
