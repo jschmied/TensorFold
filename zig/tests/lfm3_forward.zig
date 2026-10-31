@@ -23,7 +23,9 @@ pub fn main(init: std.process.Init) !void {
     const tiles = raw_args.len > 1 and std.mem.eql(u8, raw_args[raw_args.len - 1], "--tiles");
     const binned = raw_args.len > 1 and std.mem.eql(u8, raw_args[raw_args.len - 1], "--binned");
     const tiled_prompt = raw_args.len > 1 and std.mem.eql(u8, raw_args[raw_args.len - 1], "--tiled-prompt");
-    const args = raw_args[0 .. raw_args.len - @intFromBool(tiles or binned or tiled_prompt)];
+    const tiled_attention_only = raw_args.len > 1 and std.mem.eql(u8, raw_args[raw_args.len - 1], "--tiled-attention");
+    const residual_ffn_only = raw_args.len > 1 and std.mem.eql(u8, raw_args[raw_args.len - 1], "--residual-ffn");
+    const args = raw_args[0 .. raw_args.len - @intFromBool(tiles or binned or tiled_prompt or tiled_attention_only or residual_ffn_only)];
     if (args.len < 4 or args.len > 8) return error.ExpectedModelTokensOutput;
     if (args.len >= 7 and !std.mem.eql(u8, args[4], "images")) return error.ExpectedImageRowsAndStart;
     if (args.len == 5 and !std.mem.eql(u8, args[4], "embedding") and !std.mem.eql(u8, args[4], "prefix") and !std.mem.eql(u8, args[4], "decode") and !std.mem.startsWith(u8, args[4], "prompt:")) return error.ExpectedEmbeddingPrefixOrDecode;
@@ -47,6 +49,14 @@ pub fn main(init: std.process.Init) !void {
         try m.enableResidualFFN();
         try m.enableTiledAttention();
         if (m.residual_ffn == null or m.tiled_attention == null) return error.TiledPromptUnavailable;
+    }
+    if (tiled_attention_only) {
+        try m.enableTiledAttention();
+        if (m.tiled_attention == null) return error.TiledAttentionUnavailable;
+    }
+    if (residual_ffn_only) {
+        try m.enableResidualFFN();
+        if (m.residual_ffn == null) return error.ResidualFFNUnavailable;
     }
     var image_buffer: ?mtl.Buffer = null;
     defer if (image_buffer) |buffer| buffer.deinit();

@@ -65,6 +65,19 @@ match F. This is bounded teacher-forced evidence, not arbitrary-prompt, image, w
 long-context, or production fidelity qualification. The retained raw hashes and actual
 metrics are in [the public runtime receipt](../../docs/receipts/lfm3/m5-public-tiled-prompt-runtime.json).
 
+## Isolate a route and sample more boundary rows
+
+`tf-lfm3-forward` also accepts `--tiled-attention` and `--residual-ffn` (last argument) to enable one
+candidate at a time; with neither flag it runs the baseline route.
+
+The phase scorer's prompt phase is a single row. `prompt_row_sweep.py` scores many boundary rows of one
+causal sequence instead: produce FP32 and official-BF16 rows once with `full_model_reference.py --rows`, capture
+native `prompt:N` on `tokens[:N]` for each N, and run
+`prompt_row_sweep.py --fp32 ... --reference-bf16 ... --positions ... --route NAME=DIR/PREFIX --lengths ...`.
+It reports per-row RMS/max/top-20 probability and top-1 agreement with no pass/fail rule. The retained TEXT6
+result (25 rows, baseline vs tiled attention vs official BF16) is in
+[the route-isolation receipt](../../docs/receipts/lfm3/m5-text6-route-isolation-row-sweep.json).
+
 ```sh
 python3 -m unittest discover -s tools/lfm3 -p 'test_*envelope.py'
 python3 -m unittest discover -s tools/lfm3 -p test_full_model_reference.py
