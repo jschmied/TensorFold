@@ -168,12 +168,12 @@
           {
             "event": "lock_wait",
             "time_ns": 1793212362725465000,
-            "path": "/private/tmp/tensorfold-model.lock"
+            "path": "$TMPDIR/tensorfold-model.lock"
           },
           {
             "event": "lock_acquired",
             "time_ns": 1793212362725689000,
-            "path": "/private/tmp/tensorfold-model.lock",
+            "path": "$TMPDIR/tensorfold-model.lock",
             "pid": 19448,
             "device": 16777231,
             "inode": 46835039

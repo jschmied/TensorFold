@@ -98,10 +98,10 @@
   },
   "postnorm_control_stage_exit": 0,
   "source_and_binary_sha256": {
-    "/private/tmp/lfm3-combined-qualify.py": "9d9a5f942609de71f0494ce5b23ef0f5bd8f80b65aa9732ff0d5ea601a183a76",
-    "/private/tmp/lfm3-combined-manifest.json": "2c86619e73c86e6d21a99f1276102294c6c538005af393af5ea4bd6178b61ddc",
-    "/private/tmp/lfm3-combined-promotion.patch": "58df0a67e783c6d3af89fe18fb878083c9f1055ed09a692340b13612eaf0d9f2",
-    "/private/tmp/lfm3-postnorm-branchless-combined/zig-out/native/bin/tensorfold-native": "ad72d7ec17b681ede54676ba75f7d4d1b39282aa0dae7cf27d8b201660fce489"
+    "$TMPDIR/lfm3-combined-qualify.py": "9d9a5f942609de71f0494ce5b23ef0f5bd8f80b65aa9732ff0d5ea601a183a76",
+    "$TMPDIR/lfm3-combined-manifest.json": "2c86619e73c86e6d21a99f1276102294c6c538005af393af5ea4bd6178b61ddc",
+    "$TMPDIR/lfm3-combined-promotion.patch": "58df0a67e783c6d3af89fe18fb878083c9f1055ed09a692340b13612eaf0d9f2",
+    "$TMPDIR/lfm3-postnorm-branchless-combined/zig-out/native/bin/tensorfold-native": "ad72d7ec17b681ede54676ba75f7d4d1b39282aa0dae7cf27d8b201660fce489"
   },
   "event_log": "events.json",
   "manifest": "manifest.json",
@@ -117,7 +117,7 @@
   },
   "build": {
     "status": "passed",
-    "log": "/private/tmp/lfm3-applied-build.log",
+    "log": "$TMPDIR/lfm3-applied-build.log",
     "command": "zig build native tf-kernel-contract tf-lfm3-forward tf-lfm3-exact test-lfm3-host test-lfm3-image-host -Dcpu=apple_m1 --summary all",
     "actual_exit": 0
   },
