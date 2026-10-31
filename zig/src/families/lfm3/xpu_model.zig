@@ -125,6 +125,8 @@ pub const Model = struct {
     own: *Seq = undefined,
     /// Fused launches by bit (1 w1+w3+SwiGLU, 2 q/k/v/gate, 4 rope and KV store); LFM3_FUSE sets them for A/B.
     fuse: u32 = 7,
+    /// An 8-bit embedding (LFM3-VL): the head of every row runs qmv8_f32, as the last row's does.
+    emb8: bool = false,
 
     /// The affine tensors of module `m` (in layer `layer`, or a model tensor) by names.zig in namespace `ns`.
     fn table(l: *ld.Loader, ns: names.Namespace, layer: ?usize, m: names.Module) !Table {
@@ -153,17 +155,20 @@ pub const Model = struct {
     /// Uploads the checkpoint: `cap` positions on full-attention layers, windows of at most `max_rows` rows.
     pub fn load(gpa: std.mem.Allocator, r: *rt.Runtime, l: *ld.Loader, c: *const cfg.Config, cap: u32, max_rows: u32) !Model {
         if (max_rows == 0 or max_rows > 256 or cap < max_rows) return error.Invalid;
-        var bm = try r.module(xpu.kernels.basic);
-        var am = try r.module(xpu.kernels.attn);
-        var pm = try r.module(if (gen12) xpu.kernels.nem_prow_gen12 else xpu.kernels.nem_prow);
-        var fm = try r.module(xpu.kernels.lfm3);
-        var vm = try r.module(xpu.kernels.lfm3_mv);
+        const g32 = c.quant.global.group == 32; // LFM3-VL: projections in groups of 32, an 8-bit embedding (the head too)
+        const e8 = c.quant.width("embed_tokens").bits == 8;
+        const ks = xpu.kernels;
+        var em = try r.module(if (e8) ks.lfm3_q8 else ks.basic);
+        var am = try r.module(if (g32) ks.attn_g32 else ks.attn);
+        var pm = try r.module(if (gen12) (if (g32) ks.nem_prow_gen12_g32 else ks.nem_prow_gen12) else if (g32) ks.nem_prow_g32 else ks.nem_prow);
+        var fm = try r.module(ks.lfm3);
+        var vm = try r.module(if (g32) ks.lfm3_mv_g32 else ks.lfm3_mv);
         const k: Kernels = .{
-            .embed = try bm.kernel("embed4", .{ 64, 1, 1 }),
-            .embed_tok = try bm.kernel("embed4_tok", .{ 64, 1, 1 }),
+            .embed = try em.kernel(if (e8) "embed8" else "embed4", .{ 64, 1, 1 }),
+            .embed_tok = try em.kernel(if (e8) "embed8_tok" else "embed4_tok", .{ 64, 1, 1 }),
             .conv_hist = try fm.kernel("lfm3_conv_hist", .{ 64, 1, 1 }),
             .qmv = try am.kernel("qmv4_bf", .{ 64, 1, 1 }),
-            .head = try am.kernel("qmv4_f32", .{ 64, 1, 1 }),
+            .head = if (e8) try em.kernel("qmv8_f32", .{ 64, 1, 1 }) else try am.kernel("qmv4_f32", .{ 64, 1, 1 }),
             .am_part = try am.kernel("argmax_partial", .{ 256, 1, 1 }),
             .am_fin = try am.kernel("argmax_final", .{ 256, 1, 1 }),
             .pdense = try pm.kernel("pdense", .{ 16 * (16 / tile_outs), 1, 1 }),
@@ -254,6 +259,7 @@ pub const Model = struct {
             .max_rows = max_rows,
             .maxc = maxc,
             .device_bytes = l.total,
+            .emb8 = e8,
         };
         if (std.c.getenv("LFM3_FUSE")) |v| m.fuse = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 7;
         m.own = try m.newSeq();
@@ -500,7 +506,9 @@ pub const Model = struct {
             },
             .rows => {
                 // every row's logits: pdense's fp32 epilogue sums each as qmv4_f32 does (tf-xpu-lfm3_rows-test)
-                try run(&m.k.pdense, .{ V / 16, (n + tile_rows - 1) / tile_rows, 1 }, .{ m.emb.w, m.emb.s, m.emb.b, s.xn, s.logits, H, V, n, V, @as(u32, 0), @as(u32, 1) });
+                if (m.emb8) {
+                    for (0..n) |r| try run(&m.k.head, .{ V / 4, 1, 1 }, .{ m.emb.w, m.emb.s, m.emb.b, s.xn, s.logits, H, @as(u32, @intCast(r)) * H, @as(u32, @intCast(r)) * V, V });
+                } else try run(&m.k.pdense, .{ V / 16, (n + tile_rows - 1) / tile_rows, 1 }, .{ m.emb.w, m.emb.s, m.emb.b, s.xn, s.logits, H, V, n, V, @as(u32, 0), @as(u32, 1) });
                 try run(&m.k.am_part, .{ argmax_parts, n, 1 }, .{ s.logits, s.am_scratch, V, per });
                 try run(&m.k.am_fin, .{ n, 1, 1 }, .{ s.am_scratch, s.am_out, argmax_parts });
             },
