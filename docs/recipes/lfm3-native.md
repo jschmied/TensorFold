@@ -142,7 +142,7 @@ through Flash Next's `tf_qmmw_t_nax` tiles. They dequantize each weight to BF16 
 FP32. 4, 6 and 8 bits with groups of 32 or 64 are covered, `n` and `k` divisible by 64; other shapes keep the row
 kernels. The LM head and decode keep their own kernels.
 `lfm3-tiled-attention` adds two attention kernels. Prompt rows use 64-query/32-key tiles with FP32 online softmax and
-a BF16 high-plus-residual split of the probabilities for PV. A prompt segment of 9–2048 rows is one launch. Decode
+the probabilities rounded once to BF16 for PV, as MLX does. A prompt segment of 9–2048 rows is one launch. Decode
 windows, shared decode rows and prompt tails of at most eight rows use a key-parallel kernel: each query's keys split
 into at most 64 contiguous parts of at least 128 keys, merged in FP32. Both kernels replay a row through the exact
 attention path when its result is nonfinite, so nonfinite classes follow float64. Underflow and overflow of the FP32

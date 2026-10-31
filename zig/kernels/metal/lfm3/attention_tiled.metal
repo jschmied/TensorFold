@@ -1,4 +1,4 @@
-// Default-off M5 tiled SDPA experiment: strict QK, BF16 high+residual PV, FP32 accumulator; no bit-identity or fidelity claim before measured envelope gates.
+// M5 tiled SDPA: strict QK, softmax weights rounded once to BF16 for PV, FP32 accumulator.
 #include <metal_stdlib>
 using namespace metal;
 typedef bfloat bfloat16_t;
@@ -226,13 +226,14 @@ namespace tfp {
 constant constexpr float kMasked = -3.402823466e+38f;
 constant constexpr int kAnyCols = 1 << 30;
 
-// Fold one fragment's rows into r[2] (rows home.y, home.y + 8): pairs, then lanes 1 and 8 apart, then into r.
+// Fold two fragments' rows into r[2] (rows home.y, home.y + 8): pairs, then lanes 1 and 8 apart, then into r.
 template <bool MAX>
-inline void row_fold(thread const frag<float>& f, thread float (&r)[2]) {
+inline void row_fold(thread const frag<float>& f0, thread const frag<float>& f1, thread float (&r)[2]) {
   TF_UNROLL
   for (short h = 0; h < 2; h++) {
     const short b = 4 * h;
-    float t = MAX ? max(max(f[b], f[b + 1]), max(f[b + 2], f[b + 3])) : (f[b] + f[b + 1]) + (f[b + 2] + f[b + 3]);
+    float t = MAX ? max(max(max(f0[b], f0[b + 1]), max(f0[b + 2], f0[b + 3])), max(max(f1[b], f1[b + 1]), max(f1[b + 2], f1[b + 3])))
+                  : ((f0[b] + f0[b + 1]) + (f0[b + 2] + f0[b + 3])) + ((f1[b] + f1[b + 1]) + (f1[b + 2] + f1[b + 3]));
     const float u = simd_shuffle_xor(t, ushort(1));
     t = MAX ? max(t, u) : t + u;
     const float w = simd_shuffle_xor(t, ushort(8));
@@ -241,12 +242,15 @@ inline void row_fold(thread const frag<float>& f, thread float (&r)[2]) {
   }
 }
 
-// Convert canonical 16x16 fragment coordinates to the strict mixed-type MPP operand ABI.
-inline void mma_pv_residual(thread frag<float>& lo,thread frag<float>& hi,const thread frag<float>& a,const thread frag<bfloat>& b0,const thread frag<bfloat>& b1){
- frag<bfloat> high,low;
- TF_UNROLL for(short e=0;e<8;e++){high[e]=bfloat(a[e]);low[e]=bfloat(a[e]-float(high[e]));}
- mma_16x32<false,false>(lo,hi,high,b0,b1);
- mma_16x32<false,false>(lo,hi,low,b0,b1);
+// (lo | hi) += P V with the FP32 weights rounded to BF16, the type of the V operand.
+inline void mma_pv(thread frag<float>& lo, thread frag<float>& hi, const thread frag<float>& p, const thread frag<bfloat>& b0,
+                   const thread frag<bfloat>& b1) {
+  frag<bfloat> w;
+  TF_UNROLL
+  for (short e = 0; e < 8; e++) {
+    w[e] = bfloat(p[e]);
+  }
+  mma_16x32<false, false>(lo, hi, w, b0, b1);
 }
 
 // One 64-query block of one head, online softmax over 32-key blocks; P holds the ATTN_PARAMS fields, F[0] the scale.
@@ -282,17 +286,22 @@ inline void attention_nax(const device T* Q, const device T* K, const device T* 
 
   const int first_block = P[24] == 0 ? 0 : max(0, int(tg.x)*BQ + P[11] + 1 - P[24]) / BK;
   K += first_block*BK*ks; V += first_block*BK*vs;
+  frag<T> qf[8];  // this simdgroup's 16 query rows, held for every key block
+  TF_UNROLL
+  for (short d = 0; d < 8; d++) {
+    if (!AQ && last_q) {
+      frag_get_in(qf[d], Q, qs, 0, 16 * d, home, q_rows, kAnyCols);
+    } else {
+      frag_get(qf[d], Q, qs, 0, 16 * d, home);
+    }
+  }
   for (int kb = first_block; kb < blocks; kb++) {
     const bool last_k = kb == P[8];
     frag<float> s[2] = {frag<float>(0), frag<float>(0)};
-#pragma clang loop unroll_count(4)
+    TF_UNROLL
     for (short d = 0; d < 8; d++) {
-      frag<T> q, k0, k1;
-      if (!AQ && last_q) {
-        frag_get_in(q, Q, qs, 0, 16 * d, home, q_rows, kAnyCols);
-      } else {
-        frag_get(q, Q, qs, 0, 16 * d, home);
-      }
+      frag<T> k0, k1;
+      const frag<T> q = qf[d];
       if (!AK && last_k) {
         frag_get_t_in(k0, K, ks, 0, 16 * d, home, k_rows, kAnyCols);
         frag_get_t_in(k1, K, ks, 16, 16 * d, home, k_rows, kAnyCols);
@@ -335,8 +344,7 @@ inline void attention_nax(const device T* Q, const device T* K, const device T* 
         if(c0+16*f+TF_COL(e)<r0+(e>>2)*8+1-P[24])s[f][e]=kMasked;
     }
     float top_new[2] = {top[0], top[1]};
-    row_fold<true>(s[0], top_new);
-    row_fold<true>(s[1], top_new);
+    row_fold<true>(s[0], s[1], top_new);
     TF_UNROLL
     for (short f = 0; f < 2; f++) {
       TF_UNROLL
@@ -351,13 +359,15 @@ inline void attention_nax(const device T* Q, const device T* K, const device T* 
       top[h] = top_new[h];
       total[h] = total[h] * scale_old[h];
     }
-    row_fold<false>(s[0], total);
-    row_fold<false>(s[1], total);
-    TF_UNROLL
-    for (short i = 0; i < 8; i++) {
+    row_fold<false>(s[0], s[1], total);
+    // Every scale is exactly 1 once no row's maximum moves, which is nearly always after the first blocks.
+    if (simd_any(scale_old[0] != 1.0f || scale_old[1] != 1.0f)) {
       TF_UNROLL
-      for (short e = 0; e < 8; e++) {
-        acc[i][e] = acc[i][e] * scale_old[e >> 2];
+      for (short i = 0; i < 8; i++) {
+        TF_UNROLL
+        for (short e = 0; e < 8; e++) {
+          acc[i][e] = acc[i][e] * scale_old[e >> 2];
+        }
       }
     }
     simdgroup_barrier(mem_flags::mem_none);
@@ -377,7 +387,7 @@ inline void attention_nax(const device T* Q, const device T* K, const device T* 
           frag_get(v0, V, vs, 16 * k, 16 * d, home);
           frag_get(v1, V, vs, 16 * k, 16 * d + 16, home);
         }
-        mma_pv_residual(acc[d], acc[d + 1], s[k], v0, v1);
+        mma_pv(acc[d], acc[d + 1], s[k], v0, v1);
       }
     }
     K += BK * ks;
