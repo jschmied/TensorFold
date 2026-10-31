@@ -31,7 +31,7 @@ pub const Metal = struct {
     pub fn init(gpa: std.mem.Allocator, model: *Model, options: Options) !*Metal {
         if (options.chunk == 0 or options.chunk > 2048 or options.capacity == 0 or options.capacity > st.max_context or options.streams == 0)
             return error.InvalidLfmOptions;
-        if (@import("lfm3_options").residual_ffn) try model.enableResidualFFN();
+        if (@import("lfm3_options").nax_prompt) try model.enableNaxPrompt();
         if (@import("lfm3_options").tiled_attention) try model.enableTiledAttention();
         const out = try gpa.create(Metal);
         errdefer gpa.destroy(out);
@@ -155,7 +155,7 @@ pub const Metal = struct {
             const marked = std.mem.indexOfScalar(u32, stream.reuse.marks, @intCast(end)) != null;
             const interrupted_observer = stream.reuse.hook != null and (stream.cancel_check != null or stream.yield_check != null);
             const head: fwd.Head = if (prefill_control.deferHead(self.options.defer_prompt_head, end == ids.len, stream.reuse.hook != null and marked, interrupted_observer)) .none else .last;
-            const tiles: fwd.PromptTiles = if (prompt_rows == 2048 and self.options.chunk > 128 and ids.len > 128) .both else .baseline;
+            const tiles: fwd.PromptTiles = if (self.model.prompt_nax != null) .nax else .baseline;
             try fwd.runPromptWithImages(self.model, &self.scratch, &.{.{ .cache = cache, .rows = end - at }}, ids[at..end], head, image_rows, tiles);
             at = end;
             prefill_control.completed(stream, at);

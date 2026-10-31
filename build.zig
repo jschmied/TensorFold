@@ -78,17 +78,17 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "slide_test_hooks", slide_test_hooks);
     const lfm3_risk_fast = b.option(bool, "lfm3-risk-fast", "Developer LFM3 fused range predicate candidate") orelse false;
     const lfm3_defer_head = b.option(bool, "lfm3-defer-prompt-head", "Developer LFM3 unobserved intermediate prompt head omission") orelse false;
-    const residual_ffn = b.option(bool, "lfm3-residual-ffn", "Development-only residual-weight LFM3 prompt FFN") orelse (release_version == null);
+    const nax_prompt = b.option(bool, "lfm3-nax-prompt", "Development-only tensor-unit LFM3 prompt projections") orelse (release_version == null);
     const tiled_attention = b.option(bool, "lfm3-tiled-attention", "Development-only tiled LFM3 prompt attention") orelse (release_version == null);
     const prompt_rows = b.option(u32, "lfm3-prompt-rows", "Development-only LFM3 prompt rows: 128, 256 or 2048") orelse
-        (if (release_version == null and residual_ffn and tiled_attention) @as(u32, 2048) else 128);
+        (if (release_version == null and nax_prompt and tiled_attention) @as(u32, 2048) else 128);
     switch (prompt_rows) {
         128, 256, 2048 => {},
         else => @panic("Invalid LFM3 prompt row count"),
     }
-    if (prompt_rows > 128 and (!residual_ffn or !tiled_attention))
-        @panic("Wide LFM3 prompts require both development tiled options");
-    if ((residual_ffn or tiled_attention or prompt_rows > 128) and release_version != null) @panic("Tiled LFM3 candidates are development-only options");
+    if (prompt_rows > 128 and (!nax_prompt or !tiled_attention))
+        @panic("Wide LFM3 prompts require both development prompt options");
+    if ((nax_prompt or tiled_attention or prompt_rows > 128) and release_version != null) @panic("Tiled LFM3 candidates are development-only options");
     if (lfm3_defer_head and release_version != null) @panic("Deferred prompt head is a development-only option");
     const optimize = b.option(std.builtin.OptimizeMode, "optimize", "debug, safe, fast or small (default fast)") orelse .fast;
     // Nemotron's draft vocabulary (zig/src/families/nemotron/draft_ids.txt), for every backend
@@ -154,7 +154,7 @@ pub fn build(b: *std.Build) void {
     const cuda_options = @import("zig/build/options.zig").cuda(b);
     const tp_options = @import("zig/build/options.zig").tp(b);
     switch (target.result.os.tag) {
-        .macos => metalTargets(b, target, optimize, draft_ids, build_options, test_step, lfm3_risk_fast, lfm3_defer_head, residual_ffn, tiled_attention, prompt_rows),
+        .macos => metalTargets(b, target, optimize, draft_ids, build_options, test_step, lfm3_risk_fast, lfm3_defer_head, nax_prompt, tiled_attention, prompt_rows),
         .linux, .windows => cuda_build.targets(b, target, optimize, draft_ids, build_options, cuda_options),
         else => {},
     }

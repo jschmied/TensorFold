@@ -125,60 +125,41 @@ Structured output requires the native grammar library; logprobs and video are no
 A complete earlier global M5 contract run found one Qwen4 failure that also reproduces on the unchanged pinned base.
 It is not a final-source global pass. Agree model-fidelity and performance gates on #1491 before claiming release readiness.
 
-## Development-default tiled prompt experiments
+## Development-default tensor-unit routes
 
-Development builds enable both tiled options and 2048 prompt rows by default on tensor-unit devices.
-On devices without tensor units serving uses 128 rows and existing kernels. Release-version builds default to
-the existing path and reject either tiled option when explicitly enabled. These remain draft experiments.
+Development builds enable `lfm3-nax-prompt`, `lfm3-tiled-attention` and 2048 prompt rows by default on tensor-unit
+devices. On devices without tensor units serving uses 128 rows and the existing kernels. Release-version builds
+default to the existing path and reject either option when explicitly enabled. These remain draft routes; model
+fidelity is judged against an independent FP32 forward and the official MLX BF16 run, as agreed on
+[#1491](https://github.com/ashhart/TensorFold/issues/1491#issuecomment-6537143418), not against float64.
 
 ```sh
-zig build native -Dcpu=apple_m1 -Dlfm3-residual-ffn=true -Dlfm3-tiled-attention=true
+zig build native -Dcpu=apple_m1 -Dlfm3-nax-prompt=true -Dlfm3-tiled-attention=true -Dlfm3-prompt-rows=2048
 ```
 
-`lfm3-residual-ffn` changes only the FFN gate, up and down projections. It reconstructs each affine weight
-as a BF16 high part and residual part, accumulates both products in FP32, and rounds the result to BF16.
-The candidate requires 4-bit weights, groups of 64, 33 rows through the configured prompt-row limit, dimensions
-divisible by 64, and K at most
-12,288. Flagged nonfinite tiles use the existing row projection. Other shapes and widths retain that path.
-`lfm3-tiled-attention` uses 64-query/32-key tiles, strict QK products, and BF16 high-plus-residual
-probabilities for PV with FP32 accumulation. It handles nonshared slices of 9–64 rows, causal full attention
-or the 256-token sliding window. Shared rows and slices of at most eight rows retain the existing attention.
-Both modules check tensor-unit capability before compiling their optional pipelines; M4 and older devices
-retain the existing paths. Enabling the build options selects the candidates when the serving backend initializes.
-Direct `Model.load` developer harnesses must explicitly enable the corresponding candidate to exercise it.
-To select the prior development baseline, build with `-Dlfm3-residual-ffn=false -Dlfm3-tiled-attention=false`.
+`lfm3-nax-prompt` sends every dense prompt projection (attention q/k/v/out, convolution in/out, FFN gate/up/down)
+through Flash Next's `tf_qmmw_t_nax` tiles. They dequantize each weight to BF16 as MLX does and accumulate in
+FP32. 4, 6 and 8 bits with groups of 32 or 64 are covered, `n` and `k` divisible by 64; other shapes keep the row
+kernels. The LM head and decode keep their own kernels.
+`lfm3-tiled-attention` adds two attention kernels. Prompt rows use 64-query/32-key tiles with FP32 online softmax and
+a BF16 high-plus-residual split of the probabilities for PV. A prompt segment of 9–2048 rows is one launch. Decode
+windows, shared decode rows and prompt tails of at most eight rows use a key-parallel kernel: each query's keys split
+into at most 64 contiguous parts of at least 128 keys, merged in FP32. Both kernels replay a row through the exact
+attention path when its result is nonfinite, so nonfinite classes follow float64. Underflow and overflow of the FP32
+softmax follow MLX, not the earlier extended-range repair.
+To select the prior development baseline, build with `-Dlfm3-nax-prompt=false -Dlfm3-tiled-attention=false`.
 
 `-Dlfm3-prompt-rows=128`, `256`, or `2048` selects the development prompt batch; its tensor-unit default is 2048.
-Both tiled options are required for a larger batch, and release-version builds reject them.
+Both options are required for a larger batch, and release-version builds reject them.
 Cache marks retain their existing 128-row policy and can split a larger batch. Cancellation and background yield
 are checked at chunk boundaries; a 2048-row chunk remains one atomic forward pass.
 
-For 2048-row serving, long-prompt prefill explicitly permits partial FFN tiles of 1–32 rows and attention
-tiles of 1–8 rows. This keeps the tiled arithmetic across short message-boundary cuts, including a five-token
-assistant header. The context belongs to that forward call; decode, verification, short prompts, and the
-128/256-row serving modes keep their previous selectors. No private environment selector is needed:
+Kernel-contract probes: `metal LFM3 NAX prompt q{4,6,8}g64`, `q4g32` and `metal LFM3 split structural full|sliding`,
+each with planted controls (`zig build tf-kernel-contract`, `--only "LFM3 NAX prompt"`).
+Developer harnesses (`tf-lfm3-forward ... --nax-prompt`, `tf-lfm3-profile` with `TF_LFM3_NAX_PROMPT=1` and
+`TF_LFM3_DECODE_STEPS=N`) enable the same kernels explicitly.
 
-```sh
-zig build native -Dcpu=apple_m1 -Dlfm3-residual-ffn=true -Dlfm3-tiled-attention=true -Dlfm3-prompt-rows=2048
-```
-
-The earlier private 2048-row path changed an 8k reply at the short header cut. The prompt-only tail route
-restored byte equality for all 17 vocabulary rows and full KV/convolution state in the fixed 8k+16 comparison.
-This is bounded same-engine evidence. Broader small-tail nonfinite checks, independent propagated FP32/BF16
-fidelity, and final-source lifecycle validation remain separate gates; the development-default 2048-row mode is still work in progress.
-
-These are work-in-progress arithmetic changes, not release-qualified replacements. The
-[combined provisional serving receipt](../receipts/lfm3/m5-composed-prompt-provisional-serving.json)
-records the frozen private prototype's cold 2k/8k measurements. Its bounded Text4 comparison used 128 prompt
-tokens and 16 fixed teacher-forced continuations against an independent FP32 graph and actual official MLX BF16.
-The combined candidate passed separate prompt/continuation logit RMS and maximum-error comparisons, while
-the proposed top-20 probability diagnostics retained breaches. Those diagnostic metrics are an explicit proposal
-under the [FP32 criterion](https://github.com/ashhart/TensorFold/issues/1491#issuecomment-6516252750),
-not a verbatim maintainer specification or a reason to hide the breaches.
-The [held-input attention receipt](../receipts/lfm3/m5-composed-attention-held-input.json) covers 22 actual
-128-row cells from baseline and candidate histories; it does not substitute for propagated full-model checks.
-
-Integrated-source kernel contracts, nonfinite attention behavior, arbitrary tails, cache/resume/partial-acceptance
-seams, cancellation/concurrency, wider quantizations, images and longer contexts remain qualification work.
-Earlier family receipts above do not automatically qualify these opt-in arithmetic paths. No decode-throughput
-or M4 candidate speed improvement is claimed.
+These are work-in-progress arithmetic changes, not release-qualified replacements. Seam, cancellation, concurrency
+and lifecycle validation of the new routes, other Apple GPU generations and the weights' licence statement remain
+open. Licence: the LiquidAI LFM3 model cards declare `license: other` with `license_name: lfm1.0` and a LICENSE file in each repo.
+Macs checked: an M5 Ultra only.

@@ -4,9 +4,10 @@ const std = @import("std");
 const mtl = @import("metal");
 const tf = @import("tensorfold");
 const contract = @import("contract");
-const lfm3_residual = @import("metal_lfm3_residual.zig");
+const lfm3_nax = @import("metal_lfm3_nax.zig");
 const lfm3 = @import("metal_lfm3.zig");
 const lfm3_tiled = @import("metal_lfm3_tiled.zig");
+const lfm3_split = @import("metal_lfm3_split.zig");
 const lfm3_vision = @import("metal_lfm3_vision.zig");
 const lfm3_sums = @import("metal_lfm3_sums.zig");
 const lfm3_attention_sums = @import("metal_lfm3_attention_sums.zig");
@@ -140,15 +141,16 @@ pub fn main(init: std.process.Init) !u8 {
         gemma_list.deinit(a);
     }
     var kernels: std.ArrayList(g.Kernel) = .empty;
-    var residual_probes: [3]lfm3_residual.Probe = undefined;
-    var residual_count: usize = 0;
-    defer for (residual_probes[0..residual_count]) |*probe| probe.deinit();
-    if (tensor) for (std.enums.values(lfm3_residual.Fault)) |fault| {
-        if (!wanted(o, lfm3_residual.name(fault))) continue;
-        residual_probes[residual_count] = try lfm3_residual.Probe.init(a, device, queue, fault);
-        residual_count += 1;
+    var nax_probes: [lfm3_nax.formats.len + 2]lfm3_nax.Probe = undefined;
+    var nax_count: usize = 0;
+    defer for (nax_probes[0..nax_count]) |*probe| probe.deinit();
+    if (tensor) for (lfm3_nax.formats, 0..) |f, i| for (std.enums.values(lfm3_nax.Fault)) |fault| {
+        if (fault != .none and i != 0) continue;
+        if (!wanted(o, try lfm3_nax.name(a, f.bits, f.group, fault))) continue;
+        nax_probes[nax_count] = try lfm3_nax.Probe.init(a, device, queue, f.bits, f.group, fault);
+        nax_count += 1;
     };
-    for (residual_probes[0..residual_count]) |*probe| try kernels.append(a, probe.kernel());
+    for (nax_probes[0..nax_count]) |*probe| try kernels.append(a, probe.kernel());
     var tiled_probes: [4]lfm3_tiled.Probe = undefined;
     var tiled_count: usize = 0;
     defer for (tiled_probes[0..tiled_count]) |*probe| probe.deinit();
@@ -162,6 +164,15 @@ pub fn main(init: std.process.Init) !u8 {
         tiled_count += 1;
     };
     for (tiled_probes[0..tiled_count]) |*probe| try kernels.append(a, probe.kernel());
+    var split_probes: [4]lfm3_split.Probe = undefined;
+    var split_count: usize = 0;
+    defer for (split_probes[0..split_count]) |*probe| probe.deinit();
+    for ([_]bool{ false, true }) |sliding| for (std.enums.values(lfm3_split.Fault)) |fault| {
+        if (sliding and fault != .none or !wanted(o, lfm3_split.name(sliding, fault))) continue;
+        split_probes[split_count] = try lfm3_split.Probe.init(a, device, queue, sliding, fault);
+        split_count += 1;
+    };
+    for (split_probes[0..split_count]) |*probe| try kernels.append(a, probe.kernel());
     var lfm3_probes: [std.enums.values(lfm3.Kind).len]lfm3.Probe = undefined;
     var lfm3_count: usize = 0;
     defer for (lfm3_probes[0..lfm3_count]) |*probe| probe.deinit();

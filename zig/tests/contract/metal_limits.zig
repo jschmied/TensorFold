@@ -31,12 +31,18 @@ fn launchOf(a: std.mem.Allocator, device: mtl.Device, d: limits.MetalLaunch) !La
             return std.mem.indexOf(u8, s, p) != null;
         }
     }.f;
+    if (std.mem.startsWith(u8, d.name, "LFM3 split attention ")) {
+        const body = try std.mem.concat(a, u8, &.{ sources.lfm3_attention, "\n", sources.lfm3_attention_split });
+        return .{ .decl = d, .function = fun, .here = body, .pre_m5 = body };
+    }
     if (std.mem.startsWith(u8, d.name, "LFM3 tiled attention ")) {
         const body = try std.mem.concat(a, u8, &.{ sources.lfm3_attention, "\n", sources.lfm3_attention_tiled });
         return .{ .decl = d, .function = fun, .here = body, .pre_m5 = body };
     }
-    if (std.mem.startsWith(u8, d.name, "LFM3 residual FFN ")) {
-        const body = try std.mem.concat(a, u8, &.{ sources.core_row_projection, "\n", sources.nax, "\n", sources.lfm3_residual_ffn });
+    if (std.mem.startsWith(u8, d.name, "LFM3 NAX prompt ")) {
+        const tag = d.name["LFM3 NAX prompt q".len..std.mem.lastIndexOfScalar(u8, d.name, ' ').?];
+        const split = std.mem.indexOfScalar(u8, tag, 'g').?;
+        const body = try tf.lfm3.prompt_nax.source(device, a, try std.fmt.parseInt(u8, tag[0..split], 10), try std.fmt.parseInt(u16, tag[split + 1 ..], 10));
         return .{ .decl = d, .function = fun, .here = body, .pre_m5 = body };
     }
     if (std.mem.startsWith(u8, d.name, "binned ")) {
@@ -174,7 +180,7 @@ pub fn gate(a: std.mem.Allocator, io: std.Io, device: mtl.Device, offline: ?[]co
     var n = try registry.checkMetal(a, &registry.all_metal, false);
     std.debug.print("{s} limits: {d} registered Metal launches against M1-M5, {d} problems\n", .{ if (n == 0) "PASS" else "FAIL", registry.all_metal.len, n });
     for (registry.all_metal) |d| {
-        if (!device.tensorUnits() and (std.mem.startsWith(u8, d.name, "LFM3 residual FFN ") or
+        if (!device.tensorUnits() and (std.mem.startsWith(u8, d.name, "LFM3 NAX prompt ") or
             std.mem.startsWith(u8, d.name, "LFM3 tiled attention ")))
         {
             std.debug.print("SKIP limits here {s}: requires tensor units\n", .{d.name});

@@ -21,7 +21,8 @@ pub const Model = struct {
     resident: ?mtl.ResidencySet = null,
     profile: ?*counters.Recorder = null,
     tiled_attention: ?mtl.Pipeline = null,
-    residual_ffn: ?@import("residual_ffn.zig").Candidate = null,
+    split_attention: ?@import("attention_split.zig").Pipelines = null,
+    prompt_nax: ?@import("prompt_nax.zig").Candidate = null,
     projection_candidate: ?prompt.Candidate = null,
     binned_candidate: ?binned.Pipelines = null,
 
@@ -36,7 +37,8 @@ pub const Model = struct {
         errdefer gpa.destroy(m);
         m.profile = null;
         m.tiled_attention = null;
-        m.residual_ffn = null;
+        m.split_attention = null;
+        m.prompt_nax = null;
         m.projection_candidate = null;
         m.binned_candidate = null;
         m.gpa = gpa;
@@ -94,20 +96,23 @@ pub const Model = struct {
         m.resident = null;
     }
 
-    pub fn enableResidualFFN(m: *Model) !void {
-        if (m.residual_ffn != null or !m.device.tensorUnits()) return;
-        m.residual_ffn = try @import("residual_ffn.zig").Candidate.init(m.device);
+    pub fn enableNaxPrompt(m: *Model) !void {
+        if (m.prompt_nax != null) return;
+        const w = m.weights.blocks[0].ffn.gate;
+        m.prompt_nax = try @import("prompt_nax.zig").Candidate.init(m.device, w.bits, @intCast(w.group));
     }
 
     pub fn enableTiledAttention(m: *Model) !void {
         if (m.tiled_attention != null) return;
         m.tiled_attention = try @import("attention_tiled.zig").load(m.device);
+        m.split_attention = try @import("attention_split.zig").Pipelines.load(m.device);
     }
 
     pub fn deinit(m: *Model) void {
         m.dropResident();
         if (m.tiled_attention) |pipeline| pipeline.deinit();
-        if (m.residual_ffn) |*candidate| candidate.deinit();
+        if (m.split_attention) |pipelines| pipelines.deinit();
+        if (m.prompt_nax) |*candidate| candidate.deinit();
         if (m.projection_candidate) |*candidate| candidate.deinit();
         if (m.binned_candidate) |*candidate| candidate.deinit();
         m.kernels.deinit();

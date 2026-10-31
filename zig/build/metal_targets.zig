@@ -135,7 +135,7 @@ pub fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
     return exe;
 }
 
-pub fn metalTargets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, draft_ids: *std.Build.Module, build_options: *std.Build.Step.Options, test_step: *std.Build.Step, risk_fast: bool, defer_head: bool, residual_ffn: bool, tiled_attention: bool, prompt_rows: u32) void {
+pub fn metalTargets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, draft_ids: *std.Build.Module, build_options: *std.Build.Step.Options, test_step: *std.Build.Step, risk_fast: bool, defer_head: bool, nax_prompt: bool, tiled_attention: bool, prompt_rows: u32) void {
     const metal_std = b.option([]const u8, "metal-std", "Metal language version (default: MLX's for this macOS)") orelse mlxMetalStd(b);
 
     // MLX's mx.fast.metal_kernel JIT: MTLCompileOptions mathMode safe, fp32 functions fast (the default), its...
@@ -150,7 +150,7 @@ pub fn metalTargets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
     b.getInstallStep().dependOn(&b.addInstallFile(fast_lib, "lib/nemotron_fastmath.metallib").step);
     b.getInstallStep().dependOn(&lib_install.step);
 
-    const mods = metalEngineModules(b, target, optimize, draft_ids, risk_fast, defer_head, residual_ffn, tiled_attention, prompt_rows);
+    const mods = metalEngineModules(b, target, optimize, draft_ids, risk_fast, defer_head, nax_prompt, tiled_attention, prompt_rows);
     const metal = mods.metal;
     const kernels_mod = embedded(b, lib, "tensorfold.metallib");
     counters_build.targets(b, target, optimize, metal, mods.sources, test_step);
@@ -477,7 +477,7 @@ pub fn metalTargets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
     }
 }
 
-pub fn metalEngineModules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, draft_ids: *std.Build.Module, risk_fast: bool, defer_head: bool, residual_ffn: bool, tiled_attention: bool, prompt_rows: u32) struct { metal: *std.Build.Module, lanes: *std.Build.Module, fabric: *std.Build.Module, sources: *std.Build.Module, engine: *std.Build.Module, living: *std.Build.Module, qwen27: qwen27_build.Shared } {
+pub fn metalEngineModules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, draft_ids: *std.Build.Module, risk_fast: bool, defer_head: bool, nax_prompt: bool, tiled_attention: bool, prompt_rows: u32) struct { metal: *std.Build.Module, lanes: *std.Build.Module, fabric: *std.Build.Module, sources: *std.Build.Module, engine: *std.Build.Module, living: *std.Build.Module, qwen27: qwen27_build.Shared } {
     const metal = b.createModule(.{
         .root_source_file = b.path("zig/src/metal/metal.zig"),
         .target = target,
@@ -503,7 +503,7 @@ pub fn metalEngineModules(b: *std.Build, target: std.Build.ResolvedTarget, optim
     const lfm3_options = b.addOptions();
     lfm3_options.addOption(bool, "risk_fast", risk_fast);
     lfm3_options.addOption(bool, "defer_prompt_head", defer_head);
-    lfm3_options.addOption(bool, "residual_ffn", residual_ffn);
+    lfm3_options.addOption(bool, "nax_prompt", nax_prompt);
     lfm3_options.addOption(bool, "tiled_attention", tiled_attention);
     lfm3_options.addOption(u32, "prompt_rows", prompt_rows);
     engine.addOptions("lfm3_options", lfm3_options);

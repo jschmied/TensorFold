@@ -22,10 +22,9 @@ pub fn main(init: std.process.Init) !void {
     const raw_args = try init.minimal.args.toSlice(init.arena.allocator());
     const tiles = raw_args.len > 1 and std.mem.eql(u8, raw_args[raw_args.len - 1], "--tiles");
     const binned = raw_args.len > 1 and std.mem.eql(u8, raw_args[raw_args.len - 1], "--binned");
-    const tiled_prompt = raw_args.len > 1 and std.mem.eql(u8, raw_args[raw_args.len - 1], "--tiled-prompt");
     const tiled_attention_only = raw_args.len > 1 and std.mem.eql(u8, raw_args[raw_args.len - 1], "--tiled-attention");
-    const residual_ffn_only = raw_args.len > 1 and std.mem.eql(u8, raw_args[raw_args.len - 1], "--residual-ffn");
-    const args = raw_args[0 .. raw_args.len - @intFromBool(tiles or binned or tiled_prompt or tiled_attention_only or residual_ffn_only)];
+    const nax_prompt = raw_args.len > 1 and std.mem.eql(u8, raw_args[raw_args.len - 1], "--nax-prompt");
+    const args = raw_args[0 .. raw_args.len - @intFromBool(tiles or binned or tiled_attention_only or nax_prompt)];
     if (args.len < 4 or args.len > 8) return error.ExpectedModelTokensOutput;
     if (args.len >= 7 and !std.mem.eql(u8, args[4], "images") and !std.mem.startsWith(u8, args[4], "prompt:")) return error.ExpectedImageRowsAndStart;
     if (args.len == 5 and !std.mem.eql(u8, args[4], "embedding") and !std.mem.eql(u8, args[4], "prefix") and !std.mem.eql(u8, args[4], "decode") and !std.mem.startsWith(u8, args[4], "prompt:")) return error.ExpectedEmbeddingPrefixOrDecode;
@@ -45,18 +44,14 @@ pub fn main(init: std.process.Init) !void {
     defer m.deinit();
     if (tiles) try m.enableProjectionCandidate();
     if (binned) try m.enableBinnedProjectionCandidate();
-    if (tiled_prompt) {
-        try m.enableResidualFFN();
+    if (nax_prompt) {
+        try m.enableNaxPrompt();
         try m.enableTiledAttention();
-        if (m.residual_ffn == null or m.tiled_attention == null) return error.TiledPromptUnavailable;
+        if (m.prompt_nax == null or m.tiled_attention == null) return error.NaxPromptUnavailable;
     }
     if (tiled_attention_only) {
         try m.enableTiledAttention();
         if (m.tiled_attention == null) return error.TiledAttentionUnavailable;
-    }
-    if (residual_ffn_only) {
-        try m.enableResidualFFN();
-        if (m.residual_ffn == null) return error.ResidualFFNUnavailable;
     }
     var image_buffer: ?mtl.Buffer = null;
     defer if (image_buffer) |buffer| buffer.deinit();
@@ -122,7 +117,7 @@ pub fn main(init: std.process.Init) !void {
         var done: usize = 0;
         while (done < prompt_rows) {
             const n = @min(prompt_rows - done, 128);
-            try q.forward.runWithImages(m, &prompt_scratch, &.{.{ .cache = &cache, .rows = n }}, ids[done..][0..n], false, .last, images);
+            try q.forward.runPromptWithImages(m, &prompt_scratch, &.{.{ .cache = &cache, .rows = n }}, ids[done..][0..n], .last, images, if (nax_prompt) .nax else .baseline);
             done += n;
         }
         @memcpy(logits[0 .. q.config.vocab * 2], prompt_scratch.logits.contents()[0 .. q.config.vocab * 2]);

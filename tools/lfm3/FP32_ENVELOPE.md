@@ -33,7 +33,7 @@ python3 tools/lfm3/full_model_reference.py --backend mlx \
 
 zig build tf-lfm3-forward -Dcpu=apple_m1
 ./zig-out/bin/tf-lfm3-forward "$MODEL_DIR" \
-  tools/lfm3/fixtures/fp32-envelope-text4-144.npy native.bf16 prompt:128 --tiled-prompt
+  tools/lfm3/fixtures/fp32-envelope-text4-144.npy native.bf16 prompt:128 --nax-prompt
 ```
 
 The native flag explicitly enables both development candidates through the public
@@ -67,8 +67,9 @@ metrics are in [the public runtime receipt](../../docs/receipts/lfm3/m5-public-t
 
 ## Isolate a route and sample more boundary rows
 
-`tf-lfm3-forward` also accepts `--tiled-attention` and `--residual-ffn` (last argument) to enable one
-candidate at a time; with neither flag it runs the baseline route.
+`tf-lfm3-forward` also accepts `--tiled-attention` or `--nax-prompt` (last argument) to enable one
+route at a time (`--nax-prompt` adds the tensor-unit projections and the tiled attention); with neither flag it
+runs the baseline route.
 
 The phase scorer's prompt phase is a single row. `prompt_row_sweep.py` scores many boundary rows of one
 causal sequence instead: produce FP32 and official-BF16 rows once with `full_model_reference.py --rows`, capture
