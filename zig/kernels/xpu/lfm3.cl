@@ -93,7 +93,7 @@ __kernel void lfm3_conv_rows(__global const ushort *proj, uint pd, __global cons
 // One head of row r at position pos: RMSNorm over 128 dims, RoPE on pairs (d, d + 64) with bf16 cos/sin; 64 items.
 inline void norm_rope_head(__global const ushort *s, __global ushort *o, __global const ushort *w, __global const float *inv_freq, uint pos,
                            float eps, __local float *part) {
-    const uint i = get_local_id(0);
+    const uint i = get_local_id(0); // 64 items in 4 sub-groups of 16 (the kernels require 16): part[4]
     const float a = bf(s[i]), b = bf(s[i + 64]);
     float ss = sub_group_reduce_add(a * a + b * b);
     if (get_sub_group_local_id() == 0) part[get_sub_group_id()] = ss;
@@ -111,6 +111,7 @@ inline void norm_rope_head(__global const ushort *s, __global ushort *o, __globa
 }
 
 // Per-head RMSNorm, RoPE on pairs (d, d + 64), bf16 cos/sin; grid (heads, rows); to row r or slot (pos0 + r) % ring.
+__attribute__((intel_reqd_sub_group_size(16)))
 __kernel void lfm3_qk_norm_rope(__global const ushort *src, uint src_stride, uint src_off, __global ushort *dst, uint dst_stride,
                                 __global const ushort *w, __global const float *inv_freq, uint pos0, uint ring, float eps) {
     __local float part[4];
@@ -121,6 +122,7 @@ __kernel void lfm3_qk_norm_rope(__global const ushort *src, uint src_stride, uin
 }
 
 // q heads, then k heads and v rows into slot (pos0 + r) % ring, in one launch; grid (nq + nkv + nkv * 2, rows).
+__attribute__((intel_reqd_sub_group_size(16)))
 __kernel void lfm3_rope_store(__global const ushort *qkv, uint stride, __global ushort *q, __global ushort *kc, __global ushort *vc,
                               __global const ushort *qw, __global const ushort *kw, __global const float *inv_freq, uint nq, uint nkv,
                               uint pos0, uint ring, float eps) {
