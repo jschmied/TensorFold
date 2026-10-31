@@ -1,0 +1,319 @@
+{
+ "description": "Cold prefill, client time to first token, one request at a time, prompt cache disabled, tensor-unit route versus mlx-vlm on the same machine and checkpoints. Medians of 2 runs after a warm-up; the binary predates the key-parallel decode attention, which does not touch prefill.",
+ "machine": "M5 Ultra",
+ "server_flags": "--prompt-cache-gib 0",
+ "rows": [
+  {
+   "checkpoint": "text4",
+   "prompt_tokens": 2048,
+   "native_ttft_s": 0.1116,
+   "mlx_ttft_s": 0.1207,
+   "native_over_mlx": 0.925,
+   "native_prefill_tok_s": 18346,
+   "mlx_prefill_tok_s": 16965,
+   "runs": [
+    2,
+    2
+   ]
+  },
+  {
+   "checkpoint": "text4",
+   "prompt_tokens": 8192,
+   "native_ttft_s": 0.3883,
+   "mlx_ttft_s": 0.3498,
+   "native_over_mlx": 1.11,
+   "native_prefill_tok_s": 21096,
+   "mlx_prefill_tok_s": 23421,
+   "runs": [
+    2,
+    2
+   ]
+  },
+  {
+   "checkpoint": "text4",
+   "prompt_tokens": 32768,
+   "native_ttft_s": 1.8289,
+   "mlx_ttft_s": 1.623,
+   "native_over_mlx": 1.127,
+   "native_prefill_tok_s": 17917,
+   "mlx_prefill_tok_s": 20189,
+   "runs": [
+    2,
+    2
+   ]
+  },
+  {
+   "checkpoint": "text4",
+   "prompt_tokens": 65536,
+   "native_ttft_s": 4.5759,
+   "mlx_ttft_s": 3.966,
+   "native_over_mlx": 1.154,
+   "native_prefill_tok_s": 14322,
+   "mlx_prefill_tok_s": 16525,
+   "runs": [
+    2,
+    2
+   ]
+  },
+  {
+   "checkpoint": "text6",
+   "prompt_tokens": 2048,
+   "native_ttft_s": 0.1164,
+   "mlx_ttft_s": 0.1239,
+   "native_over_mlx": 0.94,
+   "native_prefill_tok_s": 17590,
+   "mlx_prefill_tok_s": 16531,
+   "runs": [
+    2,
+    2
+   ]
+  },
+  {
+   "checkpoint": "text6",
+   "prompt_tokens": 8192,
+   "native_ttft_s": 0.4047,
+   "mlx_ttft_s": 0.3755,
+   "native_over_mlx": 1.078,
+   "native_prefill_tok_s": 20243,
+   "mlx_prefill_tok_s": 21815,
+   "runs": [
+    2,
+    2
+   ]
+  },
+  {
+   "checkpoint": "text6",
+   "prompt_tokens": 32768,
+   "native_ttft_s": 1.8947,
+   "mlx_ttft_s": 1.7221,
+   "native_over_mlx": 1.1,
+   "native_prefill_tok_s": 17294,
+   "mlx_prefill_tok_s": 19028,
+   "runs": [
+    2,
+    2
+   ]
+  },
+  {
+   "checkpoint": "text6",
+   "prompt_tokens": 65536,
+   "native_ttft_s": 4.7216,
+   "mlx_ttft_s": 4.1667,
+   "native_over_mlx": 1.133,
+   "native_prefill_tok_s": 13880,
+   "mlx_prefill_tok_s": 15728,
+   "runs": [
+    2,
+    2
+   ]
+  },
+  {
+   "checkpoint": "text8",
+   "prompt_tokens": 2048,
+   "native_ttft_s": 0.117,
+   "mlx_ttft_s": 0.1224,
+   "native_over_mlx": 0.956,
+   "native_prefill_tok_s": 17506,
+   "mlx_prefill_tok_s": 16727,
+   "runs": [
+    2,
+    2
+   ]
+  },
+  {
+   "checkpoint": "text8",
+   "prompt_tokens": 8192,
+   "native_ttft_s": 0.4059,
+   "mlx_ttft_s": 0.3662,
+   "native_over_mlx": 1.108,
+   "native_prefill_tok_s": 20181,
+   "mlx_prefill_tok_s": 22370,
+   "runs": [
+    2,
+    2
+   ]
+  },
+  {
+   "checkpoint": "text8",
+   "prompt_tokens": 32768,
+   "native_ttft_s": 1.8985,
+   "mlx_ttft_s": 1.6808,
+   "native_over_mlx": 1.13,
+   "native_prefill_tok_s": 17260,
+   "mlx_prefill_tok_s": 19496,
+   "runs": [
+    2,
+    2
+   ]
+  },
+  {
+   "checkpoint": "text8",
+   "prompt_tokens": 65536,
+   "native_ttft_s": 4.7106,
+   "mlx_ttft_s": 4.0889,
+   "native_over_mlx": 1.152,
+   "native_prefill_tok_s": 13913,
+   "mlx_prefill_tok_s": 16028,
+   "runs": [
+    2,
+    2
+   ]
+  },
+  {
+   "checkpoint": "vl4",
+   "prompt_tokens": 2048,
+   "native_ttft_s": 0.1123,
+   "mlx_ttft_s": 0.1248,
+   "native_over_mlx": 0.9,
+   "native_prefill_tok_s": 18240,
+   "mlx_prefill_tok_s": 16409,
+   "runs": [
+    2,
+    2
+   ]
+  },
+  {
+   "checkpoint": "vl4",
+   "prompt_tokens": 8192,
+   "native_ttft_s": 0.3914,
+   "mlx_ttft_s": 0.3559,
+   "native_over_mlx": 1.1,
+   "native_prefill_tok_s": 20930,
+   "mlx_prefill_tok_s": 23016,
+   "runs": [
+    2,
+    2
+   ]
+  },
+  {
+   "checkpoint": "vl4",
+   "prompt_tokens": 32768,
+   "native_ttft_s": 1.8454,
+   "mlx_ttft_s": 1.6447,
+   "native_over_mlx": 1.122,
+   "native_prefill_tok_s": 17756,
+   "mlx_prefill_tok_s": 19923,
+   "runs": [
+    2,
+    2
+   ]
+  },
+  {
+   "checkpoint": "vl4",
+   "prompt_tokens": 65536,
+   "native_ttft_s": 4.6079,
+   "mlx_ttft_s": 4.0125,
+   "native_over_mlx": 1.148,
+   "native_prefill_tok_s": 14222,
+   "mlx_prefill_tok_s": 16333,
+   "runs": [
+    2,
+    2
+   ]
+  },
+  {
+   "checkpoint": "vl6",
+   "prompt_tokens": 2048,
+   "native_ttft_s": 0.1163,
+   "mlx_ttft_s": 0.1305,
+   "native_over_mlx": 0.891,
+   "native_prefill_tok_s": 17604,
+   "mlx_prefill_tok_s": 15691,
+   "runs": [
+    2,
+    2
+   ]
+  },
+  {
+   "checkpoint": "vl6",
+   "prompt_tokens": 8192,
+   "native_ttft_s": 0.4045,
+   "mlx_ttft_s": 0.3761,
+   "native_over_mlx": 1.076,
+   "native_prefill_tok_s": 20254,
+   "mlx_prefill_tok_s": 21784,
+   "runs": [
+    2,
+    2
+   ]
+  },
+  {
+   "checkpoint": "vl6",
+   "prompt_tokens": 32768,
+   "native_ttft_s": 1.9001,
+   "mlx_ttft_s": 1.7187,
+   "native_over_mlx": 1.106,
+   "native_prefill_tok_s": 17245,
+   "mlx_prefill_tok_s": 19066,
+   "runs": [
+    2,
+    2
+   ]
+  },
+  {
+   "checkpoint": "vl6",
+   "prompt_tokens": 65536,
+   "native_ttft_s": 4.7136,
+   "mlx_ttft_s": 4.168,
+   "native_over_mlx": 1.131,
+   "native_prefill_tok_s": 13903,
+   "mlx_prefill_tok_s": 15724,
+   "runs": [
+    2,
+    2
+   ]
+  },
+  {
+   "checkpoint": "vl8",
+   "prompt_tokens": 2048,
+   "native_ttft_s": 0.1169,
+   "mlx_ttft_s": 0.1292,
+   "native_over_mlx": 0.905,
+   "native_prefill_tok_s": 17514,
+   "mlx_prefill_tok_s": 15852,
+   "runs": [
+    2,
+    2
+   ]
+  },
+  {
+   "checkpoint": "vl8",
+   "prompt_tokens": 8192,
+   "native_ttft_s": 0.4059,
+   "mlx_ttft_s": 0.3663,
+   "native_over_mlx": 1.108,
+   "native_prefill_tok_s": 20180,
+   "mlx_prefill_tok_s": 22366,
+   "runs": [
+    2,
+    2
+   ]
+  },
+  {
+   "checkpoint": "vl8",
+   "prompt_tokens": 32768,
+   "native_ttft_s": 1.8994,
+   "mlx_ttft_s": 1.6894,
+   "native_over_mlx": 1.124,
+   "native_prefill_tok_s": 17252,
+   "mlx_prefill_tok_s": 19397,
+   "runs": [
+    2,
+    2
+   ]
+  },
+  {
+   "checkpoint": "vl8",
+   "prompt_tokens": 65536,
+   "native_ttft_s": 4.7192,
+   "mlx_ttft_s": 4.0828,
+   "native_over_mlx": 1.156,
+   "native_prefill_tok_s": 13887,
+   "mlx_prefill_tok_s": 16052,
+   "runs": [
+    2,
+    2
+   ]
+  }
+ ]
+}
