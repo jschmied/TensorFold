@@ -152,6 +152,12 @@ pub fn snap_bytes(ptr: *anyopaque, at: u32) u64 {
     return snap.bytes(x.m, at, x.heldBelow(at));
 }
 
+/// TF_KV_SHARE: parts per million of a kept state the pool holds, pages and copied rows (all of it when paged).
+pub fn snap_kept_ppm(ptr: *anyopaque, at: u32) u32 {
+    const x = spark(ptr);
+    return if (x.m.paged and snap.bytes(x.m, at, 0) > 0) 1_000_000 else 0;
+}
+
 /// TF_KV_SHARE: the pool kept states hold pages of, which sheds them before a promise fails (null: copies).
 pub fn snap_pool(ptr: *anyopaque) ?*kv.Pool {
     const x = spark(ptr);

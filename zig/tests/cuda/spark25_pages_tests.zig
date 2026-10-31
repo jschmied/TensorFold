@@ -95,7 +95,7 @@ fn pass(gpu: Gpu, model: []const u8, paged: bool, prompts: [lens.len][]const u32
         var sequential: usize = 0;
         for (lens) |n| sequential += be.pagesFor(n, count);
         try check.expect(sequential > pool, "spark25 pages: the solo runs take more pages than the pool holds", .{});
-        try native.attach(loaded.ctx, 1, pool);
+        try native.attach(loaded.ctx, 1, pool + gb.keptPages(mark)); // TF_KV_SHARE: the kept rows
         gb.shufflePages(0x6e4);
     }
     var cfg = try lanes.Config.init(gpa, loaded.facts, loaded.rows, loaded.rows - 1);
