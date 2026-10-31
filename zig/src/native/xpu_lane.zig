@@ -116,7 +116,8 @@ pub fn Xpu(comptime S: type) type {
 
         /// What the round loop reads at setup: one stream; with a head, drafted windows of up to 16 rows.
         pub fn facts(self: *const Self) lanes.Model {
-            if (comptime seq_only) return .{ .exact_width = 1, .gpu_tokens = false, .mtp = false, .speculate = false, .speculate_early = false, .hidden_rows = self.streams > 1, .batch_rows = self.streams, .max_streams = self.streams };
+            // sequences: shared rounds (family_streams need width 2) of one-row windows, nothing drafted or copied
+            if (comptime seq_only) return .{ .exact_width = if (self.streams > 1) 2 else 1, .copy_drafts = false, .lone_copies = false, .gpu_tokens = false, .mtp = false, .speculate = false, .speculate_early = false, .hidden_rows = self.streams > 1, .batch_rows = self.streams, .max_streams = self.streams };
             if (!self.drafting()) return .{ .exact_width = 1, .gpu_tokens = false, .mtp = false, .speculate = false, .speculate_early = false, .max_streams = 1 };
             return .{
                 .exact_width = max_rows,
@@ -338,11 +339,47 @@ pub fn Xpu(comptime S: type) type {
         fn verifySeq(self: *Self, windows: []const be.Window, out: []be.Verified) !void {
             if (comptime !has_seq) unreachable;
             if (windows.len > self.streams) return error.WindowTooWide;
+            if (comptime @hasDecl(S.Engine, "stepStreams")) if (windows.len > 1) {
+                var at: usize = 0;
+                while (at < windows.len) : (at += S.Engine.max_streams) {
+                    const end = @min(windows.len, at + S.Engine.max_streams);
+                    try self.verifyStreams(windows[at..end], out[at..end]);
+                }
+                return;
+            };
             for (windows, out) |w, *o| {
                 if (w.rows() != 1 or w.parents != null) return error.WindowTooWide;
                 _ = try self.bound(w.stream);
                 if (w.positions[0] != self.e.m.pos + 1) return error.PositionMismatch;
                 o.sampled[0] = try self.stepOne(w.pending, w.stream.sampling, w.positions[0]);
+            }
+        }
+
+        /// Several streams' one-row windows as rows of one forward, each row on its own sequence and position.
+        fn verifyStreams(self: *Self, windows: []const be.Window, out: []be.Verified) !void {
+            if (comptime !(seq_only and @hasDecl(S.Engine, "stepStreams"))) unreachable;
+            const e = self.e;
+            var qs: [S.Engine.max_streams]*Seq = undefined;
+            var ids: [S.Engine.max_streams]u32 = undefined;
+            for (windows, 0..) |w, z| {
+                if (w.rows() != 1 or w.parents != null) return error.WindowTooWide;
+                const l = self.lane_of.getPtr(w.stream) orelse return error.UnknownStream;
+                if (w.positions[0] != e.posOf(l.seq) + 1) return error.PositionMismatch;
+                qs[z] = l.seq;
+                ids[z] = w.pending;
+            }
+            const n = windows.len;
+            try e.stepStreams(qs[0..n], ids[0..n]);
+            var g: [S.Engine.max_streams]i32 = undefined;
+            try e.streamTokens(g[0..n]);
+            for (windows, out, 0..) |w, *o, z| {
+                const greedy = if (w.stream.sampling) |sm| sm.temperature <= 0 else true;
+                if (greedy) {
+                    o.sampled[0] = @intCast(g[z]);
+                } else {
+                    try e.streamLogits(z, self.logits);
+                    o.sampled[0] = try draw(self.gpa, self.logits, w.stream.sampling.?, w.positions[0]);
+                }
             }
         }
 

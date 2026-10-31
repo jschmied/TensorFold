@@ -17,6 +17,8 @@ const HD: u32 = cfg.head_dim;
 const QKV: u32 = (NQ + 2 * NKV) * HD;
 const chunk: u32 = 128; // keys a split-K work-group scans
 const argmax_parts: u32 = 64;
+/// Streams one shared decode step takes as rows at most (the N-row matvecs of lfm3_mv.cl hold 8).
+pub const max_streams: u32 = 8;
 /// Without DPAS (Gen12LP) prompt projections take nem_prow_gen12: 4 outputs a sub-group, as 8 x 8 spills on Gen12LP.
 const gen12 = !xpu.kernels.dpas;
 const tile_rows: u32 = 8;
@@ -30,6 +32,7 @@ const Layer = struct { op_norm: Buf, post_op: Buf, ffn_norm: Buf, post_ffn: Buf,
 
 const Kernels = struct {
     embed: rt.Kernel,
+    embed_tok: rt.Kernel,
     qmv: rt.Kernel,
     head: rt.Kernel,
     am_part: rt.Kernel,
@@ -46,6 +49,10 @@ const Kernels = struct {
     qkvg: rt.Kernel,
     w13: rt.Kernel,
     rope_store: rt.Kernel,
+    bf_n: rt.Kernel,
+    f32_n: rt.Kernel,
+    w13_n: rt.Kernel,
+    qkvg_n: rt.Kernel,
 };
 
 /// One stream's state: each conv layer's last six B*x rows, each attention layer's KV slots, and its position.
@@ -142,6 +149,7 @@ pub const Model = struct {
         var vm = try r.module(xpu.kernels.lfm3_mv);
         const k: Kernels = .{
             .embed = try bm.kernel("embed4", .{ 64, 1, 1 }),
+            .embed_tok = try bm.kernel("embed4_tok", .{ 64, 1, 1 }),
             .qmv = try am.kernel("qmv4_bf", .{ 64, 1, 1 }),
             .head = try am.kernel("qmv4_f32", .{ 64, 1, 1 }),
             .am_part = try am.kernel("argmax_partial", .{ 256, 1, 1 }),
@@ -158,6 +166,10 @@ pub const Model = struct {
             .qkvg = try vm.kernel("qmv4_bf_x4", .{ 64, 1, 1 }),
             .w13 = try vm.kernel("qmv4_swiglu", .{ 64, 1, 1 }),
             .rope_store = try fm.kernel("lfm3_rope_store", .{ 64, 1, 1 }),
+            .bf_n = try vm.kernel("qmv4_bf_n", .{ 64, 1, 1 }),
+            .f32_n = try vm.kernel("qmv4_f32_n", .{ 64, 1, 1 }),
+            .w13_n = try vm.kernel("qmv4_swiglu_n", .{ 64, 1, 1 }),
+            .qkvg_n = try vm.kernel("qmv4_bf_x4_n", .{ 64, 1, 1 }),
         };
         const maxc = (cap + chunk - 1) / chunk;
         const w: usize = max_rows;
@@ -177,9 +189,9 @@ pub const Model = struct {
             .po = try l.empty(w * NQ * maxc * HD * 4),
             .pm = try l.empty(w * NQ * maxc * 4),
             .pl = try l.empty(w * NQ * maxc * 4),
-            .logits = try l.empty(@as(usize, V) * 4),
-            .am_scratch = try l.empty(argmax_parts * 8),
-            .am_out = try l.empty(4),
+            .logits = try l.empty(@as(usize, max_streams) * V * 4),
+            .am_scratch = try l.empty(max_streams * argmax_parts * 8),
+            .am_out = try l.empty(max_streams * 4),
         };
         const ns = try namespace(l);
         const layers = try gpa.alloc(Layer, cfg.layers);
@@ -403,8 +415,12 @@ pub const Model = struct {
         if (n == 0 or n > m.max_rows) return error.Invalid;
         if (m.pos + n > m.cap) return error.ContextFull;
         const s = &m.s;
-        try m.r.upload(s.ids, std.mem.sliceAsBytes(ids));
-        try run(&m.k.embed, .{ n, 1, 1 }, .{ m.emb.w, m.emb.s, m.emb.b, s.ids, s.x, H });
+        if (n == 1) { // the id as a kernel argument: the queue reads no host memory a decode step's caller may reuse
+            try run(&m.k.embed_tok, .{ 1, 1, 1 }, .{ m.emb.w, m.emb.s, m.emb.b, ids[0], s.x, H });
+        } else { // the queue copies the ids later: a prompt's ids live as long as its stream
+            try m.r.upload(s.ids, std.mem.sliceAsBytes(ids));
+            try run(&m.k.embed, .{ n, 1, 1 }, .{ m.emb.w, m.emb.s, m.emb.b, s.ids, s.x, H });
+        }
         try run(&m.k.rms, .{ n, 1, 1 }, .{ s.x, m.layers[0].op_norm, s.xn, H, cfg.eps });
         for (m.layers, 0..) |*ly, i| {
             try m.mixer(ly, i, n);
@@ -438,6 +454,70 @@ pub const Model = struct {
             try m.forward(ids[i .. i + n], i + n == ids.len, h);
             i += n;
         }
+    }
+
+    /// The live position of `q` (the bound stream's is `pos`).
+    pub fn posOf(m: *const Model, q: *const Seq) u32 {
+        return if (q == m.seq) m.pos else q.pos;
+    }
+
+    /// One decode step of several streams as rows of one forward (weights read once, conv and attention per stream).
+    pub fn forwardStreams(m: *Model, qs: []const *Seq, ids: []const u32) !void {
+        const n: u32 = @intCast(ids.len);
+        if (n == 0 or n > max_streams or qs.len != n) return error.Invalid;
+        m.seq.pos = m.pos;
+        for (qs) |q| if (q.pos + 1 > m.cap) return error.ContextFull;
+        const s = &m.s;
+        for (ids, 0..) |id, z| try run(&m.k.embed_tok, .{ 1, 1, 1 }, .{ m.emb.w, m.emb.s, m.emb.b, id, from(s.x, z * H * 2), H });
+        try run(&m.k.rms, .{ n, 1, 1 }, .{ s.x, m.layers[0].op_norm, s.xn, H, cfg.eps });
+        for (m.layers, 0..) |*ly, li| {
+            switch (ly.mixer) {
+                .conv => |c| {
+                    try run(&m.k.bf_n, .{ 3 * H / 4, 1, 1 }, .{ c.in.w, c.in.s, c.in.b, s.xn, s.proj, H, 3 * H, n, 3 * H, @as(u32, 0) });
+                    for (qs, 0..) |q, z| try run(&m.k.conv, .{ H / 64, 1, 1 }, .{ from(s.proj, z * 3 * H * 2), 3 * H, q.conv[li], q.conv[li], c.cw, from(s.att, z * H * 2), @as(u32, 1), H });
+                    try run(&m.k.bf_n, .{ H / 4, 1, 1 }, .{ c.out.w, c.out.s, c.out.b, s.att, s.d, H, H, n, H, @as(u32, 0) });
+                },
+                .attn => |a| {
+                    try run(&m.k.qkvg_n, .{ (QKV + NQ + 3) / 4, 1, 1 }, .{ a.q.w, a.q.s, a.q.b, s.qkv, NQ * HD, @as(u32, 0), QKV, a.k.w, a.k.s, a.k.b, s.qkv, NKV * HD, NQ * HD, QKV, a.v.w, a.v.s, a.v.b, s.qkv, NKV * HD, (NQ + NKV) * HD, QKV, a.g.w, a.g.s, a.g.b, s.g, NQ, @as(u32, 0), NQ, s.xn, H, n });
+                    const inv = if (a.window == 0) m.inv_full else m.inv_slide;
+                    const scale: f32 = 1.0 / @sqrt(@as(f32, HD));
+                    for (qs, 0..) |q, z| {
+                        const pos = q.pos;
+                        const qz = from(s.q, z * NQ * HD * 2);
+                        try run(&m.k.rope_store, .{ NQ + NKV + NKV * HD / 64, 1, 1 }, .{ from(s.qkv, z * QKV * 2), QKV, qz, q.kc[li], q.vc[li], a.qn, a.kn, inv, NQ, NKV, pos, a.ring, cfg.eps });
+                        const span = if (a.window == 0) pos + 1 else @min(pos + 1, a.window);
+                        try run(&m.k.part, .{ NKV, (span + chunk - 1) / chunk, 1 }, .{ qz, q.kc[li], q.vc[li], s.po, s.pm, s.pl, pos, chunk, a.ring, a.window, NKV, m.maxc, scale });
+                        try run(&m.k.merge, .{ NQ, 1, 1 }, .{ s.po, s.pm, s.pl, from(s.g, z * NQ * 2), from(s.att, z * NQ * HD * 2), pos, chunk, a.window, NQ, m.maxc });
+                    }
+                    try run(&m.k.bf_n, .{ H / 4, 1, 1 }, .{ a.o.w, a.o.s, a.o.b, s.att, s.d, NQ * HD, H, n, H, @as(u32, 0) });
+                },
+            }
+            try run(&m.k.pan, .{ n, 1, 1 }, .{ s.d, s.x, ly.post_op, ly.ffn_norm, s.xn, H, cfg.eps });
+            try run(&m.k.w13_n, .{ FF / 4, 1, 1 }, .{ ly.w1.w, ly.w1.s, ly.w1.b, ly.w3.w, ly.w3.s, ly.w3.b, s.xn, s.act, H, FF, n });
+            try run(&m.k.bf_n, .{ H / 4, 1, 1 }, .{ ly.w2.w, ly.w2.s, ly.w2.b, s.act, s.d, FF, H, n, H, @as(u32, 0) });
+            const next = if (li + 1 < m.layers.len) m.layers[li + 1].op_norm else m.norm_f;
+            try run(&m.k.pan, .{ n, 1, 1 }, .{ s.d, s.x, ly.post_ffn, next, s.xn, H, cfg.eps });
+        }
+        try run(&m.k.f32_n, .{ V / 4, 1, 1 }, .{ m.emb.w, m.emb.s, m.emb.b, s.xn, s.logits, H, V, n });
+        const per = (V + argmax_parts - 1) / argmax_parts;
+        try run(&m.k.am_part, .{ argmax_parts, n, 1 }, .{ s.logits, s.am_scratch, V, per });
+        try run(&m.k.am_fin, .{ n, 1, 1 }, .{ s.am_scratch, s.am_out, argmax_parts });
+        for (qs) |q| q.pos += 1;
+        m.pos = m.seq.pos;
+    }
+
+    /// The greedy tokens of the last forwardStreams, a row each.
+    pub fn streamTokens(m: *Model, out: []i32) !void {
+        try m.r.sync();
+        try m.r.download(std.mem.sliceAsBytes(out), m.s.am_out);
+        try m.r.sync();
+    }
+
+    /// Row z's logits of the last forwardStreams.
+    pub fn streamLogits(m: *Model, z: usize, out: []f32) !void {
+        try m.r.sync();
+        try m.r.download(std.mem.sliceAsBytes(out[0..V]), from(m.s.logits, z * V * 4));
+        try m.r.sync();
     }
 
     /// The greedy token of the last forward with logits.

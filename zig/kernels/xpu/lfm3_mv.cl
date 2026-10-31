@@ -69,3 +69,112 @@ __kernel void qmv4_swiglu(__global const uint *w1, __global const ushort *s1, __
     const float u = bf(to_bf(qmv_row(w3, s3, b3, x, row, in_dim)));
     if (get_sub_group_local_id() == 0) act[row] = to_bf(bf(to_bf(a / (1.0f + exp(-a)))) * u);
 }
+
+// N rows (n <= MAXN) a weight row: qmv_row's words in each lane's order, unpacked once, each row summed as qmv_row.
+#define MAXN 8
+inline void qmv_rows(__global const uint *w, __global const ushort *scales, __global const ushort *biases, __global const ushort *x,
+                     uint x_stride, uint n, uint row, uint in_dim, float *out) {
+    const uint lane = get_sub_group_local_id();
+    const uint words = in_dim / 8;
+    const uint groups = in_dim / 64;
+    float acc[MAXN];
+#pragma unroll
+    for (uint r = 0; r < MAXN; r++) acc[r] = 0.0f;
+    for (uint wi = lane; wi < words; wi += 16) {
+        const uint g = wi / 8;
+        const float sc = bf(scales[row * groups + g]);
+        const float bi = bf(biases[row * groups + g]);
+        const uint pk = w[row * words + wi];
+#pragma unroll
+        for (uint r = 0; r < MAXN; r++) {
+            if (r < n) {
+                const float8 xv = as_float8(convert_uint8(vload8(wi, x + r * x_stride)) << 16);
+                float dot = 0.0f, sx = 0.0f;
+                dot += xv.s0 * (float)(pk & 15u);          sx += xv.s0;
+                dot += xv.s1 * (float)((pk >> 4) & 15u);   sx += xv.s1;
+                dot += xv.s2 * (float)((pk >> 8) & 15u);   sx += xv.s2;
+                dot += xv.s3 * (float)((pk >> 12) & 15u);  sx += xv.s3;
+                dot += xv.s4 * (float)((pk >> 16) & 15u);  sx += xv.s4;
+                dot += xv.s5 * (float)((pk >> 20) & 15u);  sx += xv.s5;
+                dot += xv.s6 * (float)((pk >> 24) & 15u);  sx += xv.s6;
+                dot += xv.s7 * (float)((pk >> 28) & 15u);  sx += xv.s7;
+                acc[r] += sc * dot + bi * sx;
+            }
+        }
+    }
+#pragma unroll
+    for (uint r = 0; r < MAXN; r++) out[r] = sub_group_reduce_add(acc[r]);
+}
+
+// qmv4_bf over n rows: y[z * y_stride + y_off + row] for row z of x (in_dim apart); 4 weight rows a work-group.
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel void qmv4_bf_n(__global const uint *w, __global const ushort *s, __global const ushort *b, __global const ushort *x, __global ushort *y,
+                        uint in_dim, uint rows, uint n, uint y_stride, uint y_off) {
+    const uint row = get_group_id(0) * 4 + get_sub_group_id();
+    if (row >= rows) return;
+    float acc[MAXN];
+    qmv_rows(w, s, b, x, in_dim, n, row, in_dim, acc);
+    if (get_sub_group_local_id() == 0)
+        for (uint z = 0; z < n; z++) y[z * y_stride + y_off + row] = to_bf(acc[z]);
+}
+
+// qmv4_f32 over n rows (the tied head): y[z * rows + row], x rows in_dim apart.
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel void qmv4_f32_n(__global const uint *w, __global const ushort *s, __global const ushort *b, __global const ushort *x, __global float *y,
+                         uint in_dim, uint rows, uint n) {
+    const uint row = get_group_id(0) * 4 + get_sub_group_id();
+    if (row >= rows) return;
+    float acc[MAXN];
+    qmv_rows(w, s, b, x, in_dim, n, row, in_dim, acc);
+    if (get_sub_group_local_id() == 0)
+        for (uint z = 0; z < n; z++) y[z * rows + row] = acc[z];
+}
+
+// qmv4_swiglu over n rows: act[z * rows + row].
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel void qmv4_swiglu_n(__global const uint *w1, __global const ushort *s1, __global const ushort *b1, __global const uint *w3, __global const ushort *s3,
+                            __global const ushort *b3, __global const ushort *x, __global ushort *act, uint in_dim, uint rows, uint n) {
+    const uint row = get_group_id(0) * 4 + get_sub_group_id();
+    if (row >= rows) return;
+    float a1[MAXN], a3[MAXN];
+    qmv_rows(w1, s1, b1, x, in_dim, n, row, in_dim, a1);
+    qmv_rows(w3, s3, b3, x, in_dim, n, row, in_dim, a3);
+    if (get_sub_group_local_id() == 0)
+        for (uint z = 0; z < n; z++) {
+            const float a = bf(to_bf(a1[z]));
+            const float u = bf(to_bf(a3[z]));
+            act[z * rows + row] = to_bf(bf(to_bf(a / (1.0f + exp(-a)))) * u);
+        }
+}
+
+// qmv4_bf_x4 over n rows: table t's row lands at yt[z * st + ot + row].
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel void qmv4_bf_x4_n(__global const uint *w0, __global const ushort *s0, __global const ushort *b0, __global ushort *y0, uint r0, uint o0, uint st0,
+                           __global const uint *w1, __global const ushort *s1, __global const ushort *b1, __global ushort *y1, uint r1, uint o1, uint st1,
+                           __global const uint *w2, __global const ushort *s2, __global const ushort *b2, __global ushort *y2, uint r2, uint o2, uint st2,
+                           __global const uint *w3, __global const ushort *s3, __global const ushort *b3, __global ushort *y3, uint r3, uint o3, uint st3,
+                           __global const ushort *x, uint in_dim, uint n) {
+    uint row = get_group_id(0) * 4 + get_sub_group_id();
+    float acc[MAXN];
+    __global ushort *y;
+    uint st;
+    if (row < r0) {
+        qmv_rows(w0, s0, b0, x, in_dim, n, row, in_dim, acc);
+        y = y0 + o0;
+        st = st0;
+    } else if ((row -= r0) < r1) {
+        qmv_rows(w1, s1, b1, x, in_dim, n, row, in_dim, acc);
+        y = y1 + o1;
+        st = st1;
+    } else if ((row -= r1) < r2) {
+        qmv_rows(w2, s2, b2, x, in_dim, n, row, in_dim, acc);
+        y = y2 + o2;
+        st = st2;
+    } else if ((row -= r2) < r3) {
+        qmv_rows(w3, s3, b3, x, in_dim, n, row, in_dim, acc);
+        y = y3 + o3;
+        st = st3;
+    } else return;
+    if (get_sub_group_local_id() == 0)
+        for (uint z = 0; z < n; z++) y[z * st + row] = to_bf(acc[z]);
+}

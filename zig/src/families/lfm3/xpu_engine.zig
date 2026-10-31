@@ -123,6 +123,26 @@ pub const Engine = struct {
         try e.m.forward(&.{token}, true, null);
     }
 
+    /// Streams one shared decode step takes at most.
+    pub const max_streams = model.max_streams;
+
+    /// The next token of each stream in `qs` as the rows of one forward, each at its own position.
+    pub fn stepStreams(e: *Engine, qs: []const *Sequence, tokens: []const u32) !void {
+        try e.m.forwardStreams(qs, tokens);
+    }
+
+    pub fn posOf(e: *const Engine, q: *const Sequence) u32 {
+        return e.m.posOf(q);
+    }
+
+    pub fn streamTokens(e: *Engine, out: []i32) !void {
+        try e.m.streamTokens(out);
+    }
+
+    pub fn streamLogits(e: *Engine, z: usize, out: []f32) !void {
+        try e.m.streamLogits(z, out);
+    }
+
     pub fn snapBytes(e: *const Engine, at: u32) u64 {
         return e.m.snapBytes(at);
     }

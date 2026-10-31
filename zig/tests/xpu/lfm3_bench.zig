@@ -42,6 +42,36 @@ pub fn main(init: std.process.Init) !void {
         tok = try m.argmax();
     }
     const dec = @as(f64, @floatFromInt(nowNs() - t0)) / 1e9;
+    const streams: usize = if (args.len > 4) try std.fmt.parseInt(usize, args[4], 10) else 1;
+    if (streams > 1) { // the shared decode step of `streams` streams (32-token prompts), 32 steps
+        var qs: [8]*lfm3.model.Seq = undefined;
+        var toks: [8]u32 = undefined;
+        for (qs[0..streams], toks[0..streams], 0..) |*q, *t, z| {
+            q.* = try m.newSeq();
+            m.bind(q.*);
+            try m.reset();
+            try m.prefill(ids[z * 32 ..][0..32], null);
+            t.* = try m.argmax();
+        }
+        var row: [8]i32 = undefined;
+        const s0 = nowNs();
+        for (0..32) |_| {
+            try m.forwardStreams(qs[0..streams], toks[0..streams]);
+            try m.streamTokens(row[0..streams]);
+            for (toks[0..streams], row[0..streams]) |*t, v| t.* = @intCast(v);
+        }
+        const sec = @as(f64, @floatFromInt(nowNs() - s0)) / 1e9;
+        std.debug.print("{d} streams in shared steps: {d:.1} ms a step, {d:.1} tok/s aggregate, {d:.1} a stream\n", .{ streams, sec / 32 * 1e3, 32 * @as(f64, @floatFromInt(streams)) / sec, 32 / sec });
+        if (std.c.getenv("LFM3_PROF") != null) {
+            @import("xpu").rt.prof_on = true;
+            for (0..8) |_| {
+                try m.forwardStreams(qs[0..streams], toks[0..streams]);
+                try m.streamTokens(row[0..streams]);
+            }
+            @import("xpu").rt.prof_on = false;
+            @import("xpu").rt.profDump("8 shared steps");
+        }
+    }
     if (std.c.getenv("LFM3_PROF") != null) { // 16 more steps with a sync around every launch: device time by kernel
         @import("xpu").rt.prof_on = true;
         for (0..16) |_| {

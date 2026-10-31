@@ -150,7 +150,7 @@ fn openFamily(comptime S: type, a: Allocator, gpa: Allocator, io: std.Io, o: api
     h.core = lanes.Engine.init(gpa, &h.cfg, h.backend.backend(), h.clock.clock());
     const note = try S.note(a, h.engine);
     h.startup = try std.fmt.allocPrint(gpa, "Intel GPU engine: {s}, {d:.2} GB on the device, context {d}{s}; {d} stream(s) a round on the lane core, sampling on the host", .{ h.ctx.name(), @as(f64, @floatFromInt(xpu.rt.alloc_now)) / 1e9, window, note, h.backend.streams });
-    const drafted = facts.exact_width > 1;
+    const drafted = facts.exact_width > 1 and !seq_only;
     const sequenced = drafted or seq_only;
     h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = S.name, .lanes = h.backend.streams, .context_window = @intCast(window), .context_fitted = true, .startup = h.startup, .prefill_step = if (sequenced) S.promptRows(h.engine) else 0 });
     // kept prompt states (with sequences): --prompt-cache-gib, else 4 GiB, inside the device memory left past 2 GiB
