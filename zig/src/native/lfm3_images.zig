@@ -23,13 +23,13 @@ pub const Vision = struct {
         v.gpa.destroy(v);
     }
 
-    pub fn encode(ptr: *anyopaque, stream: *const tf.lanes.Stream, from: usize) !?q.image_rows.Images {
+    pub fn encode(ptr: *anyopaque, stream: *const tf.lanes.Stream, from: usize, to: usize) !?q.image_rows.Images {
         const v: *Vision = @ptrCast(@alignCast(ptr));
         try q.image.validate(stream.images, stream.prompt().len, v.capacity, v.max_images);
         v.spans.clearRetainingCapacity();
         var used: u32 = 0;
         for (stream.images) |img| {
-            if (@as(usize, img.at) + img.tokens <= from) continue;
+            if (@as(usize, img.at) + img.tokens <= from or img.at >= to) continue;
             if (img.tokens > v.capacity -| used) return error.ImageTooLarge;
             try v.tower.image(v.model.queue, img.pixels, img.gh, img.gw, .{
                 .buf = v.rows,

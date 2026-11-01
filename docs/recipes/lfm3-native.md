@@ -156,6 +156,9 @@ prefix, and verification windows of 2 to 32 rows must equal their reference byte
 Both options are required for a larger batch, and release-version builds reject them.
 Cache marks retain their existing 128-row policy and can split a larger batch. Cancellation and background yield
 are checked at chunk boundaries; a 2048-row chunk remains one atomic forward pass.
+The server fills prompts one chunk at a time (`prefill_step`), so the lane host runs the shortest remaining prompt next
+and decodes live streams between chunks instead of finishing every queued prompt first. Where a prompt is cut does
+not change its state (`tf-lfm3-nax-exact`).
 
 Kernel-contract probes: `metal LFM3 NAX prompt q{4,6,8}g64`, `q4g32` and `metal LFM3 split structural full|sliding`,
 each with planted controls (`zig build tf-kernel-contract`, `--only "LFM3 NAX prompt"`).
