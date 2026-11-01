@@ -4,6 +4,7 @@ const mtl = @import("metal");
 const sources = @import("kernel_sources");
 const c = @import("config.zig");
 const lanes = @import("lanes");
+const spec = @import("vision_spec.zig");
 
 pub const Provider = struct {
     ctx: *anyopaque,
@@ -11,7 +12,7 @@ pub const Provider = struct {
     prepare: *const fn (*anyopaque, *const lanes.Stream, usize, usize) anyerror!?Images,
 };
 
-pub const Span = struct { at: u32, rows: u32, source: u32 };
+pub const Span = spec.Span;
 pub const Images = struct {
     buffer: mtl.Buffer,
     pipeline: mtl.Pipeline,
@@ -19,12 +20,10 @@ pub const Images = struct {
 
     pub fn encode(images: Images, e: mtl.ComputeEncoder, out: mtl.Buffer, at: usize, rows: usize) !void {
         for (images.spans) |span| {
-            const first = @max(at, span.at);
-            const end = @min(at + rows, @as(usize, span.at) + span.rows);
-            if (first >= end) continue;
-            const n = end - first;
-            const src = (@as(usize, span.source) + first - span.at) * c.hidden * 2;
-            const dst = (first - at) * c.hidden * 2;
+            const part = spec.overlap(span, at, rows) orelse continue;
+            const n = part.rows;
+            const src = part.source * c.hidden * 2;
+            const dst = part.row * c.hidden * 2;
             const bytes = n * c.hidden * 2;
             if (src > images.buffer.length() or bytes > images.buffer.length() - src or
                 dst > out.length() or bytes > out.length() - dst) return error.BadLfm3ImageRows;
