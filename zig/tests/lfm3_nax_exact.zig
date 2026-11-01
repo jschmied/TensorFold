@@ -1,4 +1,4 @@
-//! Real-weight LFM3 tensor-unit prompt route: chunk-boundary identity, resumed == fresh, and windows against one-row decode.
+//! Real-weight LFM3 tensor-unit prompt route: chunk seams, resumed == fresh, and windows against one-row decode.
 const std = @import("std");
 const mtl = @import("metal");
 const q = @import("tensorfold").lfm3;
@@ -107,7 +107,7 @@ fn resumed(m: *q.Model, gpa: std.mem.Allocator, scratch: *st.Scratch, length: us
     try equal(&fresh, &restored);
 }
 
-/// A window of `rows` verified in one pass equals the same rows decoded one at a time, after a prompt on the served route.
+/// A window of `rows` verified in one pass equals the same rows decoded one at a time, after a served-route prompt.
 fn window(m: *q.Model, gpa: std.mem.Allocator, scratch: *st.Scratch, wide: *st.Scratch, solo: *st.Scratch, prefix: usize, rows: usize) !void {
     const ids = try tokens(gpa, prefix + rows + 1);
     defer gpa.free(ids);
