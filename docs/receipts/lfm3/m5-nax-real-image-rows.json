@@ -1,0 +1,50 @@
+{
+ "image": "real photograph, 14x20 patch grid, 70 projected rows of width 2048",
+ "device": "Apple M5 Ultra",
+ "comparison": "native tower and projector rows vs ideal-FP64 independent graph (BF16 stage rounding) and official MLX BF16 rows, same FP32 patches",
+ "widths": {
+  "4-bit": {
+   "rows": 70,
+   "width": 2048,
+   "native_vs_fp64_rms": 0.0005607575567752688,
+   "mlx_bf16_vs_fp64_rms": 0.0006883479542354507,
+   "native_vs_fp64_max": 0.005889892578125,
+   "mlx_bf16_vs_fp64_max": 0.01220703125,
+   "native_vs_mlx_rms": 0.0006063439462996948,
+   "rms_of_values": 0.035402888030430735,
+   "native_equals_mlx_words": 16376,
+   "values": 143360,
+   "per_row_rms_ratio_median": 0.9644206576600263,
+   "rows_native_worse": 32
+  },
+  "6-bit": {
+   "rows": 70,
+   "width": 2048,
+   "native_vs_fp64_rms": 0.0006593466304518665,
+   "mlx_bf16_vs_fp64_rms": 0.0005571313128873913,
+   "native_vs_fp64_max": 0.015380859375,
+   "mlx_bf16_vs_fp64_max": 0.009765625,
+   "native_vs_mlx_rms": 0.000553790297256664,
+   "rms_of_values": 0.03521816533568131,
+   "native_equals_mlx_words": 16677,
+   "values": 143360,
+   "per_row_rms_ratio_median": 1.0655651420016579,
+   "rows_native_worse": 46
+  },
+  "8-bit": {
+   "rows": 70,
+   "width": 2048,
+   "native_vs_fp64_rms": 0.0006593466304518665,
+   "mlx_bf16_vs_fp64_rms": 0.0005571313128873913,
+   "native_vs_fp64_max": 0.015380859375,
+   "mlx_bf16_vs_fp64_max": 0.009765625,
+   "native_vs_mlx_rms": 0.000553790297256664,
+   "rms_of_values": 0.03521816533568131,
+   "native_equals_mlx_words": 16677,
+   "values": 143360,
+   "per_row_rms_ratio_median": 1.0655651420016579,
+   "rows_native_worse": 46
+  }
+ },
+ "note": "6- and 8-bit checkpoints share one tower, so their rows are identical; teacher-forced text from these rows is in m5-nax-route-fidelity.json"
+}

@@ -10,6 +10,13 @@ The receipt includes artifact/checkpoint pins, exact input and output hashes, ti
 These are native text-context checks, including VL checkpoints; they do not establish image-context, FP64 or comparative speed acceptance.
 The earlier 20-request snapshot remains in `current-m5-long-context-partial.json`.
 
+## Tensor-unit route gates (M5 Ultra)
+
+- [`m5-nax-exactness.json`](m5-nax-exactness.json): prompt cuts, resume and verification windows against their one-pass references, byte for byte, at all six widths.
+- [`m5-nax-serving-lifecycle.json`](m5-nax-serving-lifecycle.json): served drafted/plain, concurrent/solo, cache, image and cancellation checks at all six widths, plus cancellation and concurrency with 31k-token prompts.
+- [`m5-nax-real-image-rows.json`](m5-nax-real-image-rows.json): native projected rows of a real photograph against an independent FP64 graph and official MLX BF16.
+- [`m5-nax-32k-fidelity.json`](m5-nax-32k-fidelity.json): 32768-token prompt boundary and 16 teacher-forced rows against independent FP32 and official MLX BF16, for the tensor-unit and the earlier prompt route.
+
 These receipts cover native LFM3-1.7B and LFM3-VL-2B from the official MLX exports.
 They distinguish implementation checks from the still-required maintainer model/performance gate.
 Checkpoint revisions and run instructions are in the [family recipe](../../recipes/lfm3-native.md).
