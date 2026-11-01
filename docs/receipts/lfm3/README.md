@@ -145,6 +145,8 @@ All 60 concurrent-to-solo comparisons and all eight serial checks matched.
 Small decode-rate differences are descriptive; they are not a separately established speedup.
 
 Earlier standard-server comparisons still showed MLX-VLM faster, especially for long cold prefill.
+[`m5-text-slice-vs-mlx.json`](m5-text-slice-vs-mlx.json) measures this slice alone against mlx-vlm at all three widths:
+cold prefill is about a tenth of its rate. The stacked LFM3-VL PR carries the prompt and attention speed work.
 The faster arithmetic-changing matrix candidate failed the strict no-worse precision comparison and was excluded.
 The slower uniform-exponential candidate was also excluded. No unvalidated GQA experiment is enabled.
 
