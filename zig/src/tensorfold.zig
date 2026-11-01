@@ -11,6 +11,8 @@ pub const qwen_vl = @import("core/qwen_vl/qwen_vl.zig");
 pub const qwen_vl_tower = @import("core/qwen_vl/metal.zig");
 /// Qwen-Image-2.1's transformer on Metal: a denoiser driven by tf-qwen-image, outside the lane engine.
 pub const qwen_image = @import("families/qwen_image/qwen_image.zig");
+/// MOSS-Image's transformer on Metal: a denoiser driven by tf-moss-image, outside the lane engine.
+pub const moss_image = @import("families/moss_image/moss_image.zig");
 pub const checkpoint = @import("core/checkpoint_metal.zig");
 pub const shard_edit = @import("core/shard_edit.zig");
 pub const lora_merge = @import("core/lora_merge_dir.zig");
@@ -30,6 +32,8 @@ pub const exlr8 = @import("core/exlr8.zig");
 pub const exlr8_projection = @import("core/exlr8_projection.zig");
 pub const exlr8_dense_gpu = @import("core/exlr8_dense_gpu.zig");
 pub const exlr8_prompt = @import("core/exlr8_prompt.zig");
+/// The two-Mac pair seam's row split: the transport, its layout and the one-Mac Loopback the stage-2 checks use.
+pub const pair_rows = @import("core/pair_rows.zig");
 pub const glm_dsa = @import("families/glm_dsa/glm_dsa.zig");
 pub const nemotron = @import("families/nemotron/nemotron.zig");
 pub const flashnext_vision_contract = @import("families/flashnext/vision_contract.zig");
@@ -54,6 +58,7 @@ pub const qwen35 = @import("families/qwen3_5/qwen3_5.zig");
 pub const gemma4 = @import("families/gemma4/gemma4.zig");
 pub const step5 = @import("families/step5/step5.zig");
 pub const spark25_metal = @import("families/spark25/metal.zig");
+pub const minimax_m3 = @import("families/minimax_m3/minimax_m3.zig");
 pub const lfm2_moe = @import("families/lfm2_moe/lfm2_moe.zig");
 pub const flashnext_pack = @import("families/flashnext/pack.zig");
 pub const lfm3 = @import("families/lfm3/lfm3.zig");
@@ -68,6 +73,7 @@ test {
     _ = @import("families/nemotron/prefill_kernels.zig"); // Compile the prompt-chunk sources in tests.
     _ = @import("families/nemotron/simd_attention.zig"); // The pre-M5 attention rewrite finds its lines.
     _ = @import("families/nemotron/weights.zig");
+    _ = @import("families/nemotron/zero_budget_test.zig");
     _ = @import("families/nemotron/kernels.zig");
     _ = @import("families/nemotron/living_test.zig"); // saved lessons and their routers, beside the shards
     _ = @import("families/nemotron/pocket_shards_test.zig"); // learned neurons in the shards themselves
@@ -88,9 +94,11 @@ test {
     _ = @import("families/qwen3_5/backend.zig");
     _ = @import("families/step5/step5.zig");
     _ = @import("families/spark25/metal.zig");
+    _ = @import("families/minimax_m3/minimax_m3.zig");
     _ = @import("families/lfm2_moe/config.zig");
     _ = @import("families/lfm2_moe/backend.zig");
     _ = @import("families/lfm2_moe/state.zig");
+    _ = @import("families/lfm2_moe/dspark_test.zig");
 }
 
 pub const lane_projection = @import("core/lane_projection.zig");

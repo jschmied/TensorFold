@@ -427,6 +427,7 @@ test {
     _ = mtp;
     _ = native;
     _ = @import("cuda_snap.zig");
+    _ = @import("cuda_disk.zig");
     _ = @import("cuda_pages.zig");
     _ = @import("cuda_kv_lanes.zig");
     _ = @import("cuda_config.zig");
@@ -436,6 +437,7 @@ test {
     _ = @import("cuda_rank_memory.zig");
     _ = @import("cuda_rank_wire.zig");
     _ = @import("cuda_modelopt_experts.zig");
+    _ = @import("cuda_modelopt_threads.zig");
     _ = row_path;
     _ = @import("cuda_mtp_check.zig");
     _ = @import("cuda_draft_affine.zig");
@@ -460,6 +462,7 @@ pub const fn_back = @import("cuda_fn_back.zig");
 pub const gradient_gate = @import("cuda_gradient_gate.zig");
 test {
     _ = gradient_gate;
+    _ = @import("rope_yarn_core_test.zig");
 }
 
 test "prompt tiles retain per-operation ownership" {

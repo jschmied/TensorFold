@@ -57,8 +57,7 @@ pub const Run = struct {
     force_pipe: mtl.Pipeline = undefined,
     span_pipe: mtl.Pipeline = undefined,
     positions_pipe: mtl.Pipeline = undefined,
-    draw_pipe: mtl.Pipeline = undefined, // tf_sample_full: a sampled reply's draws (sample.zig)
-    draw_ids_pipe: mtl.Pipeline = undefined, // tf_sample_full_ids: a sampled stream's drafts over the draft head's ids
+    draws: @import("sample.zig").Draws = undefined, // a sampled reply's draws, and a sampled stream's drafts over the head's ids
     take_pipe: mtl.Pipeline = undefined,
     gpu_round: bool = false,
     ar: Buf = undefined,
@@ -113,6 +112,7 @@ pub const Run = struct {
     tree: ?*@import("tree.zig").Tree = null, // the tree window decode is running, if any (tree.zig)
     limit: ?Buf = null, // a GPU-gated window's or head step's row count for the 4-bit row kernels (gate.zig)
     head_md1: ?Buf = null, // a gated head step's one-row dims, in place of the head's own
+    head_draw: ?@import("sample.zig").HeadDraw = null, // a sampled reply's head step drafts by its keyed rule
     gx: ?*@import("gx.zig").Gx = null, // FZ_GX=rows: windows from that many rows on the grouped experts (gx.zig)
     xnew_header: []const u8 = "",
     tp: ?*Tp2 = null, // TP=2 across two Macs (tp.zig): the target layers' experts split by id, outputs exchanged

@@ -45,6 +45,14 @@ pub fn hostTests(b: *std.Build, family: *std.Build.Step) void {
     const nvfp4 = b.addRunArtifact(b.addTest(.{ .root_module = nvfp4_module }));
     b.step("test-drama-nvfp4-reference-host", "NVFP4 scalar reference and reduced-accumulator discrimination").dependOn(&nvfp4.step);
     step.dependOn(&nvfp4.step);
+    const nemotron = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/nemotron_experts_contract_host.zig"),
+        .target = b.graph.host,
+        .optimize = .debug,
+        .imports = &.{.{ .name = "contract", .module = module(b, b.graph.host, .debug) }},
+    }) }));
+    b.step("test-nemotron-experts-contract-host", "Nemotron routed-expert tables, float64 steps, stress and controls").dependOn(&nemotron.step);
+    step.dependOn(&nemotron.step);
     const shared_gate = b.addRunArtifact(b.addTest(.{ .root_module = nvfp4_module, .filters = &.{"shared gate stress"} }));
     b.step("test-drama-combine-stress-host", "Shared-gate stress remains discriminating after nonlinear output").dependOn(&shared_gate.step);
 }
@@ -86,5 +94,14 @@ pub fn cuda(b: *std.Build, runner: *std.Build.Step.Compile, controls: ?std.Build
     const run = b.addRunArtifact(runner);
     run.addArg("kernel-contract");
     b.step("kernel-contract", "Every registered CUDA kernel through the contract's gates on this GPU, each control red").dependOn(&run.step);
+    const prefill_many = b.addRunArtifact(runner);
+    prefill_many.addArg("qmm-prefill-many-contract");
+    b.step("qmm-prefill-many-contract", "GB10 bit-exact multi-projection prompt launch against separate launches").dependOn(&prefill_many.step);
+    const prefill_tile22 = b.addRunArtifact(runner);
+    prefill_tile22.addArg("qmm-prefill-tile22-contract");
+    b.step("qmm-prefill-tile22-contract", "GB10 large-prompt 2x2 tile against the default tile").dependOn(&prefill_tile22.step);
+    const prefill_many_bench = b.addRunArtifact(runner);
+    prefill_many_bench.addArg("qmm-prefill-many-bench");
+    b.step("qmm-prefill-many-bench", "Same-process A-B-A screening for the GB10 prompt launch fusion").dependOn(&prefill_many_bench.step);
     return install;
 }

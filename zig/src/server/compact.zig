@@ -52,7 +52,14 @@ pub fn reserveTokens(window: i64, at: CompactAt) i64 {
 }
 
 pub fn noteBudgetTokens(window: i64, at: CompactAt) i64 {
-    return @min(8192, @max(1, @divTrunc(reserveTokens(window, at) * 4, 5)));
+    return @min(8192, @max(1, @divTrunc(reserveInWindow(window, at) * 4, 5)));
+}
+
+/// Auto's 16384 floor applies only while the window holds it; a smaller window reserves fifteen percent.
+fn reserveInWindow(window: i64, at: CompactAt) i64 {
+    const reserve = reserveTokens(window, at);
+    if (at != .auto or reserve < window) return reserve;
+    return @max(@as(i64, 1), @divTrunc(window * 15, 100));
 }
 
 pub fn keepTokens(window: u32, override: ?u32) usize {
@@ -71,7 +78,7 @@ fn threshold(window: i64, f: f64) i64 {
 fn over(prompt: usize, max_out: i64, window: i64, at: CompactAt) bool {
     const sum = @as(i64, @intCast(prompt)) + @max(0, max_out);
     return switch (at) {
-        .auto => sum > window - reserveTokens(window, at),
+        .auto => sum > window - reserveInWindow(window, at),
         .fraction => |f| sum > threshold(window, f),
     };
 }
@@ -348,9 +355,21 @@ fn roleOf(m: Value) []const u8 {
     return if (r == .string) r.string else "";
 }
 
-fn contentOf(m: Value) []const u8 {
+/// A message's words: its content string, or its text parts joined with nothing between them.
+fn contentOf(a: Allocator, m: Value) Allocator.Error![]const u8 {
     const c = m.get("content") orelse return "";
-    return if (c == .string) c.string else "";
+    if (c == .string) return c.string;
+    if (c != .array) return "";
+    var buf: std.ArrayList(u8) = .empty;
+    for (c.array) |part| {
+        if (part != .object) continue;
+        const kind = part.get("type") orelse continue;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "text")) continue;
+        const t = part.get("text") orelse continue;
+        if (t != .string) continue;
+        try buf.appendSlice(a, t.string);
+    }
+    return buf.items;
 }
 
 fn isLead(m: Value) bool {
@@ -380,9 +399,9 @@ fn findMarker(msgs: []const Value) ?usize {
 fn markerBody(m: Value) ?[]const u8 {
     const r = roleOf(m);
     if (!std.mem.eql(u8, r, "system") and !std.mem.eql(u8, r, "user") and !std.mem.eql(u8, r, "developer")) return null;
-    const c = contentOf(m);
-    if (!std.mem.startsWith(u8, c, marker_line)) return null;
-    var rest = c[marker_line.len..];
+    const c = m.get("content") orelse return null;
+    if (c != .string or !std.mem.startsWith(u8, c.string, marker_line)) return null;
+    var rest = c.string[marker_line.len..];
     if (std.mem.startsWith(u8, rest, "\n")) rest = rest[1..];
     return rest;
 }
@@ -457,7 +476,7 @@ fn lineOf(a: Allocator, m: Value) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     try buf.appendSlice(a, roleOf(m));
     try buf.appendSlice(a, ": ");
-    try buf.appendSlice(a, contentOf(m));
+    try buf.appendSlice(a, try contentOf(a, m));
     try appendCalls(a, &buf, m);
     return buf.items;
 }
