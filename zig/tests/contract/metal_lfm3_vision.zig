@@ -55,7 +55,11 @@ pub const Probe = struct {
         return null;
     }
     pub fn init(a: std.mem.Allocator, device: mtl.Device, queue: mtl.Queue, kind: Kind) !Probe {
-        return .{ .a = a, .arena = .init(a), .rig = .{ .a = a, .device = device, .queue = queue }, .kind = kind, .pipeline = try rig_.pipeline(device, if (kind == .image_rows) sources.lfm3_image_rows else sources.lfm3_vision, symbol(kind)) };
+        return initWith(a, device, queue, kind, if (kind == .image_rows) sources.lfm3_image_rows else sources.lfm3_vision);
+    }
+    /// The probe over a kernel text other than production's, as a planted control builds it.
+    pub fn initWith(a: std.mem.Allocator, device: mtl.Device, queue: mtl.Queue, kind: Kind, text: []const u8) !Probe {
+        return .{ .a = a, .arena = .init(a), .rig = .{ .a = a, .device = device, .queue = queue }, .kind = kind, .pipeline = try rig_.pipeline(device, text, symbol(kind)) };
     }
     pub fn deinit(p: *Probe) void {
         p.arena.deinit();
