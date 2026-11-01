@@ -125,11 +125,11 @@ Structured output requires the native grammar library; logprobs and video are no
 A complete earlier global M5 contract run found one Qwen4 failure that also reproduces on the unchanged pinned base.
 It is not a final-source global pass. Agree model-fidelity and performance gates on #1491 before claiming release readiness.
 
-## Development-default tensor-unit routes
+## Opt-in tensor-unit routes
 
-Development builds enable `lfm3-nax-prompt`, `lfm3-tiled-attention` and 2048 prompt rows by default on tensor-unit
-devices. On devices without tensor units serving uses 128 rows and the existing kernels. Release-version builds
-default to the existing path and reject either option when explicitly enabled. These remain draft routes; model
+`lfm3-nax-prompt`, `lfm3-tiled-attention` and 2048 prompt rows are off in every build, so a source build and a release
+serve a checkpoint with the same arithmetic. Enabling them is a development option on tensor-unit devices; release-version
+builds reject it. These remain draft routes; model
 fidelity is judged against an independent FP32 forward and the official MLX BF16 run, as agreed on
 [#1491](https://github.com/ashhart/TensorFold/issues/1491#issuecomment-6537143418), not against float64.
 
@@ -149,12 +149,12 @@ key-parallel kernel, so a window equals the same rows decoded one at a time: eac
 into at most 64 contiguous parts of at least 128 keys, merged in FP32. Both kernels replay a row through the exact
 attention path when its result is nonfinite, so nonfinite classes follow float64. Underflow and overflow of the FP32
 softmax follow MLX, not the earlier extended-range repair.
-To select the prior development baseline, build with `-Dlfm3-nax-prompt=false -Dlfm3-tiled-attention=false`.
+Without them the build keeps the row kernels, decode attention and 128-row chunks.
 `tf-lfm3-nax-exact MODEL_DIR` checks these routes on real weights: prompts cut at many offsets, resumed from a saved
 prefix, and verification windows of 2 to 32 rows must equal their reference byte for byte.
 
-`-Dlfm3-prompt-rows=128`, `256`, or `2048` selects the development prompt batch; its tensor-unit default is 2048.
-Both options are required for a larger batch, and release-version builds reject them.
+`-Dlfm3-prompt-rows=128`, `256`, or `2048` selects the development prompt batch; it is 2048 when both options above
+are enabled and 128 otherwise. Both options are required for a larger batch, and release-version builds reject them.
 Cache marks retain their existing 128-row policy and can split a larger batch. Cancellation and background yield
 are checked at chunk boundaries; a 2048-row chunk remains one atomic forward pass.
 The server fills prompts one chunk at a time (`prefill_step`), so the lane host runs the shortest remaining prompt next
