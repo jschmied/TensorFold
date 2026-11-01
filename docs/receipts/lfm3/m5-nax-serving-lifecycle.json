@@ -2,6 +2,7 @@
  "tool": "tools/lfm3/serve_check.py --cancel --sampled",
  "server": "--context 2048 --parallel 4 --prompt-cache-gib 0",
  "device": "Apple M5 Ultra",
+ "scheduling": "prompts fill one 2048-row chunk at a time; the engine runs the shortest remaining prompt first and decodes between chunks",
  "widths": {
   "LFM3-1.7B-MLX-4bit": {
    "counts": {
@@ -9,7 +10,7 @@
     "failed": 0,
     "skipped": 0
    },
-   "binary_sha256": "4c4151dde5bc1f5c450185ca8bee33feedc5078e0d512333ec2101f61470037a",
+   "binary_sha256": "b99ed8e30333822c28c21b45ebb2b35feb4b9b3d97c64b19b00d540aae5a2f2f",
    "checks": {
     "fresh_plain": 6,
     "length_over_256": 1,
@@ -28,12 +29,12 @@
    "long_context": {
     "server_context": 40000,
     "prompt_tokens": 31178,
-    "cold_prefill_s": 1.583,
+    "cold_prefill_s": 1.557,
     "idle_small_request_s": 0.031,
     "cancel_mid_prefill": [
      {
       "cancel_after_s": 0.3,
-      "next_request_s": 0.041,
+      "next_request_s": 0.04,
       "next_output_equals_fresh": true
      },
      {
@@ -47,9 +48,9 @@
       "next_output_equals_fresh": true
      }
     ],
-    "small_request_during_three_30k_prefills_s": 3.26,
+    "small_request_during_three_30k_prefills_s": 0.67,
     "that_output_equals_fresh": true,
-    "three_30k_prefills_wall_s": 4.77,
+    "three_30k_prefills_wall_s": 4.64,
     "server_exit_clean": true
    }
   },
@@ -59,7 +60,7 @@
     "failed": 0,
     "skipped": 0
    },
-   "binary_sha256": "4c4151dde5bc1f5c450185ca8bee33feedc5078e0d512333ec2101f61470037a",
+   "binary_sha256": "b99ed8e30333822c28c21b45ebb2b35feb4b9b3d97c64b19b00d540aae5a2f2f",
    "checks": {
     "fresh_plain": 6,
     "length_over_256": 1,
@@ -78,28 +79,28 @@
    "long_context": {
     "server_context": 40000,
     "prompt_tokens": 31178,
-    "cold_prefill_s": 1.639,
-    "idle_small_request_s": 0.034,
+    "cold_prefill_s": 1.608,
+    "idle_small_request_s": 0.036,
     "cancel_mid_prefill": [
      {
       "cancel_after_s": 0.3,
-      "next_request_s": 0.044,
+      "next_request_s": 0.045,
       "next_output_equals_fresh": true
      },
      {
       "cancel_after_s": 1.0,
-      "next_request_s": 0.044,
+      "next_request_s": 0.045,
       "next_output_equals_fresh": true
      },
      {
       "cancel_after_s": 2.0,
-      "next_request_s": 0.044,
+      "next_request_s": 0.045,
       "next_output_equals_fresh": true
      }
     ],
-    "small_request_during_three_30k_prefills_s": 3.45,
+    "small_request_during_three_30k_prefills_s": 0.67,
     "that_output_equals_fresh": true,
-    "three_30k_prefills_wall_s": 4.95,
+    "three_30k_prefills_wall_s": 4.81,
     "server_exit_clean": true
    }
   },
@@ -109,7 +110,7 @@
     "failed": 0,
     "skipped": 0
    },
-   "binary_sha256": "4c4151dde5bc1f5c450185ca8bee33feedc5078e0d512333ec2101f61470037a",
+   "binary_sha256": "b99ed8e30333822c28c21b45ebb2b35feb4b9b3d97c64b19b00d540aae5a2f2f",
    "checks": {
     "fresh_plain": 6,
     "length_over_256": 1,
@@ -128,12 +129,12 @@
    "long_context": {
     "server_context": 40000,
     "prompt_tokens": 31178,
-    "cold_prefill_s": 1.66,
+    "cold_prefill_s": 1.621,
     "idle_small_request_s": 0.037,
     "cancel_mid_prefill": [
      {
       "cancel_after_s": 0.3,
-      "next_request_s": 0.046,
+      "next_request_s": 0.045,
       "next_output_equals_fresh": true
      },
      {
@@ -147,9 +148,9 @@
       "next_output_equals_fresh": true
      }
     ],
-    "small_request_during_three_30k_prefills_s": 3.46,
+    "small_request_during_three_30k_prefills_s": 0.68,
     "that_output_equals_fresh": true,
-    "three_30k_prefills_wall_s": 4.96,
+    "three_30k_prefills_wall_s": 4.84,
     "server_exit_clean": true
    }
   },
@@ -159,7 +160,7 @@
     "failed": 0,
     "skipped": 0
    },
-   "binary_sha256": "4c4151dde5bc1f5c450185ca8bee33feedc5078e0d512333ec2101f61470037a",
+   "binary_sha256": "b99ed8e30333822c28c21b45ebb2b35feb4b9b3d97c64b19b00d540aae5a2f2f",
    "checks": {
     "fresh_plain": 10,
     "length_over_256": 1,
@@ -181,28 +182,28 @@
    "long_context": {
     "server_context": 40000,
     "prompt_tokens": 31178,
-    "cold_prefill_s": 1.605,
-    "idle_small_request_s": 0.032,
+    "cold_prefill_s": 1.599,
+    "idle_small_request_s": 0.033,
     "cancel_mid_prefill": [
      {
       "cancel_after_s": 0.3,
-      "next_request_s": 0.041,
+      "next_request_s": 0.042,
       "next_output_equals_fresh": true
      },
      {
       "cancel_after_s": 1.0,
-      "next_request_s": 0.041,
+      "next_request_s": 0.042,
       "next_output_equals_fresh": true
      },
      {
       "cancel_after_s": 2.0,
-      "next_request_s": 0.041,
+      "next_request_s": 0.042,
       "next_output_equals_fresh": true
      }
     ],
-    "small_request_during_three_30k_prefills_s": 3.29,
+    "small_request_during_three_30k_prefills_s": 0.73,
     "that_output_equals_fresh": true,
-    "three_30k_prefills_wall_s": 4.8,
+    "three_30k_prefills_wall_s": 4.77,
     "server_exit_clean": true
    }
   },
@@ -212,7 +213,7 @@
     "failed": 0,
     "skipped": 0
    },
-   "binary_sha256": "4c4151dde5bc1f5c450185ca8bee33feedc5078e0d512333ec2101f61470037a",
+   "binary_sha256": "b99ed8e30333822c28c21b45ebb2b35feb4b9b3d97c64b19b00d540aae5a2f2f",
    "checks": {
     "fresh_plain": 10,
     "length_over_256": 1,
@@ -234,12 +235,12 @@
    "long_context": {
     "server_context": 40000,
     "prompt_tokens": 31178,
-    "cold_prefill_s": 1.657,
-    "idle_small_request_s": 0.035,
+    "cold_prefill_s": 1.61,
+    "idle_small_request_s": 0.036,
     "cancel_mid_prefill": [
      {
       "cancel_after_s": 0.3,
-      "next_request_s": 0.043,
+      "next_request_s": 0.045,
       "next_output_equals_fresh": true
      },
      {
@@ -253,9 +254,9 @@
       "next_output_equals_fresh": true
      }
     ],
-    "small_request_during_three_30k_prefills_s": 3.43,
+    "small_request_during_three_30k_prefills_s": 0.76,
     "that_output_equals_fresh": true,
-    "three_30k_prefills_wall_s": 4.94,
+    "three_30k_prefills_wall_s": 4.81,
     "server_exit_clean": true
    }
   },
@@ -265,7 +266,7 @@
     "failed": 0,
     "skipped": 0
    },
-   "binary_sha256": "4c4151dde5bc1f5c450185ca8bee33feedc5078e0d512333ec2101f61470037a",
+   "binary_sha256": "b99ed8e30333822c28c21b45ebb2b35feb4b9b3d97c64b19b00d540aae5a2f2f",
    "checks": {
     "fresh_plain": 10,
     "length_over_256": 1,
@@ -287,12 +288,12 @@
    "long_context": {
     "server_context": 40000,
     "prompt_tokens": 31178,
-    "cold_prefill_s": 1.653,
+    "cold_prefill_s": 1.618,
     "idle_small_request_s": 0.037,
     "cancel_mid_prefill": [
      {
       "cancel_after_s": 0.3,
-      "next_request_s": 0.043,
+      "next_request_s": 0.046,
       "next_output_equals_fresh": true
      },
      {
@@ -302,13 +303,13 @@
      },
      {
       "cancel_after_s": 2.0,
-      "next_request_s": 0.047,
+      "next_request_s": 0.046,
       "next_output_equals_fresh": true
      }
     ],
-    "small_request_during_three_30k_prefills_s": 3.44,
+    "small_request_during_three_30k_prefills_s": 0.68,
     "that_output_equals_fresh": true,
-    "three_30k_prefills_wall_s": 4.95,
+    "three_30k_prefills_wall_s": 4.83,
     "server_exit_clean": true
    }
   }
