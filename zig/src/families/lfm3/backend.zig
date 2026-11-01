@@ -101,7 +101,7 @@ pub const Metal = struct {
     }
 
     pub fn backend(self: *Metal) be.Backend {
-        return .{ .ptr = self, .vtable = &.{ .prefill = prefillFn, .prefill_step = prefillStepFn, .cancel_prefill = cancelPrefillFn, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .release = releaseFn, .reports_fill = true } };
+        return .{ .ptr = self, .vtable = &.{ .prefill = prefillFn, .prefill_step = prefillStepFn, .cancel_prefill = cancelPrefillFn, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .release = releaseFn, .reports_fill = true }, .chunk_invariant = true };
     }
 
     fn cast(ptr: *anyopaque) *Metal {
@@ -124,15 +124,15 @@ pub const Metal = struct {
         const self = cast(ptr);
         try self.open(stream, true);
         errdefer self.drop(stream);
-        while (!try self.chunk(stream, true)) {}
+        while (!try self.chunk(stream, true, 0)) {}
     }
 
-    /// One chunk of the prompt pass, true once the prompt's last row's logits are written.
-    fn prefillStepFn(ptr: *anyopaque, stream: *lanes.Stream) !bool {
+    /// One chunk of the prompt pass of at most `max_rows` rows (0: the engine's cut); true once the last row is done.
+    fn prefillStepFn(ptr: *anyopaque, stream: *lanes.Stream, max_rows: u32) !bool {
         const self = cast(ptr);
         if (!self.fills.contains(stream)) try self.open(stream, false);
         errdefer self.drop(stream);
-        return self.chunk(stream, false);
+        return self.chunk(stream, false, max_rows);
     }
 
     fn cancelPrefillFn(ptr: *anyopaque, stream: *lanes.Stream) !void {
@@ -171,12 +171,13 @@ pub const Metal = struct {
         releaseFn(self, stream);
     }
 
-    fn chunk(self: *Metal, stream: *lanes.Stream, interruptible: bool) !bool {
+    fn chunk(self: *Metal, stream: *lanes.Stream, interruptible: bool, max_rows: u32) !bool {
         const ids = stream.prompt();
         const cache = try self.cacheOf(stream);
         const at = self.fills.get(stream) orelse return error.UnknownLfmStream;
         if (interruptible) try prefill_control.before(stream, at) else try prefill_control.cancelled(stream, at);
-        var end: usize = @min(ids.len, at + self.options.chunk);
+        const rows: usize = if (max_rows == 0) self.options.chunk else @min(self.options.chunk, max_rows);
+        var end: usize = @min(ids.len, at + rows);
         for (stream.chunks) |boundary| if (boundary > at) {
             end = @min(end, boundary);
             break;

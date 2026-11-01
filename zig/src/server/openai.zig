@@ -152,7 +152,7 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
         input.temperature = if (t == .float) t.float else std.fmt.parseFloat(f64, t.int) catch 0;
     };
     const sampling = try json.newObject(cx.a);
-    for ([_][]const u8{ "temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty", "seed", "priority", "model", "draft", "thinking_budget", "ignore_eos", "return_token_ids", "stop" } ++ grammar.fields) |k| if (body.get(k)) |v| try sampling.put(cx.a, k, v);
+    for ([_][]const u8{ "temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty", "seed", "priority", "model", "draft", "thinking_budget", "ignore_eos", "return_token_ids", "stop", "grammar_budget" } ++ grammar.fields) |k| if (body.get(k)) |v| try sampling.put(cx.a, k, v);
     try grammar.refusal(cx, body);
     if (input.tools.len > 0 and try tool_specs.choiceRequiresCall(cx.a, body.get("tool_choice"))) try sampling.put(cx.a, "tool_call_required", .{ .bool = true });
     if (body.field("parallel_tool_calls")) |p| if (p == .bool and !p.bool) try sampling.put(cx.a, "tool_call_single", .{ .bool = true });
@@ -323,6 +323,7 @@ const Run = struct {
     fn extras(r: *Run, o: *json.Object, reply: *const chat.Reply) Allocator.Error!void {
         try o.put(r.a, "exact_mode", .{ .string = "exact" });
         if (reply.stop_sequence) |s| try o.put(r.a, "stop_sequence", .{ .string = s });
+        if (r.srv.config.spark_stats) try @import("spark_wire.zig").add(r.a, reply);
         try o.put(r.a, "tensorfold", reply.runtime);
         try o.put(r.a, "speculative", reply.speculative);
         if (r.turn) |t| try o.put(r.a, "cortheon", try t.summary(r.a));
@@ -433,6 +434,7 @@ const Run = struct {
         try o.put(a, "choices", .{ .array = list });
         try o.put(a, "usage", try r.usage(reply));
         try r.extras(o, reply);
+        if (reply.loop_stop) |period| try o.put(a, "error", try @import("loop_stop.zig").errorBody(a, period));
     }
 
     const StreamSink = struct {
@@ -566,7 +568,10 @@ const Run = struct {
                 r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
                 const deltas = tool_parse.deltas(a, calls.?) catch return;
                 for (deltas) |d| r.emit(r.chunk(d, null) catch return) catch return;
-            } else if (reply.content.len > 0 and !r.streamed_prose) {
+            }
+            // Replaying calls does not account for envelopes retained as content.
+            if (reply.content.len > 0 and r.prose_sent.items.len == 0) {
+                if (calls == null) r.prose() catch return;
                 r.emit(r.chunk(.{ .string = reply.content }, null) catch return) catch return;
             } else if (r.plan.policy.kept(reply.content, r.prose_sent.items)) |rest| {
                 r.emit(r.chunk(.{ .string = rest }, null) catch return) catch return;
@@ -584,6 +589,7 @@ const Run = struct {
             u.object.put(a, "usage", use) catch return;
             r.emit(u) catch return;
         }
+        if (reply.loop_stop) |period| r.emit(wrapError(a, @import("loop_stop.zig").errorBody(a, period) catch return) catch return) catch return;
         r.out.vt.event(r.out.ctx, null) catch {};
         r.warmNext(&reply, calls);
     }

@@ -1,23 +1,9 @@
 //! tf-kernel-contract: every registered Metal kernel through gates 1-4, the planted controls, then gate 5's limits.
-const postnorm = @import("metal_lfm3_postnorm.zig");
 const std = @import("std");
 const mtl = @import("metal");
 const tf = @import("tensorfold");
 const contract = @import("contract");
-const lfm3_nax = @import("metal_lfm3_nax.zig");
-const lfm3 = @import("metal_lfm3.zig");
-const lfm3_tiled = @import("metal_lfm3_tiled.zig");
-const lfm3_split = @import("metal_lfm3_split.zig");
-const lfm3_vision = @import("metal_lfm3_vision.zig");
-const lfm3_sums = @import("metal_lfm3_sums.zig");
-const lfm3_attention_sums = @import("metal_lfm3_attention_sums.zig");
-const lfm3_dual = @import("metal_lfm3_dual.zig");
-const lfm3_segments = @import("metal_lfm3_segments.zig");
-const lfm3_risk_fast = @import("metal_lfm3_risk_fast.zig");
-const lfm3_alpha = @import("metal_lfm3_alpha.zig");
-const lfm3_conv_segments = @import("metal_lfm3_conv_segments.zig");
-const binned_projection = @import("metal_binned_projection.zig");
-const lfm3_projection = @import("metal_lfm3_projection.zig");
+const lfm3_suite_k = @import("metal_lfm3_suite.zig");
 const rows_k = @import("metal_rows.zig");
 const affine_k = @import("metal_affine.zig");
 const topk_k = @import("metal_topk.zig");
@@ -32,6 +18,9 @@ const drama_combine = @import("metal_drama_combine.zig");
 const drama_cfg = @import("metal_drama_cfg.zig");
 const glm_eh_k = @import("metal_glm_eh.zig");
 const glm_rows_k = @import("metal_glm_rows.zig");
+const pair_k = @import("metal_pair.zig");
+const pair_controls = @import("metal_pair_controls.zig");
+const minimax_k = @import("metal_minimax.zig");
 
 const flash_pool = @import("metal_flashnext_pool.zig");
 const flash = @import("metal_flashnext.zig");
@@ -39,6 +28,10 @@ const fsr = @import("metal_fsr.zig");
 const gemma = @import("metal_gemma4.zig");
 const gemma_embed = @import("metal_gemma4_embed.zig");
 const gemma_mixed = @import("metal_gemma4_mixed.zig");
+const lfm2_argmax = @import("metal_lfm2_argmax.zig");
+const lfm2_streams = @import("metal_lfm2_streams.zig");
+const lfm2_tap = @import("metal_lfm2_tap.zig");
+const lfm2_controls = @import("metal_lfm2_controls.zig");
 const g = contract.gates;
 const usage = "usage: tf-kernel-contract [--only TEXT] [--no-gates] [--no-limits] [--offline DIR] [--seed N] [--repro] [--rotary-long] [--rotary-accuracy FILE]";
 
@@ -141,201 +134,9 @@ pub fn main(init: std.process.Init) !u8 {
         gemma_list.deinit(a);
     }
     var kernels: std.ArrayList(g.Kernel) = .empty;
-    var nax_probes: [lfm3_nax.formats.len + 2]lfm3_nax.Probe = undefined;
-    var nax_count: usize = 0;
-    defer for (nax_probes[0..nax_count]) |*probe| probe.deinit();
-    if (tensor) for (lfm3_nax.formats, 0..) |f, i| for (std.enums.values(lfm3_nax.Fault)) |fault| {
-        if (fault != .none and i != 0) continue;
-        if (!wanted(o, try lfm3_nax.name(a, f.bits, f.group, fault))) continue;
-        nax_probes[nax_count] = try lfm3_nax.Probe.init(a, device, queue, f.bits, f.group, fault);
-        nax_count += 1;
-    };
-    for (nax_probes[0..nax_count]) |*probe| try kernels.append(a, probe.kernel());
-    var tiled_probes: [4]lfm3_tiled.Probe = undefined;
-    var tiled_count: usize = 0;
-    defer for (tiled_probes[0..tiled_count]) |*probe| probe.deinit();
-    for ([_]bool{ false, true }) |sliding| for (std.enums.values(lfm3_tiled.Fault)) |fault| {
-        if (sliding and fault != .none or !wanted(o, lfm3_tiled.name(sliding, fault))) continue;
-        if (!tensor) {
-            std.debug.print("SKIP {s}: requires tensor units\n", .{lfm3_tiled.name(sliding, fault)});
-            continue;
-        }
-        tiled_probes[tiled_count] = try lfm3_tiled.Probe.init(a, device, queue, sliding, fault);
-        tiled_count += 1;
-    };
-    for (tiled_probes[0..tiled_count]) |*probe| try kernels.append(a, probe.kernel());
-    var split_probes: [4]lfm3_split.Probe = undefined;
-    var split_count: usize = 0;
-    defer for (split_probes[0..split_count]) |*probe| probe.deinit();
-    for ([_]bool{ false, true }) |sliding| for (std.enums.values(lfm3_split.Fault)) |fault| {
-        if (sliding and fault != .none or !wanted(o, lfm3_split.name(sliding, fault))) continue;
-        split_probes[split_count] = try lfm3_split.Probe.init(a, device, queue, sliding, fault);
-        split_count += 1;
-    };
-    for (split_probes[0..split_count]) |*probe| try kernels.append(a, probe.kernel());
-    var lfm3_probes: [std.enums.values(lfm3.Kind).len]lfm3.Probe = undefined;
-    var lfm3_count: usize = 0;
-    defer for (lfm3_probes[0..lfm3_count]) |*probe| probe.deinit();
-    for (std.enums.values(lfm3.Kind)) |kind| {
-        if (!wanted(o, lfm3.name(kind))) continue;
-        lfm3_probes[lfm3_count] = try lfm3.Probe.init(a, device, queue, kind);
-        lfm3_count += 1;
-    }
-    for (lfm3_probes[0..lfm3_count]) |*probe| try kernels.append(a, probe.kernel());
-    var lfm3_dual_probes: [8]lfm3_dual.Probe = undefined;
-    var lfm3_dual_count: usize = 0;
-    defer for (lfm3_dual_probes[0..lfm3_dual_count]) |*probe| probe.deinit();
-    for ([_]u8{ 4, 6, 8 }) |bits| for ([_]usize{ 32, 64 }) |group| {
-        const name = try lfm3_dual.label(a, bits, group, .none);
-        defer a.free(name);
-        if (!wanted(o, name)) continue;
-        lfm3_dual_probes[lfm3_dual_count] = try lfm3_dual.Probe.init(a, device, queue, bits, group, .none);
-        lfm3_dual_count += 1;
-    };
-    for ([_]lfm3_dual.Fault{ .second, .tail }) |fault| {
-        const name = try lfm3_dual.label(a, 4, 64, fault);
-        defer a.free(name);
-        if (!wanted(o, name)) continue;
-        lfm3_dual_probes[lfm3_dual_count] = try lfm3_dual.Probe.init(a, device, queue, 4, 64, fault);
-        lfm3_dual_count += 1;
-    }
-    for (lfm3_dual_probes[0..lfm3_dual_count]) |*probe| try kernels.append(a, probe.kernel());
-    var postnorm_probes: [2]postnorm.Probe = undefined;
-    var postnorm_count: usize = 0;
-    defer for (postnorm_probes[0..postnorm_count]) |*probe| probe.deinit();
-    for ([_]bool{ false, true }) |bad| {
-        if (!wanted(o, postnorm.name(bad))) continue;
-        postnorm_probes[postnorm_count] = try postnorm.Probe.init(a, device, queue, bad);
-        postnorm_count += 1;
-    }
-    for (postnorm_probes[0..postnorm_count]) |*probe| try kernels.append(a, probe.kernel());
-    var lfm3_risk_probes: [2]lfm3_risk_fast.Probe = undefined;
-    var lfm3_risk_count: usize = 0;
-    defer for (lfm3_risk_probes[0..lfm3_risk_count]) |*probe| probe.deinit();
-    for ([_]bool{ false, true }) |sliding| {
-        if (!wanted(o, lfm3_risk_fast.name(sliding))) continue;
-        lfm3_risk_probes[lfm3_risk_count] = try lfm3_risk_fast.Probe.init(a, device, queue, sliding);
-        lfm3_risk_count += 1;
-    }
-    for (lfm3_risk_probes[0..lfm3_risk_count]) |*probe| try kernels.append(a, probe.kernel());
-    var lfm3_skip_probe: ?lfm3_alpha.SkipProbe = null;
-    defer if (lfm3_skip_probe) |*probe| probe.deinit();
-    if (wanted(o, lfm3_alpha.skip_name)) {
-        lfm3_skip_probe = try lfm3_alpha.SkipProbe.init(a, device, queue);
-        try kernels.append(a, lfm3_skip_probe.?.kernel());
-    }
-    var lfm3_clear_probe: ?lfm3_alpha.ClearProbe = null;
-    defer if (lfm3_clear_probe) |*probe| probe.deinit();
-    if (wanted(o, lfm3_alpha.clear_name)) {
-        lfm3_clear_probe = try lfm3_alpha.ClearProbe.init(a, device, queue);
-        try kernels.append(a, lfm3_clear_probe.?.kernel());
-    }
-    var lfm3_overflow_probe: ?lfm3_alpha.OverflowProbe = null;
-    defer if (lfm3_overflow_probe) |*probe| probe.deinit();
-    if (wanted(o, lfm3_alpha.overflow_name)) {
-        lfm3_overflow_probe = try lfm3_alpha.OverflowProbe.init(a, device, queue);
-        try kernels.append(a, lfm3_overflow_probe.?.kernel());
-    }
-    var lfm3_weight_probe: ?lfm3_alpha.NonfiniteWeightProbe = null;
-    defer if (lfm3_weight_probe) |*probe| probe.deinit();
-    if (wanted(o, lfm3_alpha.nonfinite_weight_name)) {
-        lfm3_weight_probe = try lfm3_alpha.NonfiniteWeightProbe.init(a, device, queue);
-        try kernels.append(a, lfm3_weight_probe.?.kernel());
-    }
-    var lfm3_product_probe: ?lfm3_alpha.ProductProbe = null;
-    defer if (lfm3_product_probe) |*probe| probe.deinit();
-    if (wanted(o, lfm3_alpha.product_name)) {
-        lfm3_product_probe = try lfm3_alpha.ProductProbe.init(a, device, queue);
-        try kernels.append(a, lfm3_product_probe.?.kernel());
-    }
-    var lfm3_alpha_probe: ?lfm3_alpha.Probe = null;
-    defer if (lfm3_alpha_probe) |*probe| probe.deinit();
-    if (wanted(o, lfm3_alpha.name)) {
-        lfm3_alpha_probe = try lfm3_alpha.Probe.init(a, device, queue);
-        try kernels.append(a, lfm3_alpha_probe.?.kernel());
-    }
-    var lfm3_shared_probes: [3]lfm3_segments.Probe = undefined;
-    var lfm3_shared_count: usize = 0;
-    defer for (lfm3_shared_probes[0..lfm3_shared_count]) |*probe| probe.deinit();
-    for ([_]bool{ false, true }) |sliding| for ([_]bool{ false, true }) |bad| {
-        if (sliding and bad or !wanted(o, lfm3_segments.name(sliding, bad))) continue;
-        lfm3_shared_probes[lfm3_shared_count] = try lfm3_segments.Probe.init(a, device, queue, sliding, bad);
-        lfm3_shared_count += 1;
-    };
-    for (lfm3_shared_probes[0..lfm3_shared_count]) |*probe| try kernels.append(a, probe.kernel());
-    var lfm3_conv_probes: [2]lfm3_conv_segments.Probe = undefined;
-    var lfm3_conv_count: usize = 0;
-    defer for (lfm3_conv_probes[0..lfm3_conv_count]) |*probe| probe.deinit();
-    for ([_]bool{ false, true }) |bad| {
-        if (!wanted(o, lfm3_conv_segments.name(bad))) continue;
-        lfm3_conv_probes[lfm3_conv_count] = try lfm3_conv_segments.Probe.init(a, device, queue, bad);
-        lfm3_conv_count += 1;
-    }
-    for (lfm3_conv_probes[0..lfm3_conv_count]) |*probe| try kernels.append(a, probe.kernel());
-    var lfm3_image_probes: [std.enums.values(lfm3_vision.Kind).len]lfm3_vision.Probe = undefined;
-    var lfm3_image_count: usize = 0;
-    defer for (lfm3_image_probes[0..lfm3_image_count]) |*probe| probe.deinit();
-    for (std.enums.values(lfm3_vision.Kind)) |kind| {
-        if (!wanted(o, lfm3_vision.name(kind))) continue;
-        lfm3_image_probes[lfm3_image_count] = try lfm3_vision.Probe.init(a, device, queue, kind);
-        lfm3_image_count += 1;
-    }
-    for (lfm3_image_probes[0..lfm3_image_count]) |*probe| try kernels.append(a, probe.kernel());
-    var lfm3_sum_probes: [8]lfm3_sums.Probe = undefined;
-    var lfm3_sum_count: usize = 0;
-    defer for (lfm3_sum_probes[0..lfm3_sum_count]) |*probe| probe.deinit();
-    for (std.enums.values(lfm3_sums.Kind)) |kind| for ([_]bool{ false, true }) |bad| {
-        if (!wanted(o, lfm3_sums.name(kind, bad))) continue;
-        lfm3_sum_probes[lfm3_sum_count] = try lfm3_sums.Probe.init(a, device, queue, kind, bad);
-        lfm3_sum_count += 1;
-    };
-    for (lfm3_sum_probes[0..lfm3_sum_count]) |*probe| try kernels.append(a, probe.kernel());
-    var lfm3_attention_probes: [std.enums.values(lfm3_attention_sums.Kind).len * 2]lfm3_attention_sums.Probe = undefined;
-    var lfm3_attention_count: usize = 0;
-    defer for (lfm3_attention_probes[0..lfm3_attention_count]) |*probe| probe.deinit();
-    for (std.enums.values(lfm3_attention_sums.Kind)) |kind| for ([_]bool{ false, true }) |bad| {
-        if (!wanted(o, lfm3_attention_sums.name(kind, bad))) continue;
-        lfm3_attention_probes[lfm3_attention_count] = try lfm3_attention_sums.Probe.init(a, device, queue, kind, bad);
-        lfm3_attention_count += 1;
-    };
-    for (lfm3_attention_probes[0..lfm3_attention_count]) |*probe| try kernels.append(a, probe.kernel());
-    var binned_probes: [9]binned_projection.Probe = undefined;
-    var binned_count: usize = 0;
-    defer for (binned_probes[0..binned_count]) |*probe| probe.deinit();
-    for ([_]u8{ 4, 6, 8 }) |bits| for ([_]usize{ 32, 64 }) |group| {
-        const name = try binned_projection.label(a, bits, group, .none);
-        defer a.free(name);
-        if (!wanted(o, name)) continue;
-        binned_probes[binned_count] = try binned_projection.Probe.init(a, device, queue, bits, group, .none);
-        binned_count += 1;
-    };
-    for ([_]binned_projection.Fault{ .rows, .accum, .nonfinite }) |fault| {
-        const name = try binned_projection.label(a, 4, 64, fault);
-        defer a.free(name);
-        if (!wanted(o, name)) continue;
-        binned_probes[binned_count] = try binned_projection.Probe.init(a, device, queue, 4, 64, fault);
-        binned_count += 1;
-    }
-    for (binned_probes[0..binned_count]) |*probe| try kernels.append(a, probe.kernel());
-
-    var lfm3_projection_probes: [14]lfm3_projection.Probe = undefined;
-    var lfm3_projection_count: usize = 0;
-    defer for (lfm3_projection_probes[0..lfm3_projection_count]) |*probe| probe.deinit();
-    for ([_]u8{ 4, 6, 8 }) |bits| for ([_]usize{ 32, 64 }) |group| for (std.enums.values(lfm3_projection.Proof)) |proof| {
-        const name = try lfm3_projection.label(a, bits, group, proof, .none);
-        defer a.free(name);
-        if (!wanted(o, name)) continue;
-        lfm3_projection_probes[lfm3_projection_count] = try lfm3_projection.Probe.init(a, device, queue, bits, group, proof, .none);
-        lfm3_projection_count += 1;
-    };
-    for ([_]lfm3_projection.Fault{ .tail, .rows }) |fault| {
-        const name = try lfm3_projection.label(a, 4, 64, .bytes, fault);
-        defer a.free(name);
-        if (!wanted(o, name)) continue;
-        lfm3_projection_probes[lfm3_projection_count] = try lfm3_projection.Probe.init(a, device, queue, 4, 64, .bytes, fault);
-        lfm3_projection_count += 1;
-    }
-    for (lfm3_projection_probes[0..lfm3_projection_count]) |*probe| try kernels.append(a, probe.kernel());
+    var lfm3_suite: lfm3_suite_k.Suite = .{ .a = a, .device = device, .queue = queue, .kernels = &kernels, .tensor = tensor };
+    defer lfm3_suite.deinit();
+    try lfm3_suite.collect(o.only);
     for (gemma.all_entries) |v| {
         if (!wanted(o, v.name)) continue;
         if (!tensor) {
@@ -362,6 +163,58 @@ pub fn main(init: std.process.Init) !u8 {
         if (!tensor) return error.TensorUnitsRequired;
         try kernels.append(a, mixed.kernel());
     }
+    var lfm2_list: std.ArrayList(*lfm2_argmax.Probe) = .empty;
+    var lfm2_streams_list: std.ArrayList(*lfm2_streams.Probe) = .empty;
+    defer {
+        for (lfm2_list.items) |p| {
+            p.deinit();
+            a.destroy(p);
+        }
+        for (lfm2_streams_list.items) |p| {
+            p.deinit();
+            a.destroy(p);
+        }
+        lfm2_list.deinit(a);
+        lfm2_streams_list.deinit(a);
+    }
+    for (std.enums.values(lfm2_controls.Mutation)) |m| {
+        const argmax_side = m == .none or m == .argmax_last_tie or m == .argmax_no_flag;
+        if (argmax_side) {
+            if (!wanted(o, if (m == .none) lfm2_argmax.name else m.name())) continue;
+            const p = try a.create(lfm2_argmax.Probe);
+            errdefer a.destroy(p);
+            p.* = try lfm2_argmax.Probe.init(a, device, queue, m);
+            try lfm2_list.append(a, p);
+            try kernels.append(a, p.kernel());
+            if (m != .none) continue;
+        }
+        for (std.enums.values(lfm2_streams.Which)) |w| {
+            const control_for = (m == .conv_first_state and w == .conv) or (m == .attention_first_cache and w == .attention);
+            if (m != .none and !control_for) continue;
+            if (!wanted(o, if (m == .none) lfm2_streams.spec(w).name else m.name())) continue;
+            const p = try a.create(lfm2_streams.Probe);
+            errdefer a.destroy(p);
+            p.* = try lfm2_streams.Probe.init(a, device, queue, w, m);
+            try lfm2_streams_list.append(a, p);
+            try kernels.append(a, p.kernel());
+        }
+    }
+    var tap_list: std.ArrayList(*lfm2_tap.Probe) = .empty;
+    defer {
+        for (tap_list.items) |p| {
+            p.deinit();
+            a.destroy(p);
+        }
+        tap_list.deinit(a);
+    }
+    for ([_]lfm2_controls.Mutation{ .none, .tap_packed_rows, .tap_clobbers_column }) |m| {
+        if (!wanted(o, if (m == .none) lfm2_tap.name else m.name())) continue;
+        const p = try a.create(lfm2_tap.Probe);
+        errdefer a.destroy(p);
+        p.* = try lfm2_tap.Probe.init(a, device, queue, m);
+        try tap_list.append(a, p);
+        try kernels.append(a, p.kernel());
+    }
     var rows_list: std.ArrayList(*rows_k.Row) = .empty;
     var proj_list: std.ArrayList(*affine_k.Proj) = .empty;
     defer for (rows_list.items) |r| r.deinit();
@@ -372,6 +225,32 @@ pub fn main(init: std.process.Init) !u8 {
         r.* = try rows_k.Row.init(a, device, queue, w);
         try rows_list.append(a, r);
         try kernels.append(a, r.kernel());
+    }
+    var pair_list: std.ArrayList(*pair_k.Pair) = .empty;
+    defer {
+        for (pair_list.items) |p| {
+            p.deinit();
+            a.destroy(p);
+        }
+        pair_list.deinit(a);
+    }
+    for (std.enums.values(pair_controls.Mutation)) |m| {
+        for (pair_k.all) |w| {
+            const control_for = switch (m) {
+                .none => true,
+                .stage_peer_half => w == .stage,
+                .gather_own_halves => w == .gather,
+                .argmax_high_tie, .argmax_no_flag => w == .argmax,
+                .pick_no_flag, .pick_high_tie => w == .pick,
+            };
+            if (!control_for) continue;
+            if (!wanted(o, if (m == .none) pair_k.spec(w).name else m.name())) continue;
+            const p = try a.create(pair_k.Pair);
+            errdefer a.destroy(p);
+            p.* = try pair_k.Pair.init(a, device, queue, w, m);
+            try pair_list.append(a, p);
+            try kernels.append(a, p.kernel());
+        }
     }
     var flash_list: [8]flash.Probe = undefined;
     var flash_made: usize = 0;
@@ -497,6 +376,21 @@ pub fn main(init: std.process.Init) !u8 {
     var glm_windows: glm_rows_k.Suite = .{ .a = a, .device = device, .queue = queue, .kernels = &kernels };
     defer glm_windows.deinit();
     try glm_windows.collect(o.only);
+    var nemotron_experts: @import("metal_nemotron_experts.zig").Suite = .{ .a = a, .device = device, .queue = queue, .kernels = &kernels };
+    defer nemotron_experts.deinit();
+    try nemotron_experts.collect(o.only);
+    var nemotron_pages: @import("metal_nemotron_pages.zig").Suite = .{ .a = a, .device = device, .queue = queue, .kernels = &kernels };
+    defer nemotron_pages.deinit();
+    try nemotron_pages.collect(o.only);
+    var nemotron_attention: @import("metal_nemotron_attention.zig").Suite = .{ .a = a, .device = device, .queue = queue, .kernels = &kernels };
+    defer nemotron_attention.deinit();
+    try nemotron_attention.collect(o.only);
+    var nemotron_unroll: @import("metal_nemotron_unroll.zig").Suite = .{ .a = a, .device = device, .queue = queue, .kernels = &kernels };
+    defer nemotron_unroll.deinit();
+    try nemotron_unroll.collect(o.only);
+    var minimax: minimax_k.Suite = .{ .a = a, .device = device, .queue = queue, .kernels = &kernels };
+    defer minimax.deinit();
+    try minimax.collect(o.only);
     const weight_only = @import("metal_weight_only.zig");
     const weight_source = try weight_only.text(a);
     defer a.free(weight_source);
@@ -535,6 +429,10 @@ pub fn main(init: std.process.Init) !u8 {
     defer native_ple.destroy();
     const native_gdn = try @import("metal_qwen4_gdn.zig").Suite.create(a, device, queue, &kernels, o.only);
     defer native_gdn.destroy();
+    const moss_image = try @import("metal_moss_image.zig").Suite.create(a, device, queue, &kernels, o.only);
+    defer moss_image.destroy();
+    const moss_image_decoder = try @import("metal_moss_image_decoder.zig").Suite.create(a, device, queue, &kernels, o.only);
+    defer moss_image_decoder.destroy();
     var t: g.Tally = .{};
     const t0 = std.Io.Clock.awake.now(init.io);
     if (o.gates) {

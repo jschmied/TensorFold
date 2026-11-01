@@ -73,6 +73,17 @@ pub fn parseHeaderPrefix(arena: std.mem.Allocator, json: []const u8, data_len: u
 
 /// Select multiple namespaces in one header parse; an empty list admits every name.
 pub fn parseHeaderPrefixes(arena: std.mem.Allocator, json: []const u8, data_len: usize, prefixes: []const []const u8) !Header {
+    return parseHeaderOptions(arena, json, data_len, .{ .prefixes = prefixes });
+}
+
+pub const ParseOptions = struct {
+    prefixes: []const []const u8 = &.{},
+    /// `omit` leaves an unnamed dtype or a rank past `max_rank` out of the index (Qwen's GPU loader), not refused.
+    unsupported: enum { refuse, omit } = .refuse,
+};
+
+/// `parseHeaderPrefixes` with the unsupported layouts' refusal a choice; every entry kept is checked the same way.
+pub fn parseHeaderOptions(arena: std.mem.Allocator, json: []const u8, data_len: usize, options: ParseOptions) !Header {
     if (json.len > max_header_bytes) return error.BadSafetensors;
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{});
     if (parsed != .object) return error.BadSafetensors;
@@ -80,16 +91,22 @@ pub fn parseHeaderPrefixes(arena: std.mem.Allocator, json: []const u8, data_len:
     var it = parsed.object.iterator();
     while (it.next()) |kv| {
         if (std.mem.eql(u8, kv.key_ptr.*, "__metadata__")) continue;
-        if (prefixes.len > 0) {
-            for (prefixes) |p| {
+        if (options.prefixes.len > 0) {
+            for (options.prefixes) |p| {
                 if (std.mem.startsWith(u8, kv.key_ptr.*, p)) break;
             } else continue;
         }
         if (kv.value_ptr.* != .object) return error.BadSafetensors;
         const o = kv.value_ptr.object;
-        const dtype = DType.parse(str(o.get("dtype")) orelse return error.BadSafetensors) orelse return error.UnsupportedDType;
+        const dtype = DType.parse(str(o.get("dtype")) orelse return error.BadSafetensors) orelse {
+            if (options.unsupported == .omit) continue;
+            return error.UnsupportedDType;
+        };
         const shape = list(o.get("shape")) orelse return error.BadSafetensors;
-        if (shape.len > max_rank) return error.RankTooHigh;
+        if (shape.len > max_rank) {
+            if (options.unsupported == .omit) continue;
+            return error.RankTooHigh;
+        }
         var e: Entry = .{ .dtype = dtype, .rank = @intCast(shape.len), .shape = @splat(1), .begin = 0, .end = 0 };
         var n: usize = dtype.size();
         for (shape, 0..) |d, i| {
@@ -157,6 +174,36 @@ pub const Tensor = struct {
 
     pub fn is(self: Tensor, dtype: DType, shape: []const usize) bool {
         return self.dtype == dtype and self.rank == shape.len and std.mem.eql(usize, self.shape[0..self.rank], shape);
+    }
+};
+
+/// One file's header read on its own: no mapping, and no tensor byte read or held.
+pub const Metadata = struct {
+    names: Header,
+    data: usize,
+    file_size: usize,
+    arena: std.heap.ArenaAllocator,
+
+    pub fn read(gpa: std.mem.Allocator, io: Io, path: []const u8) !Metadata {
+        const file = try Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
+        const size = std.math.cast(usize, try file.length(io)) orelse return error.BadSafetensors;
+        var prefix: [8]u8 = undefined;
+        if (try file.readPositionalAll(io, &prefix, 0) != prefix.len) return error.BadSafetensors;
+        const header_len = try headerSize(std.mem.readInt(u64, &prefix, .little), size);
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        errdefer arena.deinit();
+        const text = try arena.allocator().alloc(u8, header_len);
+        if (try file.readPositionalAll(io, text, 8) != text.len) return error.BadSafetensors;
+        const names = try parseHeader(arena.allocator(), text, size - 8 - header_len);
+        // the length the ranges were checked against must still hold once the header is read
+        if (try file.length(io) != size) return error.BadSafetensors;
+        return .{ .names = names, .data = 8 + header_len, .file_size = size, .arena = arena };
+    }
+
+    pub fn deinit(self: *Metadata) void {
+        self.arena.deinit();
+        self.* = undefined;
     }
 };
 

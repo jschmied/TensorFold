@@ -3,9 +3,9 @@ const std = @import("std");
 const lanes = @import("lanes");
 const Allocator = std.mem.Allocator;
 pub const tfvideo = @import("tfvideo.zig");
+pub const DraftSources = @import("draft_sources.zig").Sources;
 /// The server's name for one request, unique while the process lives.
 pub const Id = u64;
-
 /// One request's sampling (Python's exact_sampling.Sampling); a request without one decodes greedily.
 pub const Sampling = lanes.Sampling;
 /// presence_penalty and frequency_penalty, applied where ``Info.penalties``.
@@ -13,6 +13,7 @@ pub const Penalties = lanes.Penalties;
 pub const EmbeddingInfo = lanes.embedding.Info;
 pub const EmbeddingBatch = lanes.embedding.Batch;
 pub const embedding_vector = @import("embedding_vector.zig");
+pub const load_ledger = @import("load_ledger.zig");
 
 /// One image of a request (``Request.images``): the tower's input and the placeholder rows its output replaces.
 pub const Image = lanes.stream.Image;
@@ -52,6 +53,8 @@ pub const Structure = struct {
     compiler: ?*grammar.Compiler = null,
     /// That compile, which the engine reads instead of compiling again; the server frees it after `finished`.
     compiled: ?grammar.Compiled = null,
+    /// grammar_budget: mask tokens after which the reply could no longer complete within its token limits.
+    budget: bool = false,
 
     pub fn free(st: Structure) void {
         if (st.compiled) |g| g.free();
@@ -100,6 +103,8 @@ pub const Request = struct {
     structure: ?Structure = null,
     /// Stop a short exact cycle while the think block is open.
     loop_guard: bool = false,
+    /// With ``loop_guard``: the reply ends where the guard fires, with no forced close and no answer after it.
+    loop_stop: bool = false,
     /// The prompt row (the assistant header's last) where routed lessons decide whether they act (null: none acts).
     decide: ?u32 = null,
     /// The model as shipped: no learned neuron acts on its rows, no prompt state is kept or reused (a lesson's writer).
@@ -143,24 +148,7 @@ pub const SpeechSubmitError = error{ Closed, Busy, InvalidRequest, Unsupported }
 pub const Reason = enum { stop, length, cancelled, failed, silence };
 pub const speech_guard = @import("speech_guard.zig");
 
-/// What a finished reply's rounds did, for its runtime fields and /metrics.
-pub const Stats = struct {
-    rounds: u64 = 0,
-    drafted: u64 = 0,
-    accepted: u64 = 0,
-    /// The narrowest verify window of the reply's rounds (drafted replies: 2 or more).
-    min_rows: u32 = 0,
-    prefill_widths: []const u32 = &.{},
-    prefill_raised: []const bool = &.{},
-    /// The loop period that ended or interrupted the think block, if any.
-    loop_period: ?u32 = null,
-    /// Prompt prefill duration measured by the engine host, in seconds.
-    prefill_seconds: ?f64 = null,
-    /// Seconds from engine submission to first admission; an engine that admits immediately leaves zero.
-    queued_seconds: f64 = 0,
-    /// The drafter's own counters as a JSON object, or empty.
-    telemetry_json: []const u8 = "",
-};
+pub const Stats = @import("engine_stats.zig").Stats;
 
 pub const Event = union(enum) {
     /// The prompt is in the cache: ``cached`` of its tokens came from a kept prefix.
@@ -221,8 +209,12 @@ pub const Info = struct {
     warm_turns: bool = false,
     /// The engine decodes plain whatever a request asks: no drafter loaded, or this chip is faster plain.
     plain_only: bool = false,
+    /// Available proposals, independent of a request's choice to use them.
+    draft_sources: DraftSources = .{},
     /// The immutable retained-prefix plan applied at startup, not a process memory limit or current cache occupancy.
     prompt_cache_plan: ?PromptCachePlan = null,
+    /// --decode-share: the reply's share of a fill step's wall time beside live decoders; null: the engine's default.
+    decode_share: ?f64 = null,
     /// The engine scores decisions (`score`) and writes no text: the server refuses text requests.
     decides: bool = false,
     /// Decisions may carry pictures (`Decision.pictures`).
@@ -272,6 +264,7 @@ pub const Precision = enum { checkpoint, full };
 
 /// What a server asks of the engine it opens: the checkpoint, and the serve flags an engine reads.
 pub const Open = struct {
+    pub const slideRefusal = @import("engine_slide.zig").refusal;
     pub fn fsrRefusal(o: Open, backend: []const u8) ?[]const u8 {
         if (o.ssd_experts_gib == null and !o.ple_on_ssd and o.fsr_trace == null) return null;
         if (!std.mem.eql(u8, backend, "metal") or !std.mem.eql(u8, o.model_type, "qwen4_exp"))
@@ -296,7 +289,9 @@ pub const Open = struct {
     drafts: bool = true,
     /// --drafter: a draft model's directory (Qwen3.8-27B's DFlash2; null: none), and --drafter-bits: 4, or 0 for bf16.
     drafter: ?[]const u8 = null,
+    drafter_name: ?[]const u8 = null, // the supplied --drafter name, before resolving its directory
     drafter_bits: u8 = 4,
+    rope_yarn: ?f64 = null, // --rope-yarn: YaRN over the checkpoint's trained window; families without it refuse
     /// --record: each stream's committed rows and tapped features written under this folder, for drafter training.
     record: ?[]const u8 = null,
     speed_up: ?[]const u8 = null,
@@ -315,7 +310,7 @@ pub const Open = struct {
     learn_conversations: bool = false,
     /// --learn-daily-gib: what learned states may write a day under the root, every model together.
     learn_daily_gib: f64 = 32,
-    /// --spill-gib (Macs): states evicted from RAM go to the store `learn_conversations` opens (off: written behind).
+    /// --spill-gib: states evicted from RAM go to the store `learn_conversations` opens (off: written behind).
     spill: prompt_cache.rows.Spill = .off,
     /// --slide: Sliding Weights learns into the served weights, live (off: learn requests are refused).
     slide: bool = false,
@@ -331,6 +326,8 @@ pub const Open = struct {
     /// --mtp-drafts and --mtp-confidence; null: the engine's defaults.
     mtp_drafts: ?u32 = null,
     mtp_confidence: ?f64 = null,
+    /// --decode-share: the reply's share of a fill step's wall time beside live decoders; null: the engine's default.
+    decode_share: ?f64 = null,
     /// Kept prompt entries (--checkpoint-slots); null: the engine's plan.
     keep: ?i64 = null,
     /// Tensor parallelism: this process is `rank` of `tp`; rank 0 listens on `master`:`master_port` for the others.
@@ -387,7 +384,10 @@ pub const MemorySource = struct {
 pub const HealthSource = @import("engine_status.zig").HealthSource;
 pub const Status = @import("engine_status.zig").Status;
 
-pub const SubmitError = error{ Closed, Busy, InvalidSpans, Stale, InvalidRequest }; // Stale: put-back has not reached the device
+pub const SubmitError = error{ Closed, Busy, InvalidSpans, Stale, InvalidRequest, MemoryPressure }; // Stale: put-back has not reached the device
+
+/// What a request refused under critical memory pressure says (a 503).
+pub const pressure_message = "this Mac is under critical memory pressure: the server takes no new requests until it eases; retry shortly";
 
 /// What a reply refused or ended for `Stale` says, a submit's error and a queued job's failure alike.
 pub const stale_message = "a Living Weights delete could not be put back on the device: send the delete again to retry it, or restart the server";
@@ -433,6 +433,8 @@ pub const Engine = struct {
         imprint: ?*const fn (ctx: *anyopaque, ask: *ImprintAsk) bool = null,
         /// A planned stop's first half: no more work, disk writes finished under a deadline, the engine thread joined.
         drain: ?*const fn (ctx: *anyopaque) void = null,
+        /// The server's load-ledger producer at attach, null at detach (load_ledger.zig); null entry: no engine group.
+        load: ?*const fn (ctx: *anyopaque, producer: ?load_ledger.Producer) void = null,
     };
 
     pub fn info(e: Engine) Info {
@@ -566,6 +568,7 @@ test {
     _ = @import("lane_embedding_test.zig");
     _ = speech_guard;
     _ = @import("lane_host.zig");
+    _ = load_ledger;
     _ = @import("lane_host_test.zig");
     _ = @import("lane_root_copy_test.zig");
     _ = @import("lane_rounds_test.zig");

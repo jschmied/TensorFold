@@ -10,6 +10,10 @@ test "contract image: GLM top1 selects its own image" {
     try std.testing.expectEqualStrings("glm_glue", try resolve("glm_glue"));
 }
 
+test "contract image: qmm prefill launch fusion selects its own image" {
+    try std.testing.expectEqualStrings("qmm_prefill", try resolve("qmm_prefill"));
+}
+
 test "contract image: only explicit controls select the controls image" {
     try std.testing.expectEqualStrings("contract_controls", try resolve("contract_controls"));
     try std.testing.expectEqualStrings("h3", try resolve("h3"));
@@ -43,4 +47,10 @@ test "contract image: all 32 Qwen4 launches select their own embedded images" {
     }
     try std.testing.expectEqual(@as(usize, 32), count);
     try std.testing.expectEqual(@as(usize, 4), names.count());
+}
+
+test "contract image: every registered CUDA launch and control selects its own image" {
+    const registry = @import("core").contract.registry;
+    for (registry.all_cuda ++ registry.cuda_controls) |r|
+        try std.testing.expectEqualStrings(r.launch.image, try resolve(r.launch.image));
 }

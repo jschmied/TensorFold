@@ -93,6 +93,9 @@ pub const Engine = struct {
     prompt_out: prompt_lp.Output, // a head pass's logprob words, then its picks, host-mapped (rank 0 reads them)
     structured: bool = false, // a structured output step: every rank's draws gather whole rows, rank 0 masks them
     pages: ?*pages_mod.Pages = null, // the other streams' KV pages and sequences (cuda_pages), once the server attached them
+    index_split: bool = false, // the next prompt step's indexer rows split across the ranks: rank 0's choice, the chunk's flag 2
+    index_splits: u64 = 0, // prompt steps whose indexer rows split (glm-split-check counts them)
+    share_pages: bool = false, // TF_GLM_KV_SHARE: a kept state leaves its prefix's pages to the prompt cache that holds them
 
     /// Opens rank `rank` of `world` over `comm`; the ranks agree on settings (cuda_ranks) before the weights load.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *const cuda.Context, checkpoint: []const u8, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, rank: usize, world: usize, o: Options) !*Engine {
@@ -331,12 +334,15 @@ pub const Engine = struct {
 
     /// One chunk of a `len`-id prompt pass: `part` from `start` plus the next id; first token at the end, else null.
     pub fn prefillChunk(e: *Engine, part: []const u32, start: usize, len: usize, from: ?Resume, cancel: ?Cancel, marks: ?Marks) !?u32 {
+        const split = e.index_split; // this step's alone
+        e.index_split = false;
         if ((from != null or start == 0) and try e.prefillStart(len, from) != start) return error.BadChunk;
         if (start >= len or start % fw.prefill_rows != 0) return error.BadChunk;
         const rows = @min(len - start, fw.prefill_rows);
         if (part.len != @min(len - start, rows + 1)) return error.BadChunk;
         var one: [1]fw.Rank = undefined;
         var f = e.view(&e.bp, &one);
+        f.index_split = split;
         const as_i32: []const i32 = @ptrCast(part);
         if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
         f.prof = e.prompt_profs[if (rows <= 64) 0 else if (rows <= 256) 1 else if (rows <= 1024) 2 else 3];
@@ -358,6 +364,7 @@ pub const Engine = struct {
         stamp.end();
         if (f.prof) |p| p.mark(e.stream, .gate);
         try f.run(as_i32[0..rows]);
+        e.index_splits += @intFromBool(split);
         stamp = prof_mod.span(f.prof, e.stream, .prompt_score);
         if (e.prompt_logprobs) |p| if (part.len > 1) try prompt_lp.run(e, p, part[1..]);
         stamp.end();
@@ -522,7 +529,7 @@ pub const Engine = struct {
     }
 
     /// decode.draft: the MTP head absorbs the kept rows (committed first) with `follow`, then chains `depth` drafts.
-    pub fn draft(e: *Engine, from_prompt: bool, follow: []const u32, depth: usize, out: []u32) !void {
+    pub fn draft(e: *Engine, from_prompt: bool, follow: []const u32, depth: usize, out: []u32, chances: ?[]f64) !void {
         if (!e.mtp) return error.NoDraftHead;
         if (depth > max_drafts) return error.TooDeep;
         var one: [1]fw.Rank = undefined;
@@ -535,11 +542,18 @@ pub const Engine = struct {
         var s0: usize = 0;
         while (s0 < next.len) : (s0 += fw.window_rows) {
             const part = next[s0..@min(next.len, s0 + fw.window_rows)];
-            try f.mtp(part, &.{hidden + s0 * D * 2});
+            try f.mtpMode(part, &.{hidden + s0 * D * 2}, depth > 0);
             try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len + part.len);
         }
         for (0..depth) |j| {
-            try e.draw(e.bm.logits, 1, e.cur.st.pos + 1 + j, 0, out[j..][0..1]);
+            if (chances != null and !e.structured and e.cur.sampling == null) {
+                const p = try e.greedyChance(e.bm.logits);
+                out[j] = p.token;
+                chances.?[j] = p.chance;
+            } else {
+                try e.draw(e.bm.logits, 1, e.cur.st.pos + 1 + j, 0, out[j..][0..1]);
+                if (chances) |c| c[j] = 1; // a sampled or structured draft keeps chance 1: its window runs whole
+            }
             if (j + 1 < depth) {
                 try f.mtp(@ptrCast(out[j..][0..1]), &.{e.bm.fnormed});
                 try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len + 1);
@@ -563,6 +577,7 @@ pub const Engine = struct {
     pub const redrawFirst = @import("cuda_structured.zig").redrawFirst;
     /// decode.sample_rows' greedy pick: per-rank top-1 (tf_glm_top1), all-gathered, largest value then lowest id.
     const greedy = @import("cuda_engine_pick.zig").greedy;
+    const greedyChance = @import("cuda_engine_pick.zig").greedyChance;
 
     /// A failed RoCE gather's error, after a synchronize whose result read gathered rows (they hold nothing then).
     pub fn checkGathers(e: *const Engine) !void {

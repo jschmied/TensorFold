@@ -17,6 +17,12 @@ pub const Server = server.Server;
 pub const Config = server.Config;
 
 test {
+    _ = @import("auth_scope_test.zig");
+    _ = @import("family_sampling.zig");
+    _ = @import("auth_scope_http_test.zig");
+    _ = @import("admission_cli.zig");
+    _ = @import("request_admission_test.zig");
+    _ = @import("request_admission_http_test.zig");
     _ = @import("vision_markers_test.zig");
     _ = @import("embedding_protocol_test.zig");
     _ = @import("embedding_service_test.zig");
@@ -35,6 +41,7 @@ test {
     _ = @import("tool_parse.zig");
     _ = @import("tool_lfm2.zig");
     _ = @import("tool_lfm2_stream_test.zig");
+    _ = @import("tool_minimax.zig");
     _ = @import("tool_stream.zig");
     _ = @import("tool_params.zig");
     _ = @import("tool_grammar.zig");
@@ -44,6 +51,7 @@ test {
     _ = @import("grammar.zig");
     _ = @import("pyrepr.zig");
     _ = @import("metrics.zig");
+    _ = @import("load_metrics.zig");
     _ = @import("http_conn.zig");
     _ = @import("auth.zig");
     _ = @import("cli.zig");
@@ -57,6 +65,7 @@ test {
     _ = @import("drama_cfg.zig");
     if (comptime @import("builtin").os.tag != .windows) _ = @import("speech_cfg_test.zig");
     if (comptime @import("builtin").os.tag != .windows) _ = @import("speech_stream_test.zig"); // over a Unix socket pair
+    if (comptime @import("builtin").os.tag != .windows) _ = @import("speech_lane_release_test.zig");
     if (comptime @import("builtin").os.tag != .windows) _ = @import("speech_speakers_test.zig");
     if (comptime @import("builtin").os.tag != .windows) _ = @import("speech_sampling_test.zig");
     _ = @import("drama_voice_tool.zig");
@@ -67,6 +76,7 @@ test {
     _ = @import("health_test.zig");
     _ = @import("memory_routes.zig");
     _ = @import("process_memory.zig");
+    _ = @import("process_resident.zig");
     _ = @import("log.zig");
     _ = @import("request_log.zig");
     _ = @import("messages.zig");
@@ -82,12 +92,18 @@ test {
     _ = @import("tool_cut_test.zig");
     _ = @import("logprobs_test.zig");
     _ = @import("think_split_test.zig");
+    _ = @import("deepseek_reply_test.zig");
     _ = @import("thinking_reserve_test.zig");
+    _ = @import("loop_stop_test.zig");
     _ = @import("late_system_test.zig");
     _ = @import("compact_test.zig");
+    _ = @import("compact_auto_test.zig");
     _ = @import("request_log.zig");
     _ = @import("completion_prompt_test.zig");
     _ = @import("hf_eos_http_test.zig");
+    _ = @import("reply_gpu_seconds_test.zig");
+    _ = @import("spark_wire.zig");
+    _ = @import("spark_wire_test.zig");
     _ = @import("server_init_test.zig");
     _ = @import("connection_arena_test.zig");
     _ = @import("decisions.zig");
@@ -118,6 +134,7 @@ test {
     _ = @import("slide_recheck.zig");
     _ = @import("slide_forget.zig");
     _ = @import("slide_forget_test.zig");
+    _ = @import("slide_forget_many_test.zig");
     _ = @import("slide_supplied.zig");
     _ = @import("slide_questions_test.zig");
     _ = @import("slide_teacher_test.zig");
@@ -136,6 +153,8 @@ test {
     _ = @import("responses_include_test.zig");
     _ = @import("cortheon/cortheon.zig");
     _ = @import("cortheon/cortheon_test.zig");
+    _ = @import("cortheon/research.zig");
+    _ = @import("cortheon/program.zig");
     _ = @import("recall_routes.zig");
     // the benchmark command's serve child runs under POSIX signals and waits; Windows refuses the command
     if (comptime @import("builtin").os.tag != .windows) {
@@ -184,4 +203,5 @@ test {
     _ = @import("control_tokens_http_test.zig");
     _ = @import("request_provenance_test.zig");
     _ = @import("request_cost_test.zig");
+    _ = @import("prompt_tool_turn_test.zig");
 }

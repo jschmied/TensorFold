@@ -56,10 +56,12 @@ pub const Budget = struct {
     window: u64 = 0,
     /// The engine's own rows are pages too: a window of them first, then the cache after the windows the room holds.
     engine_paged: bool = false,
+    /// Parts per million of the cache that kept states hold as pool pages (TF_KV_SHARE): made pages past the windows.
+    kept_ppm: u32 = 0,
 };
 
 /// The streams served, the cache's slots and copied-KV bytes, and the pages left for the streams.
-pub const Plan = struct { lanes: u32, snaps: usize, copied: u64, pages: usize };
+pub const Plan = struct { lanes: u32, snaps: usize, copied: u64, pages: usize, kept: u64 = 0 }; // kept: the cache bytes made pages
 
 /// The prompt cache's split: slots for its snapshots, the rest for their copied KV rows (no slot: no cache).
 pub fn split(cache: u64, snap_bytes: u64, named: ?usize) struct { snaps: usize, copied: u64 } {
@@ -78,10 +80,12 @@ pub fn plan(l: Layout, b: Budget) error{ NoStream, TooMany }!Plan {
     const fit = @min(extra, left / each);
     if (fit < extra and b.fixed) return error.TooMany;
     left -= fit * l.fixed_bytes;
-    const c = split(@min(b.cache, left -| held(l, b, fit)), l.snap_bytes, b.snaps);
+    const cache = @min(b.cache, left -| held(l, b, fit));
+    const kept = cache / 1_000_000 * b.kept_ppm + cache % 1_000_000 * b.kept_ppm / 1_000_000; // the cache's share as pages
+    const c = split(cache - kept, l.snap_bytes, b.snaps);
     left -= c.snaps * l.snap_bytes + c.copied;
-    const most: u64 = if (b.window > 0) (fit + @intFromBool(b.engine_paged)) * l.pages(b.window) + fit * l.runPages() else std.math.maxInt(u64);
-    return .{ .lanes = @intCast(1 + fit), .snaps = c.snaps, .copied = c.copied, .pages = @intCast(@min((left + own) / l.pageBytes(), most)) };
+    const most: u64 = if (b.window > 0) (fit + @intFromBool(b.engine_paged)) * l.pages(b.window) + fit * l.runPages() + kept / l.pageBytes() else std.math.maxInt(u64);
+    return .{ .lanes = @intCast(1 + fit), .snaps = c.snaps, .copied = c.copied, .pages = @intCast(@min((left + own) / l.pageBytes(), most)), .kept = kept };
 }
 
 /// Whether `b.cache` fits whole in what `plan` leaves it: the room past the engine and a fixed part and page a stream.
@@ -129,6 +133,15 @@ pub const Reclaim = struct {
     call: *const fn (ctx: *anyopaque, want: usize) bool,
 };
 
+/// Called after each outermost change to the pool's counts, on the thread that made it.
+pub const Notify = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, p: *const Pool) void,
+};
+
+/// A family's pool as the load ledger reads it: tokens a page, and the contiguous run it needs (0: none).
+pub const Source = struct { pool: *Pool, page_tokens: u32, run_pages: u32 = 0 };
+
 /// What an idle pool must show: nothing promised, every page free or the store's alone.
 pub const Census = struct { total: usize, free: usize, promised: usize, kept: usize, leased: usize };
 
@@ -140,8 +153,13 @@ pub const Pool = struct {
     free: []u32, // a stack of free ids, `nfree` deep
     nfree: usize,
     promised: usize = 0,
+    nreclaimable: usize = 0, // one non-lease holder, so eviction can free the page
+    nkept: usize = 0, // pages with a holder beyond their leases; may also be leased
+    nleased: usize = 0, // pages mapped by at least one lease, counted once
     page_bytes: u64,
     reclaim: ?Reclaim = null,
+    notify: ?Notify = null,
+    depth: u8 = 0, // public changes in progress: the outermost one notifies, after nested calls and rollbacks
 
     pub fn init(gpa: Allocator, count: usize, page_bytes: u64) !Pool {
         const refs = try gpa.alloc(u32, count);
@@ -173,9 +191,7 @@ pub const Pool = struct {
 
     /// Pages the store alone holds: evicting its idle leaves frees them.
     pub fn reclaimable(p: *const Pool) usize {
-        var n: usize = 0;
-        for (p.refs, p.leased) |r, l| n += @intFromBool(r == 1 and l == 0);
-        return n;
+        return p.nreclaimable;
     }
 
     /// Whether `need` pages could be promised now, the store's idle pages counted.
@@ -185,13 +201,27 @@ pub const Pool = struct {
 
     /// The counts an idle server logs: promised 0, free + kept == total, no page leased.
     pub fn census(p: *const Pool) Census {
-        var kept: usize = 0;
-        var leased: usize = 0;
-        for (p.refs, p.leased) |r, l| {
-            kept += @intFromBool(r > l);
-            leased += @intFromBool(l > 0);
-        }
-        return .{ .total = p.total(), .free = p.nfree, .promised = p.promised, .kept = kept, .leased = leased };
+        return .{ .total = p.total(), .free = p.nfree, .promised = p.promised, .kept = p.nkept, .leased = p.nleased };
+    }
+
+    /// Ownership changes update page classes once; holders and leases remain the authoritative per-page state.
+    fn ownership(p: *Pool, id: usize, refs: u32, leased: u32) void {
+        const r = p.refs[id];
+        const l = p.leased[id];
+        p.nreclaimable = p.nreclaimable - @intFromBool(r == 1 and l == 0) + @intFromBool(refs == 1 and leased == 0);
+        p.nkept = p.nkept - @intFromBool(r > l) + @intFromBool(refs > leased);
+        p.nleased = p.nleased - @intFromBool(l > 0) + @intFromBool(leased > 0);
+        p.refs[id] = refs;
+        p.leased[id] = leased;
+    }
+
+    /// A lease gives back its reference; its last reference returns the page to the same free stack.
+    fn unlease(p: *Pool, id: u32) void {
+        if (p.leased[id] == 0 or p.refs[id] < p.leased[id]) std.debug.panic("kv pool: page {d} released with no holder", .{id});
+        p.ownership(id, p.refs[id] - 1, p.leased[id] - 1);
+        if (p.refs[id] > 0) return;
+        p.free[p.nfree] = id;
+        p.nfree += 1;
     }
 
     pub fn idle(p: *const Pool) bool {
@@ -206,19 +236,25 @@ pub const Pool = struct {
 
     /// One more holder of a held page; a free page is never retained, only taken.
     pub fn retain(p: *Pool, id: u32) void {
+        p.enter();
+        defer p.leave();
         if (p.refs[id] == 0) std.debug.panic("kv pool: page {d} retained while free", .{id});
-        p.refs[id] += 1;
+        p.ownership(id, p.refs[id] + 1, p.leased[id]);
     }
 
     /// One holder fewer; the last one's release frees the page. Releasing a page nobody holds panics.
     pub fn release(p: *Pool, id: u32) void {
+        p.enter();
+        defer p.leave();
         p.drop(id) catch std.debug.panic("kv pool: page {d} released with no holder", .{id});
     }
 
     /// `release`, as an error when no holder but the leases' holds the page (the store's release of a page it lacks).
     pub fn drop(p: *Pool, id: u32) error{NotHeld}!void {
+        p.enter();
+        defer p.leave();
         if (p.refs[id] <= p.leased[id]) return error.NotHeld; // no holder past the leases' (callers drop theirs first)
-        p.refs[id] -= 1;
+        p.ownership(id, p.refs[id] - 1, p.leased[id]);
         if (p.refs[id] > 0) return;
         p.free[p.nfree] = id;
         p.nfree += 1;
@@ -226,6 +262,8 @@ pub const Pool = struct {
 
     /// Promise `n` more pages to `l`, the store reclaiming first if it must; LaneMemory when they do not fit.
     pub fn promise(p: *Pool, l: *Lease, n: usize) error{LaneMemory}!void {
+        p.enter();
+        defer p.leave();
         if (p.available() < n) if (p.reclaim) |r| {
             _ = r.call(r.ctx, n);
         };
@@ -234,20 +272,39 @@ pub const Pool = struct {
         l.promised += n;
     }
 
+    /// `out.len` free pages the store holds itself (a kept state's copied rows), the store reclaiming first if it must.
+    pub fn hold(p: *Pool, out: []u32) bool {
+        p.enter();
+        defer p.leave();
+        if (p.available() < out.len) if (p.reclaim) |r| {
+            _ = r.call(r.ctx, out.len);
+        };
+        if (p.available() < out.len) return false;
+        for (out) |*id| {
+            p.nfree -= 1;
+            id.* = p.free[p.nfree];
+            p.ownership(id.*, 1, 0);
+        }
+        return true;
+    }
+
     /// The part of `l`'s promise it has not taken goes back.
     pub fn unpromise(p: *Pool, l: *Lease) void {
+        p.enter();
+        defer p.leave();
         p.promised -= l.promised;
         l.promised = 0;
     }
 
     /// A free page from `l`'s promise, appended to its table.
     pub fn take(p: *Pool, l: *Lease) error{ PastReservation, OutOfMemory }!u32 {
+        p.enter();
+        defer p.leave();
         if (l.promised == 0) return error.PastReservation;
         try l.ids.ensureUnusedCapacity(p.gpa, 1);
         p.nfree -= 1;
         const id = p.free[p.nfree];
-        p.refs[id] = 1;
-        p.leased[id] = 1;
+        p.ownership(id, 1, 1);
         l.promised -= 1;
         p.promised -= 1;
         l.ids.appendAssumeCapacity(id);
@@ -256,26 +313,31 @@ pub const Pool = struct {
 
     /// Pages a store's resume retained for this stream (its matched path), at the head of its table.
     pub fn adopt(p: *Pool, l: *Lease, ids: []const u32) error{OutOfMemory}!void {
+        p.enter();
+        defer p.leave();
         l.ids.appendSlice(p.gpa, ids) catch |e| {
             for (ids) |id| p.release(id);
             return e;
         };
-        for (ids) |id| p.leased[id] += 1;
+        for (ids) |id| p.ownership(id, p.refs[id], p.leased[id] + 1);
     }
 
     /// The stream's page `i` swapped for the store's copy `id` of the same tokens (a keep's Kept.shared).
     pub fn share(p: *Pool, l: *Lease, i: usize, id: u32) void {
+        p.enter();
+        defer p.leave();
         const old = l.ids.items[i];
         if (old == id) return;
         p.retain(id);
-        p.leased[id] += 1;
+        p.ownership(id, p.refs[id], p.leased[id] + 1);
         l.ids.items[i] = id;
-        p.leased[old] -= 1;
-        p.release(old);
+        p.unlease(old);
     }
 
     /// `l` covers `n` pages, taken from its promise, and the new entries reach `table`; a failure takes them back.
     pub fn cover(p: *Pool, l: *Lease, n: usize, table: ?Table) !void {
+        p.enter();
+        defer p.leave();
         const old = l.ids.items.len;
         errdefer p.shrink(l, old);
         while (l.ids.items.len < n) _ = try p.take(l);
@@ -284,6 +346,8 @@ pub const Pool = struct {
 
     /// `cover` for an empty table: n consecutive ids from a multiple of `step` when they are free, else as `cover`.
     pub fn coverRun(p: *Pool, l: *Lease, n: usize, step: usize, table: ?Table) !void {
+        p.enter();
+        defer p.leave();
         if (l.ids.items.len > 0 or n == 0 or l.promised < n) return p.cover(l, n, table);
         try l.ids.ensureTotalCapacity(p.gpa, n);
         const start = p.findAligned(n, step) orelse return p.cover(l, n, table);
@@ -297,8 +361,7 @@ pub const Pool = struct {
     fn shrink(p: *Pool, l: *Lease, n: usize) void {
         while (l.ids.items.len > n) {
             const id = l.ids.pop().?;
-            p.leased[id] -= 1;
-            p.release(id);
+            p.unlease(id);
             l.promised += 1;
             p.promised += 1;
         }
@@ -330,6 +393,8 @@ pub const Pool = struct {
 
     /// `k` consecutive pages from `l`'s promise, held as one run until releaseRun; null: no such run is free now.
     pub fn claimRun(p: *Pool, l: *Lease, k: usize) ?u32 {
+        p.enter();
+        defer p.leave();
         if (l.promised < k) return null;
         const start = p.findRun(k) orelse return null;
         p.claimAt(l, start, k);
@@ -347,28 +412,38 @@ pub const Pool = struct {
         p.nfree = n;
         @memset(p.refs[start..][0..k], 1);
         @memset(p.leased[start..][0..k], 1); // held as a lease holds its pages: never the store's to reclaim
+        p.nleased += k; // every page in this free run gained its first lease and no other holder
         l.promised -= k;
         p.promised -= k;
     }
 
     /// A run claimed at `start` goes back to the free pages.
     pub fn releaseRun(p: *Pool, start: u32, k: usize) void {
+        p.enter();
+        defer p.leave();
         for (start..start + k) |id| {
             if (p.refs[id] != 1 or p.leased[id] != 1) std.debug.panic("kv pool: run page {d} released while not a run's", .{id});
-            p.refs[id] = 0;
-            p.leased[id] = 0;
+            p.ownership(id, 0, 0);
             p.free[p.nfree] = @intCast(id);
             p.nfree += 1;
         }
     }
 
+    fn enter(p: *Pool) void {
+        p.depth += 1;
+    }
+
+    fn leave(p: *Pool) void {
+        p.depth -= 1;
+        if (p.depth == 0) if (p.notify) |n| n.call(n.ctx, p);
+    }
+
     /// The stream ended (finished, cancelled or failed): its promise and every page it holds go back.
     pub fn finish(p: *Pool, l: *Lease) void {
+        p.enter();
+        defer p.leave();
         p.unpromise(l);
-        for (l.ids.items) |id| {
-            p.leased[id] -= 1;
-            p.release(id);
-        }
+        for (l.ids.items) |id| p.unlease(id);
         l.ids.deinit(p.gpa);
         l.* = .{};
     }
@@ -376,4 +451,7 @@ pub const Pool = struct {
 
 test {
     _ = @import("kv_pool_test.zig");
+    _ = @import("kv_pool_counts_test.zig");
+    _ = @import("kv_pool_walk_test.zig");
+    _ = @import("kv_pool_notify_test.zig");
 }
