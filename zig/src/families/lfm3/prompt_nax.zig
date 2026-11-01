@@ -26,7 +26,7 @@ pub const Candidate = struct {
         const text = try source(device, arena.allocator(), bits, group);
         const lib = try mtl.Library.fromSource(device, text, mtl.CompileOptions.mlx());
         defer lib.deinit();
-        const pipe = try mtl.Pipeline.init(device, lib, "tf_qmmw_t_nax", false);
+        const pipe = try mtl.Pipeline.init(device, lib, "tf_qmmw_t_nax_win", false);
         errdefer pipe.deinit();
         if (pipe.simdWidth() != 32 or pipe.maxThreads() < 128) return error.Reflection;
         return .{ .pipe = pipe, .bits = bits, .group = group };
@@ -36,8 +36,11 @@ pub const Candidate = struct {
         self.pipe.deinit();
     }
 
+    /// Scales and biases load eight groups a row at once: k spans whole windows, their buffers are 16 byte aligned.
     pub fn supports(self: *const Candidate, w: row.Weights, rows: usize) bool {
-        return rows > 0 and w.bits == self.bits and w.group == self.group and w.n % 64 == 0 and w.k % 64 == 0;
+        const window = 8 * @as(usize, self.group);
+        return rows > 0 and w.bits == self.bits and w.group == self.group and w.n % 64 == 0 and w.k % window == 0 and
+            w.s_off % 16 == 0 and w.b_off % 16 == 0;
     }
 
     pub fn encode(self: *const Candidate, e: mtl.ComputeEncoder, w: row.Weights, x: mtl.Buffer, x_off: usize, y: mtl.Buffer, y_off: usize, rows: usize) void {

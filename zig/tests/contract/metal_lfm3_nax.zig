@@ -33,6 +33,7 @@ pub const Probe = struct {
     pipe: mtl.Pipeline,
     label: []const u8,
     fault: Fault,
+    group: u16,
     const vt = blk: {
         var hooks = g.hooks(affine.Proj);
         hooks.prepare = prepare;
@@ -58,10 +59,10 @@ pub const Probe = struct {
         };
         defer a.free(text);
         if (fault != .none and std.mem.eql(u8, text, clean)) return error.MissingControlSite;
-        const pipe = try rig.pipeline(device, text, "tf_qmmw_t_nax");
+        const pipe = try rig.pipeline(device, text, "tf_qmmw_t_nax_win");
         errdefer pipe.deinit();
-        if (pipe.simdWidth() != 32 or pipe.maxThreads() < 128 or rig.tgMemory(pipe) != 9216) return error.NaxPromptLimits;
-        return .{ .a = a, .inner = inner, .pipe = pipe, .label = label, .fault = fault };
+        if (pipe.simdWidth() != 32 or pipe.maxThreads() < 128 or rig.tgMemory(pipe) != 11264) return error.NaxPromptLimits;
+        return .{ .a = a, .inner = inner, .pipe = pipe, .label = label, .fault = fault, .group = group };
     }
     pub fn deinit(p: *Probe) void {
         p.pipe.deinit();
@@ -69,15 +70,16 @@ pub const Probe = struct {
         p.a.free(p.label);
     }
     pub fn kernel(p: *Probe) g.Kernel {
+        const window: usize = 8 * @as(usize, p.group);
         return .{ .ctx = &p.inner, .vt = &vt, .control = switch (p.fault) {
             .none => null,
             .bias => .shapes,
             .nonfinite => .nonfinite,
-        }, .spec = .{ .name = p.label, .accum = .f32, .depth = depth, .out = .bf16, .tiles = .{ .{ .size = 64, .min = 1 }, .{ .size = 64, .step = 64, .min = 64 }, .{ .size = 64, .step = 64, .min = 64 } }, .served = &.{ .{ .rows = 128, .n = 7680, .k = 2048 }, .{ .rows = 128, .n = 2048, .k = 7680 }, .{ .rows = 65, .n = 6144, .k = 2048 }, .{ .rows = 33, .n = 512, .k = 2048 }, .{ .rows = 5, .n = 2048, .k = 2048 }, .{ .rows = 1, .n = 2048, .k = 2048 } } } };
+        }, .spec = .{ .name = p.label, .accum = .f32, .depth = depth, .out = .bf16, .tiles = .{ .{ .size = 64, .min = 1 }, .{ .size = 64, .step = 64, .min = 64 }, .{ .size = 64, .step = window, .min = window } }, .served = &.{ .{ .rows = 128, .n = 7680, .k = 2048 }, .{ .rows = 128, .n = 2048, .k = 7680 }, .{ .rows = 65, .n = 6144, .k = 2048 }, .{ .rows = 33, .n = 512, .k = 2048 }, .{ .rows = 5, .n = 2048, .k = 2048 }, .{ .rows = 1, .n = 2048, .k = 2048 } } } };
     }
     fn prepare(ctx: *anyopaque, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
         const p = parent(ctx);
-        if (shape.rows == 0 or shape.n % 64 != 0 or shape.k % 64 != 0) return false;
+        if (shape.rows == 0 or shape.n % 64 != 0 or shape.k % (8 * @as(usize, p.group)) != 0) return false;
         if (!try p.inner.prepare(shape, fill, seed)) return false;
         if (p.inner.f) |*f| f.form = .dequantized;
         return true;

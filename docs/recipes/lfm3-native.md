@@ -138,8 +138,9 @@ zig build native -Dcpu=apple_m1 -Dlfm3-nax-prompt=true -Dlfm3-tiled-attention=tr
 ```
 
 `lfm3-nax-prompt` sends every dense prompt projection (attention q/k/v/out, convolution in/out, FFN gate/up/down)
-through Flash Next's `tf_qmmw_t_nax` tiles. They dequantize each weight to BF16 as MLX does and accumulate in
-FP32. 4, 6 and 8 bits with groups of 32 or 64 are covered, `n` and `k` divisible by 64; other shapes keep the row
+through `tf_qmmw_t_nax_win`, Flash Next's `tf_qmmw_t_nax` tile with scales and biases loaded eight groups at a time.
+It dequantizes each weight to BF16 as MLX does and accumulates in FP32, with the same bytes as `tf_qmmw_t_nax`. 4, 6
+and 8 bits with groups of 32 or 64 are covered, `n` divisible by 64 and `k` by eight groups; other shapes keep the row
 kernels. The LM head and decode keep their own kernels.
 `lfm3-tiled-attention` adds two attention kernels. Prompt rows use 64-query/32-key tiles with FP32 online softmax and
 the probabilities rounded once to BF16 for PV, as MLX does. A prompt segment of up to 2048 rows is one launch, so

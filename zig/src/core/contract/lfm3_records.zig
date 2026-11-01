@@ -93,8 +93,8 @@ pub const metal = [_]M{
     .{ .name = "LFM3 split attention lfm3_attn_split_merge", .threads = 32, .tg_memory = 0, .reserved = 32 },
     .{ .name = "LFM3 split attention lfm3_attn_split_segments", .threads = 128, .tg_memory = 2592, .reserved = 128 },
     .{ .name = "LFM3 split attention lfm3_attn_split_segments_merge", .threads = 32, .tg_memory = 0, .reserved = 32 },
-    .{ .name = "LFM3 NAX prompt q4g64 tf_qmmw_t_nax", .threads = 128, .tg_memory = 9216, .reserved = 128, .offline = false },
-    .{ .name = "LFM3 NAX prompt q6g64 tf_qmmw_t_nax", .threads = 128, .tg_memory = 9216, .reserved = 128, .offline = false },
-    .{ .name = "LFM3 NAX prompt q8g64 tf_qmmw_t_nax", .threads = 128, .tg_memory = 9216, .reserved = 128, .offline = false },
-    .{ .name = "LFM3 NAX prompt q4g32 tf_qmmw_t_nax", .threads = 128, .tg_memory = 9216, .reserved = 128, .offline = false },
+    .{ .name = "LFM3 NAX prompt q4g64 tf_qmmw_t_nax_win", .threads = 128, .tg_memory = 11264, .reserved = 128, .offline = false },
+    .{ .name = "LFM3 NAX prompt q6g64 tf_qmmw_t_nax_win", .threads = 128, .tg_memory = 11264, .reserved = 128, .offline = false },
+    .{ .name = "LFM3 NAX prompt q8g64 tf_qmmw_t_nax_win", .threads = 128, .tg_memory = 11264, .reserved = 128, .offline = false },
+    .{ .name = "LFM3 NAX prompt q4g32 tf_qmmw_t_nax_win", .threads = 128, .tg_memory = 11264, .reserved = 128, .offline = false },
 };
