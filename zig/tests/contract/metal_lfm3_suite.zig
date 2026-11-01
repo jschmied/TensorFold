@@ -4,6 +4,7 @@ const mtl = @import("metal");
 const contract = @import("contract");
 const postnorm = @import("metal_lfm3_postnorm.zig");
 const lfm3 = @import("metal_lfm3.zig");
+const lfm3_controls = @import("metal_lfm3_controls.zig");
 const lfm3_sums = @import("metal_lfm3_sums.zig");
 const lfm3_attention_sums = @import("metal_lfm3_attention_sums.zig");
 const lfm3_dual = @import("metal_lfm3_dual.zig");
@@ -43,6 +44,8 @@ pub const Suite = struct {
     lfm3_image_controls: [std.enums.values(lfm3_vision.Kind).len]lfm3_vision_controls.Probe = undefined,
     lfm3_image_control_count: usize = 0,
     lfm3_probes: [std.enums.values(lfm3.Kind).len]lfm3.Probe = undefined,
+    lfm3_control_probes: [std.enums.values(lfm3.Kind).len]lfm3.Probe = undefined,
+    lfm3_control_count: usize = 0,
     lfm3_count: usize = 0,
     lfm3_dual_probes: [8]lfm3_dual.Probe = undefined,
     lfm3_dual_count: usize = 0,
@@ -78,6 +81,12 @@ pub const Suite = struct {
             s.lfm3_count += 1;
         }
         for (s.lfm3_probes[0..s.lfm3_count]) |*probe| try kernels.append(a, probe.kernel());
+        for (std.enums.values(lfm3.Kind)) |kind| {
+            if (!wanted(only, lfm3_controls.name(kind))) continue;
+            s.lfm3_control_probes[s.lfm3_control_count] = try lfm3_controls.init(a, device, queue, kind);
+            s.lfm3_control_count += 1;
+        }
+        for (s.lfm3_control_probes[0..s.lfm3_control_count]) |*probe| try kernels.append(a, lfm3_controls.kernel(probe));
         for ([_]u8{ 4, 6, 8 }) |bits| for ([_]usize{ 32, 64 }) |group| {
             const name = try lfm3_dual.label(a, bits, group, .none);
             defer a.free(name);
@@ -229,6 +238,7 @@ pub const Suite = struct {
         for (s.lfm3_image_probes[0..s.lfm3_image_count]) |*probe| probe.deinit();
         for (s.lfm3_image_controls[0..s.lfm3_image_control_count]) |*probe| probe.deinit();
         for (s.lfm3_probes[0..s.lfm3_count]) |*probe| probe.deinit();
+        for (s.lfm3_control_probes[0..s.lfm3_control_count]) |*probe| probe.deinit();
         for (s.lfm3_dual_probes[0..s.lfm3_dual_count]) |*probe| probe.deinit();
         for (s.postnorm_probes[0..s.postnorm_count]) |*probe| probe.deinit();
         if (s.lfm3_skip_probe) |*probe| probe.deinit();

@@ -54,12 +54,20 @@ pub const Probe = struct {
     extra: [3]rig_.Ref = undefined,
     risk: rig_.Ref = undefined,
 
+    /// The production kernel text both LFM3 source files build, in the order the pipelines are compiled.
+    pub fn source(a: std.mem.Allocator) ![]u8 {
+        return std.mem.concat(a, u8, &.{ sources.lfm3, "\n", sources.lfm3_attention });
+    }
     pub fn init(a: std.mem.Allocator, device: mtl.Device, queue: mtl.Queue, kind: Kind) !Probe {
-        const source = try std.mem.concat(a, u8, &.{ sources.lfm3, "\n", sources.lfm3_attention });
-        defer a.free(source);
-        const pipeline = try rig_.pipeline(device, source, symbol(kind));
+        const text = try source(a);
+        defer a.free(text);
+        return initSource(a, device, queue, kind, text);
+    }
+    /// The probe over kernel text the caller supplies, which a planted control edits.
+    pub fn initSource(a: std.mem.Allocator, device: mtl.Device, queue: mtl.Queue, kind: Kind, text: []const u8) !Probe {
+        const pipeline = try rig_.pipeline(device, text, symbol(kind));
         errdefer pipeline.deinit();
-        return .{ .a = a, .arena = .init(a), .rig = .{ .a = a, .device = device, .queue = queue }, .kind = kind, .pipeline = pipeline, .merge = if (math.attention(kind)) try rig_.pipeline(device, source, "lfm3_attn_merge") else null };
+        return .{ .a = a, .arena = .init(a), .rig = .{ .a = a, .device = device, .queue = queue }, .kind = kind, .pipeline = pipeline, .merge = if (math.attention(kind)) try rig_.pipeline(device, text, "lfm3_attn_merge") else null };
     }
     pub fn deinit(p: *Probe) void {
         p.arena.deinit();
