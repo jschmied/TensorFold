@@ -159,14 +159,15 @@ Cache marks retain their existing 128-row policy and can split a larger batch. C
 are checked at chunk boundaries; a 2048-row chunk remains one atomic forward pass.
 The server fills prompts one chunk at a time (`prefill_step`), so the lane host runs the shortest remaining prompt next
 and decodes live streams between chunks instead of finishing every queued prompt first. Where a prompt is cut does
-not change its state (`tf-lfm3-nax-exact`).
+not change its state (`tf-lfm3-nax-exact`), so the backend declares `chunk_invariant` and `--decode-share S` may cap
+chunks at 512 rows while replies decode: that lowers inter-token latency and raises aggregate decode at the cost of
+prompt throughput (`m5-nax-decode-share.json`). Without the flag the server keeps its own cuts.
 
 Kernel-contract probes: `metal LFM3 NAX prompt q{4,6,8}g64`, `q4g32` and `metal LFM3 split structural full|sliding`,
 each with planted controls (`zig build tf-kernel-contract`, `--only "LFM3 NAX prompt"`).
 Developer harnesses (`tf-lfm3-forward ... --nax-prompt`, `tf-lfm3-profile` with `TF_LFM3_NAX_PROMPT=1` and
 `TF_LFM3_DECODE_STEPS=N`) enable the same kernels explicitly.
 
-These are work-in-progress arithmetic changes, not release-qualified replacements. Seam, cancellation, concurrency
-and lifecycle validation of the new routes, other Apple GPU generations and the weights' licence statement remain
-open. Licence: the LiquidAI LFM3 model cards declare `license: other` with `license_name: lfm1.0` and a LICENSE file in each repo.
-Macs checked: an M5 Ultra only.
+These are work-in-progress arithmetic changes, not release-qualified replacements. Other Apple GPU generations and the
+weights' licence statement remain open. Licence: the LiquidAI LFM3 model cards declare `license: other` with
+`license_name: lfm1.0` and a LICENSE file in each repo. Macs checked: an M5 Ultra only.
