@@ -492,7 +492,7 @@ fn attention(enc: *Encoder, s: *st.Scratch, a: wts.Attention, segments: []const 
         }
         var at: usize = 0;
         const window: usize = if (sliding) c.sliding_window else 0;
-        const whole = enc.m.tiled_attention != null and @import("attention_tiled.zig").eligiblePrompt(seg.rows, window, enc.prompt_tiles.attentionTail());
+        const whole = enc.m.tiled_attention != null and !enc.record and @import("attention_tiled.zig").eligiblePrompt(seg.rows, window, enc.prompt_tiles.attentionTail());
         const step = if (whole) seg.rows else st.attn_slice;
         while (at < seg.rows) : (at += step) {
             const rows = @min(seg.rows - at, step);
@@ -502,7 +502,7 @@ fn attention(enc: *Encoder, s: *st.Scratch, a: wts.Attention, segments: []const 
             const args = AttnArgs{ .len = @intCast(first), .cap = cap, .scale = 1.0 / @sqrt(@as(f32, c.head_dim)), .window = if (sliding) c.sliding_window else 0, .chunk_base = @intCast(chunk_base) };
             try enc.begin(.attention);
             if (enc.m.tiled_attention) |pipeline| {
-                if (@import("attention_tiled.zig").eligiblePrompt(rows, args.window, enc.prompt_tiles.attentionTail())) {
+                if (!enc.record and @import("attention_tiled.zig").eligiblePrompt(rows, args.window, enc.prompt_tiles.attentionTail())) {
                     enc.e.setPipeline(pipeline);
                     enc.e.setBuffer(s.queries, (base + at) * c.hidden * 2, 0);
                     enc.e.setBuffer(cache.keys, 0, 1);
