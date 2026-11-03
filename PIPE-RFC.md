@@ -163,6 +163,8 @@ Today one lane host runs one round at a time on one engine thread:
 
 v3 gains room for streams and compute-bound batches, not per-stream speed (section 2), so it comes last.
 
+**Any number of stages:** nothing here is specific to two. The ring runs rank 0, 1, ..., N - 1 and back to rank 0; the plan link is a star of up to 64 ranks (`planlink.max_ranks`); `splitLayers` cuts N ranges. With N stages a v1 token adds N hops (about 2 % at four stages on 1 GbE for Qwen 27B), each node is busy 1/N of the time, v2 approaches N times faster for long prompts, and v3 needs at least N groups.
+
 **Drafters:**
 - MTP taps only the last layer and reuses the head (`families/qwen3_5/cuda_mtp.zig:121, 157, 354`), so it stays on rank 0.
 - DFlash2 taps the drafter's `target_layer_ids` (for example 5, 19, 33, 47 and 61) on whichever stage holds them (`cuda_forward.zig:116-118`). Those taps would ride back with the row, about 50 KiB more a row. v1 serves MTP or no drafter.
@@ -181,7 +183,7 @@ Days are for one engineer who knows the code **(guess)**.
 | # | step | shown on | useful alone because | days |
 |---|---|---|---|---|
 | 1 | TCP `Collective` backend (`send` / `recv`, framing, deadlines) beside NCCL, with host tests and a localhost pair | host, GB10 | the link every later step uses; also Linux pairs without RoCE | 2-3 |
-| 2 | Qwen 27B CUDA stage mode, v1: ring with the head on rank 0, follower KV, `keep` through the plan; two processes on one GB10 | GB10 | same bits as one node (as the prototype), serving through the lane host | 4-6 |
+| 2 | Qwen 27B CUDA stage mode, v1: ring with the head on rank 0, any number of stages, follower KV, `keep` through the plan; two and three processes on one GB10 (three covers a middle stage) | GB10 | same bits as one node (as the prototype), serving through the lane host | 4-6 |
 | 3 | `fabric/tp` on macOS: TCP backend, bootstrap, plan link, fail-fast | Mac | the Metal engine can join a rank group at all | 2-3 |
 | 4 | Qwen 27B Metal follower stage | Mac | a Mac holds a layer range | 4-6 |
 | 5 | GB10 + Mac over Ethernet, v1: deterministic per placement, each stage within its family's tolerance (section 5) | GB10 + Mac | the mixed goal, measured | 2 |
