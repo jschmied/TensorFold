@@ -118,13 +118,13 @@ The next steps for the prototype are loading only each stage's layers, chunked p
   - The condition is that each stage sees the same batch composition as one node would. Kernels that are not batch-invariant would otherwise differ **(guess: true for the current engines' row-batched paths; to be checked per family)**.
 - **Mixed CUDA and Metal:** no promise of equality with either single node, because each stage's bits come from its own backend.
   - What we can promise: the same placement, engine versions and inputs give the same bits (deterministic per placement).
-  - Per-stage tolerance does not compose: an early stage's small error can grow through later layers and the recurrent state. So the check is end to end, against a whole-model reference with the same weights and inputs: logit differences, greedy-divergence statistics over long contexts, the DeltaNet states at chosen positions, and repeated runs of one placement. Determinism per placement also assumes the same execution shapes (chunk sizes and row batches).
+  - Per-stage tolerance does not compose: an early stage's small error can grow through later layers and the recurrent state. So the check is end to end, against a whole-model reference with the same weights and inputs: the KL divergence and the largest logit difference, teacher-forced top-1 agreement, greedy split positions over long contexts, the DeltaNet states at chosen positions, and repeated runs of one placement. Determinism per placement also assumes the same execution shapes (chunk sizes and row batches).
   - The served reply should say which placement produced it **(proposal)**.
 - **Not promised:** bits across a re-placement, which is why section 4 recommends (b).
 
 ## 6. Fit with the current design
 
-The CUDA engines already have a coordination layer: the tensor-parallel fabric (`zig/src/fabric/tp`). The pipeline should join it, not the cluster runtime (`zig/src/cluster`). The cluster runtime is MCDMA-only, builds only on macOS, has no CUDA shard, and its rounds never read membership (`CLUSTER-AUDIT.md`, sections 3 and 4).
+The CUDA engines already have a coordination layer: the tensor-parallel fabric (`zig/src/fabric/tp`). The pipeline should join it, not the cluster runtime (`zig/src/cluster`). The cluster runtime is MCDMA-only, builds only on macOS, has no CUDA shard, and its rounds never read membership (`CLUSTER-AUDIT.md`, sections 3 and 4). That is main today: #1957 (#1594 step 1) adds ConnectX links to `fabric/mcdma`, and #1594's next step brings the cluster runtime up on a Linux CUDA host, which makes the cluster runtime a real second answer to question 1.
 
 ### 6.1 Communication
 
