@@ -28,30 +28,44 @@ Draft by Jürgen Schmied. Against upstream `main` `933b969fa`, and #1922 (Starli
 - the token ids, for families whose layers read them (Flash-Next's PLE n-gram embeddings, **(guess)** that each stage needs them);
 - the round's row map (slots, positions), as the cluster's round commands carry today (`cluster/round.zig:17-89`).
 
-**Sizes per stage boundary.** Qwen 27B is `hidden_size` 5120 and 64 layers (`zig/src/families/qwen27/gdn_test.zig:9`). Flash-Next carries 4 residual streams of 2560 (`zig/src/families/flashnext/cuda_prompt_wt.zig:10-15`, `wide = streams * dims`).
+**Sizes per stage boundary.** Qwen 27B is `hidden_size` 5120 and 64 layers (`zig/src/families/qwen27/gdn_test.zig:9`). Between layers its CUDA engine keeps two bf16 rows, the hidden state and the residual (`e.h` and `e.r`), so its own dtype is already bf16 and an exact boundary carries 2 × 5,120 bf16 values. Flash-Next carries 4 residual streams of 2560 (`zig/src/families/flashnext/cuda_prompt_wt.zig:10-15`, `wide = streams * dims`).
 
-| model | values a row | decode, 1 row (f32 / bf16) | prompt chunk, 4096 rows (f32 / bf16) |
+| model | values a row | decode, 1 row | prompt chunk, 4096 rows |
 |---|---|---|---|
-| Qwen 27B | 5,120 | 20 KiB / 10 KiB | 80 MiB / 40 MiB |
-| Flash-Next | 10,240 | 40 KiB / 20 KiB | 160 MiB / 80 MiB |
+| Qwen 27B (h and r, bf16, exact) | 2 × 5,120 | 20 KiB | 80 MiB |
+| Flash-Next (f32 / bf16) | 10,240 | 40 KiB / 20 KiB | 160 MiB / 80 MiB |
 
 **Latency budget per boundary.** I assume about 115 MB/s of payload at 1 GbE and about 1.15 GB/s at 10 GbE, with a LAN one-way latency of about 0.1 ms **(guess)**.
 
 | | 1 GbE | 10 GbE |
 |---|---|---|
-| decode, Qwen 27B row (f32) | ≈ 0.3 ms | ≈ 0.12 ms |
+| decode, Qwen 27B row (h and r) | ≈ 0.3 ms | ≈ 0.12 ms |
 | decode, Flash-Next row (f32) | ≈ 0.45 ms | ≈ 0.14 ms |
-| prompt chunk, Qwen 27B (f32 / bf16) | ≈ 0.73 s / 0.36 s | ≈ 73 ms / 36 ms |
+| prompt chunk, Qwen 27B (h and r) | ≈ 0.73 s | ≈ 73 ms |
 | prompt chunk, Flash-Next (f32 / bf16) | ≈ 1.46 s / 0.73 s | ≈ 146 ms / 73 ms |
 
-- **Decode:** a token costs one hidden hop per boundary plus a 4-byte token back. Next to a decode step of tens of ms on a GB10 **(guess)**, that is under 2–3 % at 1 GbE.
+- **Decode:** a token costs one hidden hop per boundary plus a 4-byte token back. A plain Qwen 27B (MLX 4-bit) decode step is about 64 ms on a GB10 (measured, section 2a), so a 0.3 ms hop at 1 GbE is about 0.5 %.
 - **Prompts:** the chunks pipeline. Chunk k+1 computes on stage 1 while chunk k crosses the link and computes on stage 2. So the link only costs time when it is slower than a stage.
-  - At 1 GbE that is likely for Flash-Next, whose MoE compute per row is small **(guess)**.
+  - Qwen 27B (measured): a cold 32k prompt takes 25.0 s on one GB10, about 3.1 s a 4096-row chunk, so about 1.6 s a chunk on each of two stages. The 0.73 s a chunk at 1 GbE hides behind that.
+  - At 1 GbE a slower link than a stage is likely for Flash-Next, whose MoE compute per row is small **(guess)**.
   - 10 GbE or more is the comfortable target for long prompts.
+- **Speed against fit:** at one stream a pipeline is not faster than one node; each stage idles while the others work. What it buys is fit: a model larger than one node, or a GB10 and a Mac serving one model. Throughput needs micro-batching across slots (question 5).
+
+## 2a. A prototype: Qwen 27B in two stages on one GB10
+
+To check the boundary before proposing it, I split Qwen3.8-27B (MLX 4-bit) into layers 0-32 and 32-64 in two processes on one GB10, with the boundary over localhost TCP (no Nagle). It is a test-tool mode, not a server, and both processes still load every weight.
+
+- **Exact:** the last stage's logits equal one process's logits at all 128 greedy steps of a 2,000-token prompt, byte for byte, in both runs.
+- **Decode:** 65.2 and 65.3 ms a step split, against 63.6 and 65.1 ms whole: up to 1.6 ms for two device copies and the hop, on a step that runs nothing in parallel.
+- **Prompt:** one 2,000-row chunk takes 1,632-1,637 ms split against 1,536-1,543 ms whole. The 40 MiB of rows cost about 95 ms, all of it visible, because a single chunk leaves nothing to overlap.
+- **One trap:** the CUDA engine's `init` sets its fields one by one, so a new field's default is never applied. A stage field left unset gave NaN logits on the whole path.
+
+The next steps for the prototype are loading only each stage's layers, chunked prompts with overlap, and a second machine.
 
 ## 3. Planning
 
 **What exists:**
+- The cluster config already has a pipeline degree, `models.<id>.parallel.pipeline` (`cluster/config.zig:224, 285-289`), and its mixed-backend refusal already suggests it: "put each backend in its own pipeline stage" (`cluster/config.zig:298`).
 - `plan.zig` already cuts uneven, contiguous layer ranges. Each stage's share is weighted by its ranks' `gpu_limit` (`cluster/plan.zig:153-159`), through `splitLayers` (`cluster/plan.zig:177-196`).
 - Speed today only splits work within a stage (`cluster/plan.zig:141-144, 162-171`).
 - Every stage has the same width (`cluster/plan.zig:123`), and stages take nodes in id order (`cluster/plan.zig:156, 161`).
@@ -151,7 +165,7 @@ Each step is useful alone. Days are for one engineer who knows the code **(guess
    - Engine flags placed by Starlight (simplest, like `tensor_parallel` env ranks);
    - the cluster runtime's rounds (exact batching, but MCDMA-shaped today);
    - or engine flags plus the cluster planner as a library? I'd propose the last.
-2. **Hidden rows on the wire:** the engine's own dtype (exact, larger), or bf16 (half the bytes, different bits)?
+2. **Hidden rows on the wire:** the engine's own dtype (exact, larger), or bf16 (half the bytes, different bits)? For Qwen 27B these are the same, since its own rows are bf16 (section 2); the question is for Flash-Next.
 3. **First family:** Qwen 27B (simpler, dense GDN), or Flash-Next (the one we want to serve)?
 4. **Is "deterministic per placement, within single-node tolerance" acceptable** as the promise for CUDA + Metal pipelines?
 5. **Micro-batching:** v1 serves one round at a time through the chain, so stages idle while others work. Should v1 add micro-batches across slots, or keep it for later?
