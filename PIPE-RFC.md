@@ -132,7 +132,7 @@ The CUDA engines already have a coordination layer: the tensor-parallel fabric (
 - TCP rank bootstrap, a star on rank 0, and a settings agreement (`bootstrap.zig`).
 - Rank 0's round plan to the followers over its own TCP connection (`planlink.zig`).
 - Fail-fast: a failed or vanished rank ends all ranks (`fate.zig`).
-- These three and `sock.zig` import only `std`, so they can build on macOS as they are.
+- `bootstrap.zig` and `sock.zig` import only `std`, and `fate.zig` already branches on the OS (`fate.zig:65`). `planlink.zig` is Linux-specific: `linux.poll`, CPU pinning with `sched_setaffinity`, `/proc` reads and `MSG_MORE` (`planlink.zig:7-13, 213-217, 254-287`). The build wires `tp` only beside a CUDA module (`zig/build/tp.zig`, `zig/build/cuda_engines.zig:13`), so a Metal build needs these four split into a control module without `cuda`, and `planlink` ported to `std.posix.poll` with pinning Linux-only.
 - The `Collective` is CUDA-typed (`collective.zig:3-6`: `cuda.abi.DevicePtr`, `cuda.abi.Stream`). A Metal follower cannot implement it, so the activation hop does not go through it.
 
 **Proposed: a stage link beside the control plane.**
