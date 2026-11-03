@@ -1,6 +1,6 @@
 # RFC: a layer-range (pipeline) layout across mixed nodes
 
-Draft by Jürgen Schmied. Against upstream `main` `933b969fa`, and #1922 (Starlight) at its head `39ecd68b3`.
+Draft by Jürgen Schmied. Against upstream `main` `933b969fa`, and #1922 (Starlight) at its head `39ecd68b3`; section 6 against `main` `071cefe08`.
 
 **Conventions:**
 - `cluster/…` is `zig/src/cluster/…` and `sl/…` is `starlight/…` in #1922.
@@ -19,9 +19,9 @@ Draft by Jürgen Schmied. Against upstream `main` `933b969fa`, and #1922 (Starli
 ## 2. The layout
 
 **A stage** is one node (or one tensor-parallel group of identical nodes) holding layers `a..b` of one model:
-- the first stage also holds the embeddings, and the last also holds the final norm and the head;
-- each stage keeps KV / recurrent state for its own layers only;
-- the stages form a chain. The last stage samples, and sends the token id back to the first.
+- rank 0 serves: it holds the lane host, the embeddings and the first layer range, and also the final norm, the head, the sampler and any drafter;
+- the other ranks hold their layer ranges only, and each stage keeps KV / recurrent state for its own layers;
+- the rows go round a ring: rank 0, 1, ..., the last, and back to rank 0 for the head. That costs one more hidden hop (20 KiB a row for Qwen 27B) than a chain, and keeps sampling, penalties, stop strings, the prompt cache's host side and MTP on one node, unchanged.
 
 **What crosses the wire each step:**
 - the hidden rows after layer `b`, in the dtype the engine itself keeps between layers. A narrower wire type would change bits (see 5);
@@ -49,7 +49,10 @@ Draft by Jürgen Schmied. Against upstream `main` `933b969fa`, and #1922 (Starli
   - Qwen 27B (measured): a cold 32k prompt takes 25.0 s on one GB10, about 3.1 s a 4096-row chunk, so about 1.6 s a chunk on each of two stages. The 0.73 s a chunk at 1 GbE hides behind that.
   - At 1 GbE a slower link than a stage is likely for Flash-Next, whose MoE compute per row is small **(guess)**.
   - 10 GbE or more is the comfortable target for long prompts.
-- **Speed against fit:** at one stream a pipeline is not faster than one node; each stage idles while the others work. What it buys is fit: a model larger than one node, or a GB10 and a Mac serving one model. Throughput needs micro-batching across slots (question 5).
+- **Speed against fit:**
+  - **Decode** at one stream is not faster than one node: a token still passes every weight in order, and decode is bound by reading them. Overlapped micro-batches keep both nodes busy, but in the memory-bound regime that buys room for more streams (twice the KV), not faster streams.
+  - **Prompts** can be faster at one stream. With chunks overlapped, a prompt of n chunks on two stages takes about (n + 1) / 2 chunk-times of one node's, so about 1.8x faster to the first token at 8 chunks (a 32k prompt), as long as the link is faster than a stage.
+  - What a pipeline always buys is fit: a model larger than one node, or a GB10 and a Mac serving one model.
 
 ## 2a. A prototype: Qwen 27B in two stages on one GB10
 
@@ -116,56 +119,87 @@ The next steps for the prototype are loading only each stage's layers, chunked p
   - The served reply should say which placement produced it **(proposal)**.
 - **Not promised:** bits across a re-placement, which is why section 4 recommends (b).
 
-## 6. Where it plugs in
+## 6. Fit with the current design
 
-**Engine** (per family; the real work):
-- a stage mode, `--layers a..b` with `--next host:port` and `--prev`, that:
-  - loads only its layers' tensors (plus the embeddings / head at the ends);
-  - runs the forward over those layers on incoming hidden rows;
-  - keeps KV / state for those layers;
-  - forwards rows to the next stage. The last stage samples and returns the token.
-- **Weights:** the cluster's loader already reads per-rank byte ranges (`cluster/loader.zig:1`, `cluster/metal_sink.zig:31-38`). A CUDA counterpart of the Metal sink is needed. Flash-Next's loader already reads per-layer prefixes (`zig/src/families/flashnext/cuda_modelopt_experts.zig:64`).
-- **Order:** Qwen 27B (dense GDN) first. Then Flash-Next, whose HC streams and PLE token inputs make the stage interface wider **(guess: +3–4 days per backend)**.
+The CUDA engines already have a coordination layer: the tensor-parallel fabric (`zig/src/fabric/tp`). The pipeline should join it, not the cluster runtime (`zig/src/cluster`). The cluster runtime is MCDMA-only, builds only on macOS, has no CUDA shard, and its rounds never read membership (`CLUSTER-AUDIT.md`, sections 3 and 4).
 
-**Cluster runtime:**
-- `backend.Shard.forward` (`cluster/backend.zig:11-23`) gains a hidden-row input and output for a stage.
-- A TCP link implements `transport.zig`'s interface, which today says "never TCP" (`cluster/transport.zig:1`). The config allows `"transport": "tcp"` for pipeline-only layouts (today MCDMA only, `cluster/config.zig:115-116`).
-- The planner change is from section 3.
-- This also unblocks a Linux cluster build. The module already compiles and passes its tests on Linux (`CLUSTER-AUDIT.md`, section 6).
+### 6.1 Communication
 
-**Starlight** (one more layout beside `tensor_parallel`):
-- A deployment field `pipeline: <family>`, with `nodes: N`.
-- The controller asks the planner for ranges, instead of splitting `memory_gib` evenly (`sl/docs/fleet.md:39`).
-- Each member gets a `Group`, as tensor parallel does (`sl/internal/control/wire/ranks.go:39-46`): `Member` is the stage index, `FirstRank` / `World` its layer range and the model's layers, and `Master` / `Port` the next stage's address, from the node's `rank_host` (`sl/internal/control/sync.go:133-145`).
-- As with rank groups, the first stage's node serves and the others serve nothing (`sl/docs/nodes.md:34-36`).
-- Draining a pipeline drains all its stages together (section 4, b).
+**What exists in `fabric/tp`:**
+- TCP rank bootstrap, a star on rank 0, and a settings agreement (`bootstrap.zig`).
+- Rank 0's round plan to the followers over its own TCP connection (`planlink.zig`).
+- Fail-fast: a failed or vanished rank ends all ranks (`fate.zig`).
+- Point-to-point `send` / `recv` on the stream-ordered, graph-capturable `Collective` (`collective.zig:49-50`). Its NCCL backend serves two CUDA nodes, and the hop can then sit inside a captured decode graph.
+
+**What is missing:**
+- A TCP `Collective` backend implementing `send` / `recv` only, with no reductions. It is needed for plain Ethernet, for a Mac, and for two processes on one GPU, where NCCL refuses two ranks.
+- GB10 and Apple silicon both have unified memory, so staging through the host is cheap.
+- The Metal engine has no `fabric/tp` at all. It needs the TCP backend, bootstrap and the plan link on macOS.
+
+### 6.2 Node coordination
+
+- **Launch and roles** work as for `tensor_parallel` today. Starlight starts each rank with its environment (rank, master, port) and its layer range, and rank 0 serves.
+- **Ranges** come from `cluster/plan.zig`'s `splitLayers` used as a library: by memory today, by measured speed later (section 3).
+- **Churn** is fail-fast as it stands: one rank lost ends the replica, and Starlight restarts it. That is option (b) of section 4, so v1 needs no membership work.
+- **Per-row metadata** (positions, slots, segments, draw rules) rides the plan link, as in tensor parallel.
+- **New work on the followers**, the largest part of this layer:
+  - each stage holds KV and recurrent state for its own layers a slot;
+  - `keep` (the rollback to an accepted path after a verify) reaches every stage through the plan;
+  - the prompt cache saves and restores each stage's part under one key;
+  - rank 0's admission charges by the tightest stage. The followers report their pools at bootstrap, which fits the byte budget planned in #1943.
+
+### 6.3 Scheduling
+
+Today one lane host runs one round at a time on one engine thread:
+- `step` lands any in-flight token before it plans (`core/lanes/engine.zig:128-131`);
+- `verify` reads its tokens back before `step` returns (`families/qwen3_5/cuda_native.zig:416-474`, `cuda_engine.zig:544-546`);
+- the engine has one CUDA stream, one set of activation buffers, one staged-table buffer and one graph map (`cuda_engine.zig:82-156`).
+
+| level | what it is | fits today | what changes |
+|---|---|---|---|
+| v1: in turn | a round runs front, send, the other stages, receive, then the head | yes | `verify` and the prompt step become front, send, receive, head inside the family. The lane host is unchanged. The decode graph is split per stage, or holds NCCL's send and receive. |
+| v2: prompt overlap | one prompt's chunks overlap across the stages | mostly | `prefill_step` issues chunk k + 1's front before chunk k's head returns, inside the family, with a second set of activation buffers. The lane host is unchanged. |
+| v3: decode micro-batches | two groups of streams in flight | no | `verify` splits into issue and complete halves, with scratch and graphs for each group, and the lanes `Engine` plans two round sequences. That is the core lanes code every family shares. |
+
+v3 gains room for streams and compute-bound batches, not per-stream speed (section 2), so it comes last.
+
+**Drafters:**
+- MTP taps only the last layer and reuses the head (`families/qwen3_5/cuda_mtp.zig:121, 157, 354`), so it stays on rank 0.
+- DFlash2 taps the drafter's `target_layer_ids` (for example 5, 19, 33, 47 and 61) on whichever stage holds them (`cuda_forward.zig:116-118`). Those taps would ride back with the row, about 50 KiB more a row. v1 serves MTP or no drafter.
+
+**Graphs:** decode is captured from embed to head today (`cuda_engine.zig:511-526`). Each stage needs its own capture, and on TCP the hop stays outside the captured region.
 
 ## 7. Steps
 
-Each step is useful alone. Days are for one engineer who knows the code **(guess)**. The audit's 19–26 days (`CLUSTER-AUDIT.md`, section 7) are refined here for a pipeline only.
+The test hardware is one GB10 and one Mac. That sets the order:
+- two CUDA nodes over NCCL can't be tested, and NCCL refuses two ranks on one GPU, so the TCP backend comes first;
+- the only two-machine test is GB10 + Mac, so a Metal follower comes before any speed claim;
+- two processes on one GB10 share its GPU, so they show exactness, not overlap gains.
 
-| # | step | useful alone because | days | needs |
+Days are for one engineer who knows the code **(guess)**.
+
+| # | step | shown on | useful alone because | days |
 |---|---|---|---|---|
-| 1 | Hidden-row wire format and a TCP stage link (framing, back-pressure, timeouts), tested over localhost with the cluster's toy model in two stages: same tokens as one rank | the transport every later step uses | 2–3 | host |
-| 2 | Qwen 27B CUDA stage mode (`--layers`, `--next`), two processes on one GB10 or two GB10s over Ethernet; same bits as one node | splits a model too large for one GB10, with no RoCE | 4–6 | GPU |
-| 3 | Planner: split by time with a memory cap, width-1 stages on mixed backends, a Linux / CUDA probe and per-family calibration; `cluster check` prints the split | correct ranges for any mix, used by Starlight or the CLI | 2–3 | host |
-| 4 | Qwen 27B Metal stage mode; two Macs over Ethernet or Thunderbolt IP | Mac pairs without MCDMA | 4–6 | Mac |
-| 5 | Starlight `pipeline` layout: placement from step 3, stage groups, drain as one | fleet placement and draining of pipelines | 2–3 | host |
-| 6 | Churn (b): stage loss fails in-flight requests (retryable), re-plans, and serves anew | survives a node leaving | 1–2 | host |
-| 7 | GB10 + Mac end to end, with the exactness wording from section 5 checked (repeatable per placement, within tolerance of each single node) | the mixed goal | 2 | GPU + Mac |
-| 8 | Flash-Next stage mode (HC streams, PLE inputs) on both backends | the second family | 6–8 | GPU + Mac |
+| 1 | TCP `Collective` backend (`send` / `recv`, framing, deadlines) beside NCCL, with host tests and a localhost pair | host, GB10 | the link every later step uses; also Linux pairs without RoCE | 2-3 |
+| 2 | Qwen 27B CUDA stage mode, v1: ring with the head on rank 0, follower KV, `keep` through the plan; two processes on one GB10 | GB10 | same bits as one node (as the prototype), serving through the lane host | 4-6 |
+| 3 | `fabric/tp` on macOS: TCP backend, bootstrap, plan link, fail-fast | Mac | the Metal engine can join a rank group at all | 2-3 |
+| 4 | Qwen 27B Metal follower stage | Mac | a Mac holds a layer range | 4-6 |
+| 5 | GB10 + Mac over Ethernet, v1: deterministic per placement, each stage within its family's tolerance (section 5) | GB10 + Mac | the mixed goal, measured | 2 |
+| 6 | v2: chunked prompt overlap | GB10 + Mac | the first measurable speed gain, time to first token | 2-3 |
+| 7 | Planner by measured speed with a memory cap; Starlight `pipeline` layout | host | correct ranges for any mix, placed by the fleet | 3-4 |
+| 8 | Prompt cache and admission across stages (with #1943's byte budget) | GB10 + Mac | resumed prompts and full admission on a pipeline | 3-4 |
+| 9 | v3: decode micro-batches in the lanes core | GB10 + Mac | room for more streams | 5-8, after agreement |
+| 10 | Flash-Next stage mode, and DFlash2 taps across stages | GB10 + Mac | the second family and the faster drafter | 6-8 |
 
-- **Total:** 17–25 days for Qwen 27B (steps 1–7), and 23–33 days with Flash-Next.
-- **Host-only:** steps 1, 3, 5 and 6 (7–11 days).
-- **Compared with the audit:** the Linux cluster build, the cluster-side Shard work and the app profile are folded into steps 1, 3 and 5, and churn re-prefill (option a) is left out.
+- **Total:** 22-31 days to step 8, which is a served GB10 + Mac pipeline with prompt overlap, resume and admission. Steps 9 and 10 add 11-16 days.
+- **Host-only:** steps 1 and 7 (5-7 days).
+- **Not testable here:** two CUDA nodes over NCCL / RoCE. The NCCL `send` / `recv` path would need a second CUDA node, or ashhart's pair.
 
 ## 8. Open questions for the maintainer
 
-1. **Where should the layout live?**
-   - Engine flags placed by Starlight (simplest, like `tensor_parallel` env ranks);
-   - the cluster runtime's rounds (exact batching, but MCDMA-shaped today);
-   - or engine flags plus the cluster planner as a library? I'd propose the last.
+1. **Where should the layout live?** I'd propose the `fabric/tp` rank model, with engine flags placed by Starlight and the cluster planner as a library (section 6), rather than the cluster runtime's MCDMA rounds. Is that the direction you want, or should the cluster runtime gain CUDA and TCP instead?
 2. **Hidden rows on the wire:** the engine's own dtype (exact, larger), or bf16 (half the bytes, different bits)? For Qwen 27B these are the same, since its own rows are bf16 (section 2); the question is for Flash-Next.
 3. **First family:** Qwen 27B (simpler, dense GDN), or Flash-Next (the one we want to serve)?
 4. **Is "deterministic per placement, within single-node tolerance" acceptable** as the promise for CUDA + Metal pipelines?
-5. **Micro-batching:** v1 serves one round at a time through the chain, so stages idle while others work. Should v1 add micro-batches across slots, or keep it for later?
+5. **Micro-batching (v3):** it changes the lanes core every family shares (section 6.3). Is a later change there acceptable, or should pipelines stay at v1 and v2?
+6. **A second CUDA node:** we have one GB10 and one Mac. Could the NCCL path (two CUDA nodes) be checked on your pair once steps 1 and 2 land?
