@@ -44,14 +44,15 @@ Draft by Jürgen Schmied. Against upstream `main` `933b969fa`, and #1922 (Starli
 | prompt chunk, Qwen 27B (h and r) | ≈ 0.73 s | ≈ 73 ms |
 | prompt chunk, Flash-Next (f32 / bf16) | ≈ 1.46 s / 0.73 s | ≈ 146 ms / 73 ms |
 
-- **Decode:** a token costs one hidden hop per boundary plus a 4-byte token back. A plain Qwen 27B (MLX 4-bit) decode step is about 64 ms on a GB10 (measured, section 2a), so a 0.3 ms hop at 1 GbE is about 0.5 %.
+- **Decode:** on the ring a token costs one hidden hop per stage, back to rank 0 included: two hops for two stages, about 0.56 ms at 1 GbE on the wire. A plain Qwen 27B (MLX 4-bit) decode step is about 64 ms on a GB10 (measured, section 2a), so the wire is about 1 %. GPU synchronization, staging and waking the peer come on top: the prototype measured 0.2-1.6 ms in all on localhost, and step 1 measures them apart from the wire.
 - **Prompts:** the chunks pipeline. Chunk k+1 computes on stage 1 while chunk k crosses the link and computes on stage 2. So the link only costs time when it is slower than a stage.
-  - Qwen 27B (measured): a cold 32k prompt takes 25.0 s on one GB10, about 3.1 s a 4096-row chunk, so about 1.6 s a chunk on each of two stages. The 0.73 s a chunk at 1 GbE hides behind that.
+  - Qwen 27B (measured): a cold 32k prompt takes 25.0 s on one GB10, about 3.1 s a 4096-row chunk, so about 1.55 s a chunk on each of two stages. The 0.73 s a chunk at 1 GbE hides behind that.
+  - The last stage need not send a whole chunk back to rank 0 when only the last row's logits are wanted: one row suffices. MTP absorbs the last layer's rows for every prompt row, and full prompt logprobs need every row, so those keep the full return.
   - At 1 GbE a slower link than a stage is likely for Flash-Next, whose MoE compute per row is small **(guess)**.
   - 10 GbE or more is the comfortable target for long prompts.
 - **Speed against fit:**
   - **Decode** at one stream is not faster than one node: a token still passes every weight in order, and decode is bound by reading them. Overlapped micro-batches keep both nodes busy, but in the memory-bound regime that buys room for more streams (twice the KV), not faster streams.
-  - **Prompts** can be faster at one stream. With chunks overlapped, a prompt of n chunks on two stages takes about (n + 1) / 2 chunk-times of one node's, so about 1.8x faster to the first token at 8 chunks (a 32k prompt), as long as the link is faster than a stage.
+  - **Prompts** can be faster at one stream. With chunks overlapped, a prompt of n chunks on two stages takes about (n + 1) stage-times plus one link transfer: 9 x 1.55 + 0.73 = 14.7 s for a 32k Qwen 27B prompt against 25.0 s, so about 1.7x to the first token, before scheduling overhead. That is the ideal; short prompts (one or two chunks) can be slower than one node, since there is nothing to overlap the fill and the transfer with.
   - What a pipeline always buys is fit: a model larger than one node, or a GB10 and a Mac serving one model.
 
 ## 2a. A prototype: Qwen 27B in two stages on one GB10
@@ -76,8 +77,8 @@ The next steps for the prototype are loading only each stage's layers, chunked p
 - `cost.zig` prices a stage at its slowest rank (`cluster/cost.zig:137-149`), with FLOPs per backend (`cluster/cost.zig:92-95`).
 
 **Proposed:**
-1. **Split by time, capped by memory.** For a pure pipeline (tensor = 1), give stage *i* layers in proportion to its measured speed for this family, then move layers off any stage whose weights + KV + state exceed its `gpu_limit` (budget's check). That is a change to `splitLayers`' weights only.
-2. **Order stages** to keep the first and last stages on the nodes that hold the embeddings and head cheaply. Keep id order as the default.
+1. **Place the ends explicitly.** Today `placeOf` puts `.head` and `.final_norm` on the last stage (`cluster/plan.zig:202`). The ring needs them on rank 0, with the embeddings. A pipeline layout names where the head goes, and rank 0's budget counts the embeddings, final norm, head, any drafter and the boundary's staging buffers.
+2. **Search the boundaries, capped by memory.** Layer bytes are a poor measure of time: Qwen's DeltaNet and full-attention layers cost differently, and the gap moves with context and batch. With a measured time per layer for each node and a few stages over 64 layers, an exhaustive search over contiguous boundaries is cheap. It minimises decode time (the sum of stage times plus the hops), or prompt time (the sum plus (chunks - 1) times the slowest stage or link), within each stage's memory. It is no longer a change to `splitLayers`' weights alone.
 3. **Allow width 1 per stage on mixed backends.** Keep the tensor-parallel same-backend rule (`cluster/config.zig:298`).
 
 **What a node reports** (beyond the cluster's `Inventory`: backend, memory, `gpu_limit`, bandwidth, cores, unified, `cluster/node.zig:46-65`; and Starlight's `Facts`: platform, backend, memory, GPUs, `rank_host`, `sl/internal/control/wire/wire.go:56-68`):
@@ -91,6 +92,8 @@ The next steps for the prototype are loading only each stage's layers, chunked p
 - Membership tracks alive / suspect / dead / left (`cluster/membership.zig:12, 304-315`), but nothing reads a view change (`cluster/status.zig:83`, `cluster/bringup.zig:33-44`).
 - A lost peer ends the round with `PeerTimeout` (`cluster/exchange.zig:39, 107`; `cluster/barrier.zig:51`).
 - Starlight drains and stops any replica it no longer lists (`sl/docs/nodes.md:23-25`) and gives a node 180 s to drain on shutdown (`sl/docs/nodes.md:69`).
+
+**What a client sees:** a request that fails before its first byte gets a retryable 503. A stream that has already sent tokens cannot become a 503: it ends with the protocol's error event where the API has one, and otherwise with a closed connection and no final `finish_reason`, so a client can tell it is incomplete.
 
 **Options when a node leaves mid-request:**
 - **(a) Re-plan, then rebuild the lost stage's KV by re-prefilling from the request's tokens.** The server has the prompt and the tokens it generated.
@@ -115,7 +118,7 @@ The next steps for the prototype are loading only each stage's layers, chunked p
   - The condition is that each stage sees the same batch composition as one node would. Kernels that are not batch-invariant would otherwise differ **(guess: true for the current engines' row-batched paths; to be checked per family)**.
 - **Mixed CUDA and Metal:** no promise of equality with either single node, because each stage's bits come from its own backend.
   - What we can promise: the same placement, engine versions and inputs give the same bits (deterministic per placement).
-  - Each stage also stays within its family's single-node tolerance of a reference.
+  - Per-stage tolerance does not compose: an early stage's small error can grow through later layers and the recurrent state. So the check is end to end, against a whole-model reference with the same weights and inputs: logit differences, greedy-divergence statistics over long contexts, the DeltaNet states at chosen positions, and repeated runs of one placement. Determinism per placement also assumes the same execution shapes (chunk sizes and row batches).
   - The served reply should say which placement produced it **(proposal)**.
 - **Not promised:** bits across a re-placement, which is why section 4 recommends (b).
 
@@ -129,12 +132,17 @@ The CUDA engines already have a coordination layer: the tensor-parallel fabric (
 - TCP rank bootstrap, a star on rank 0, and a settings agreement (`bootstrap.zig`).
 - Rank 0's round plan to the followers over its own TCP connection (`planlink.zig`).
 - Fail-fast: a failed or vanished rank ends all ranks (`fate.zig`).
-- Point-to-point `send` / `recv` on the stream-ordered, graph-capturable `Collective` (`collective.zig:49-50`). Its NCCL backend serves two CUDA nodes, and the hop can then sit inside a captured decode graph.
+- These three and `sock.zig` import only `std`, so they can build on macOS as they are.
+- The `Collective` is CUDA-typed (`collective.zig:3-6`: `cuda.abi.DevicePtr`, `cuda.abi.Stream`). A Metal follower cannot implement it, so the activation hop does not go through it.
 
-**What is missing:**
-- A TCP `Collective` backend implementing `send` / `recv` only, with no reductions. It is needed for plain Ethernet, for a Mac, and for two processes on one GPU, where NCCL refuses two ranks.
-- GB10 and Apple silicon both have unified memory, so staging through the host is cheap.
-- The Metal engine has no `fabric/tp` at all. It needs the TCP backend, bootstrap and the plan link on macOS.
+**Proposed: a stage link beside the control plane.**
+- **Control:** bootstrap, the plan link and fail-fast as they are, with rank 0 the hub.
+- **Data:** direct TCP connections between ring neighbours (rank i to i + 1, the last to rank 0), never relayed through rank 0. Framing carries the round's sequence number and the slot rows' count, and every read and write has a deadline.
+- **The backend's side** is its own: the producing stage's work is complete on its device before the bytes leave (a stream synchronize on CUDA, a completed command buffer on Metal), and the received bytes are in a buffer the next kernel may read before it is launched. Both machines have unified memory, so the boundary buffer can be host-visible on both and no copy is needed past the socket.
+- **v1 is blocking:** send, then receive, in turn. v2 needs a nonblocking form, with a completion per buffer and two buffers a boundary so a chunk's rows are not overwritten while in flight.
+- On two CUDA nodes, NCCL `send` / `recv` can later replace the TCP data path and sit inside a captured graph.
+
+**Trust:** the listener binds every IPv4 address (`sock.zig:34-43`), and nothing authenticates a peer. v1 is for a trusted network only, and the settings agreement also checks the checkpoint's and the layout's fingerprints, so a rank with other weights or another range is refused. Authenticated, encrypted links for untrusted networks are a separate requirement.
 
 ### 6.2 Node coordination
 
@@ -147,6 +155,10 @@ The CUDA engines already have a coordination layer: the tensor-parallel fabric (
   - `keep` (the rollback to an accepted path after a verify) reaches every stage through the plan;
   - the prompt cache saves and restores each stage's part under one key;
   - rank 0's admission charges by the tightest stage. The followers report their pools at bootstrap, which fits the byte budget planned in #1943.
+- **State consistency:**
+  - Every plan carries a round sequence number, and every slot a state generation that a `keep`, a release or a restore advances. A stage refuses rows whose generation is not its own, which turns a missed rollback into an error instead of a wrong answer.
+  - v1 runs one round at a time, so the plan link's order is the only order. From v2 on, a slot's buffers are reused only after every stage has completed the round that last wrote them.
+  - A prompt-cache entry counts as reusable only once every stage has acknowledged its part, so a hit never restores different positions on different nodes. This matters most for the DeltaNet state, which a token count cannot repair.
 
 ### 6.3 Scheduling
 
@@ -157,7 +169,7 @@ Today one lane host runs one round at a time on one engine thread:
 
 | level | what it is | fits today | what changes |
 |---|---|---|---|
-| v1: in turn | a round runs front, send, the other stages, receive, then the head | yes | `verify` and the prompt step become front, send, receive, head inside the family. The lane host is unchanged. The decode graph is split per stage, or holds NCCL's send and receive. |
+| v1: in turn | a round runs front, send, the other stages, receive, then the head | yes | `verify` and the prompt step become front, send, receive, head inside the family. The lane host is unchanged. The decode graph is split per stage, with the TCP hop outside the captured graphs. |
 | v2: prompt overlap | one prompt's chunks overlap across the stages | mostly | `prefill_step` issues chunk k + 1's front before chunk k's head returns, inside the family, with a second set of activation buffers. The lane host is unchanged. |
 | v3: decode micro-batches | two groups of streams in flight | no | `verify` splits into issue and complete halves, with scratch and graphs for each group, and the lanes `Engine` plans two round sequences. That is the core lanes code every family shares. |
 
@@ -174,28 +186,25 @@ v3 gains room for streams and compute-bound batches, not per-stream speed (secti
 ## 7. Steps
 
 The test hardware is one GB10 and one Mac. That sets the order:
-- two CUDA nodes over NCCL can't be tested, and NCCL refuses two ranks on one GPU, so the TCP backend comes first;
+- two CUDA nodes over NCCL can't be tested, and NCCL refuses two ranks on one GPU, so the TCP stage link comes first;
 - the only two-machine test is GB10 + Mac, so a Metal follower comes before any speed claim;
-- two processes on one GB10 share its GPU, so they show exactness, not overlap gains.
+- two processes on one GB10 share its GPU, so they show exactness and memory, not overlap gains.
 
-Days are for one engineer who knows the code **(guess)**.
+| # | step | shown on | acceptance |
+|---|---|---|---|
+| 1 | Stage link: neighbour TCP connections, framing with round sequence numbers, deadlines, fingerprint check; host tests and a localhost pair | host, GB10 | bytes and order exact under injected delays; the wire and the synchronization measured separately |
+| 2 | Qwen 27B CUDA stage mode, v1: ring with the head on rank 0, any number of stages, range-only loading, follower state, `keep` and generations through the plan | GB10 | two and three processes (three covers a middle stage): bit-exact logits against one engine, solo and two concurrent requests, a drafted verify with rollback, multi-chunk prompts; each process allocates only its range (peak and steady memory measured); a killed follower ends the stream without a deadlock, and the client can tell it is incomplete |
+| 3 | The control plane and the stage link on macOS; a Metal follower stage | Mac | the Metal engine joins a rank group and holds a layer range |
+| 4 | GB10 + Mac over Ethernet, v1 | GB10 + Mac | deterministic per placement; checked end to end against a whole-model reference (section 5); decode and prompt time at 1 GbE and with 1, 10 and 30 ms of added round trip |
+| 5 | v2: chunked prompt overlap, two buffers a boundary, back-pressure | GB10 + Mac | time to first token against one node, short and long prompts |
+| 6 | Planner: explicit end placement, boundary search, memory cap; Starlight `pipeline` layout | host | ranges for any mix; rank 0's budget counts the ends |
+| 7 | Prompt cache and admission across stages (with #1943's byte budget) | GB10 + Mac | a resumed prompt equals a fresh one on a pipeline; a hit needs every stage's acknowledgement |
+| 8 | A model larger than either node | GB10 + Mac | served across both, which a single node refuses |
+| 9 | v3: decode micro-batches in the lanes core | GB10 + Mac | after agreement |
+| 10 | Flash-Next stage mode, and DFlash2 taps across stages | GB10 + Mac | the second family and the faster drafter |
 
-| # | step | shown on | useful alone because | days |
-|---|---|---|---|---|
-| 1 | TCP `Collective` backend (`send` / `recv`, framing, deadlines) beside NCCL, with host tests and a localhost pair | host, GB10 | the link every later step uses; also Linux pairs without RoCE | 2-3 |
-| 2 | Qwen 27B CUDA stage mode, v1: ring with the head on rank 0, any number of stages, follower KV, `keep` through the plan; two and three processes on one GB10 (three covers a middle stage) | GB10 | same bits as one node (as the prototype), serving through the lane host | 4-6 |
-| 3 | `fabric/tp` on macOS: TCP backend, bootstrap, plan link, fail-fast | Mac | the Metal engine can join a rank group at all | 2-3 |
-| 4 | Qwen 27B Metal follower stage | Mac | a Mac holds a layer range | 4-6 |
-| 5 | GB10 + Mac over Ethernet, v1: deterministic per placement, each stage within its family's tolerance (section 5) | GB10 + Mac | the mixed goal, measured | 2 |
-| 6 | v2: chunked prompt overlap | GB10 + Mac | the first measurable speed gain, time to first token | 2-3 |
-| 7 | Planner by measured speed with a memory cap; Starlight `pipeline` layout | host | correct ranges for any mix, placed by the fleet | 3-4 |
-| 8 | Prompt cache and admission across stages (with #1943's byte budget) | GB10 + Mac | resumed prompts and full admission on a pipeline | 3-4 |
-| 9 | v3: decode micro-batches in the lanes core | GB10 + Mac | room for more streams | 5-8, after agreement |
-| 10 | Flash-Next stage mode, and DFlash2 taps across stages | GB10 + Mac | the second family and the faster drafter | 6-8 |
-
-- **Total:** 22-31 days to step 8, which is a served GB10 + Mac pipeline with prompt overlap, resume and admission. Steps 9 and 10 add 11-16 days.
-- **Host-only:** steps 1 and 7 (5-7 days).
-- **Not testable here:** two CUDA nodes over NCCL / RoCE. The NCCL `send` / `recv` path would need a second CUDA node, or ashhart's pair.
+- **No day estimates yet.** The Metal side of the stage link and control plane, range-only loading and the follower state protocol are each larger than a first estimate showed, so the steps carry estimates once a spike of each exists. Steps 1 and 2 come first, on the GB10 alone.
+- **Not testable here:** two CUDA nodes over NCCL / RoCE. That path would need a second CUDA node, or your pair.
 
 ## 8. Open questions for the maintainer
 
@@ -205,3 +214,4 @@ Days are for one engineer who knows the code **(guess)**.
 4. **Is "deterministic per placement, within single-node tolerance" acceptable** as the promise for CUDA + Metal pipelines?
 5. **Micro-batching (v3):** it changes the lanes core every family shares (section 6.3). Is a later change there acceptable, or should pipelines stay at v1 and v2?
 6. **A second CUDA node:** we have one GB10 and one Mac. Could the NCCL path (two CUDA nodes) be checked on your pair once steps 1 and 2 land?
+7. **Trust:** is "trusted network only, with fingerprints checked at bootstrap" enough for v1?
