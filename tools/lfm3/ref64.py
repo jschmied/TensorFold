@@ -37,6 +37,11 @@ usage:
                                                the final norm (f32), float64 top-1 per row, and the bf16-points
                                                pass's per-layer gap (meta.json); numpy path
   ref64.py check MODEL_DIR TOKENS_JSON         teacher-forced float64 top-1 of {name: {prompt, reply}}; numpy path
+  ref64.py ref MODEL_DIR OUT_JSON [--numpy]    no engine: prompts() teacher-forced, the float64 greedy 32-token
+                                               reply, and the top-5 ids and logits of every row
+
+The tensor prefix is read from the safetensors header (`model.` in a plain bf16 checkpoint such as
+LFM3-1.7B-Base, `language_model.model.` in the MLX exports).
 """
 import json
 import math
@@ -116,6 +121,18 @@ def strip(k):
     return re.sub(r"^(model\.language_model\.|language_model\.|model\.)+", "", k)
 
 
+def namespace(names, cfg):
+    """The text decoder's tensor prefix, read from the safetensors header: what precedes embed_tokens.weight
+    (`model.` in a plain bf16 checkpoint, `language_model.model.` in the MLX exports)."""
+    found = sorted(k[: -len("embed_tokens.weight")] for k in names if k.endswith("embed_tokens.weight"))
+    pick = next((p for p in ("language_model.model.", "model.") if p in found), found[0] if len(found) == 1 else None)
+    if pick is None:
+        raise SystemExit(f"ref64.py: no text decoder's embed_tokens.weight in the safetensors header ({found})")
+    if cfg.get("conv_bias"):
+        raise SystemExit("ref64.py: conv_bias is set in config.json; the reference has no conv or projection biases")
+    return pick
+
+
 class Model:
     def __init__(self, d):
         self.d = d
@@ -128,7 +145,7 @@ class Model:
             with safe_open(f"{d}/model.safetensors", "pt") as f:
                 self.map = {k: "model.safetensors" for k in f.keys()}
         self.files, self.cache = {}, {}
-        self.prefix = "language_model.model." if "language_model.model.embed_tokens.weight" in self.map else "model."
+        self.prefix = namespace(self.map, self.cfg)
         self.mlx = root.get("quantization") if root.get("quantization", {}).get("mode", "affine") == "affine" else None
 
     def raw(self, k):
@@ -271,7 +288,7 @@ class NpModel:
             mm = np.memmap(f"{d}/{s}", dtype=np.uint8, mode="r")
             for k, v in h.items():
                 self.hdr[k] = (mm, 8 + n, v)
-        self.prefix = "language_model.model." if "language_model.model.embed_tokens.weight" in self.hdr else "model."
+        self.prefix = namespace(self.hdr, self.cfg)
         self.mlx = root.get("quantization") if root.get("quantization", {}).get("mode", "affine") == "affine" else None
 
     def raw(self, k):
@@ -444,6 +461,36 @@ def check(model_dir, path):
     return res
 
 
+def reference(model_dir, out_path, numpy_path, reply_len=32, k=5):
+    """Without an engine: prompts() teacher-forced in float64, the float64 greedy reply, and the top-k per row.
+    The file has the engine file's `cases` shape (prompt, prompt_picks, reply), so `ref64.py MODEL_DIR OUT_JSON`
+    replays it, and each case adds rows: [{t, kind, top: [[id, logit], ...]}] for every prompt and reply row."""
+    from tokenizers import Tokenizer
+    tok = Tokenizer.from_file(f"{model_dir}/tokenizer.json")
+    mdl = NpModel(model_dir) if numpy_path or torch is None else Model(model_dir)
+    bos = mdl.cfg["bos_token_id"]
+    cases = []
+    for name, text in prompts(60):
+        ids = [bos] + tok.encode(text, add_special_tokens=False).ids
+        P, reply = len(ids), []
+        while len(reply) < reply_len:  # greedy, a full forward per token; the last one holds every row teacher-forced
+            lf = mdl.logits(ids + reply, P)
+            reply.append(int(lf[-1].argmax()))
+        rows = []
+        for kind, t in [("prompt", t) for t in range(P)] + [("reply", P - 1 + j) for j in range(reply_len)]:
+            top = np.argsort(-lf[t], kind="stable")[:k]
+            rows.append({"t": t, "kind": kind, "top": [[int(i), float(lf[t, i])] for i in top]})
+        picks = [r["top"][0][0] for r in rows[:P]]
+        same_reply = [r["top"][0][0] for r in rows[P:]] == reply
+        cases.append({"name": name, "prompt": ids, "prompt_picks": picks, "reply": reply, "rows": rows,
+                      "reply_text": tok.decode(reply), "reply_rows_match_greedy": same_reply})
+        print(f"{name}: {P} prompt rows, reply {json.dumps(tok.decode(reply))}"
+              + ("" if same_reply else " (teacher-forced top-1 differs from the greedy steps)"), file=sys.stderr,
+              flush=True)
+    json.dump({"model_dir": os.path.abspath(model_dir), "path": "numpy" if isinstance(mdl, NpModel) else "torch",
+               "top_k": k, "reply_len": reply_len, "cases": cases}, open(out_path, "w"))
+
+
 def main(model_dir, engine_path, points, numpy_path):
     mdl = NpModel(model_dir) if numpy_path or torch is None or points == "xpu" else Model(model_dir)
     with_bf16 = points is not None
@@ -513,6 +560,8 @@ if __name__ == "__main__":
         dump(a[1], a[2])
     elif len(a) == 3 and a[0] == "check":
         json.dump(check(a[1], a[2]), sys.stdout, indent=1)
+    elif len(a) in (3, 4) and a[0] == "ref" and a[3:] in ([], ["--numpy"]):
+        reference(a[1], a[2], a[3:] == ["--numpy"])
     elif len(a) >= 2 and set(flags) <= {"--bf16", "--bf16-points", "--numpy"} and len(set(flags)) == len(flags) \
             and not {"--bf16", "--bf16-points"} <= set(flags):
         pts = "engine" if "--bf16" in flags else "xpu" if "--bf16-points" in flags else None

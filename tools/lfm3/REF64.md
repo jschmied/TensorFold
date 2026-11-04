@@ -92,3 +92,27 @@ python -I tools/lfm3/ref64.py MODEL_DIR engine.json --bf16-points
 On LiquidAI/LFM3-1.7B-MLX-4bit (Python 3.12, numpy 2.5, no torch; 3 min 14 s and 4.1 GB for `dump`): the three
 prompts' bf16-points gap reaches 0.041 (capitals), 0.025 (chat) and 0.111 (items, worst row of any layer), and the
 XPU engine's 64-token greedy replies agree with the float64 top-1 at 192 of 192 positions.
+
+## LFM3-1.7B-Base (bf16), reference only (2026-11-04)
+
+- Checkpoint: [LiquidAI/LFM3-1.7B-Base](https://huggingface.co/LiquidAI/LFM3-1.7B-Base) at
+  `7bca5038823c0d0f14efe06439109354a10e014c`: one `model.safetensors` of plain BF16 tensors under `model.` (the
+  script now reads the decoder's prefix from the safetensors header). sha256 `61a3f541…bc8b59`, the tree API's lfs oid.
+- No engine: `ref64.py ref` runs prompts() teacher-forced, the float64 greedy 32-token reply (one full forward per
+  token), and writes each row's top-5 ids and logits. The file has the engine file's `cases` shape, so the usual
+  `ref64.py MODEL_DIR REF_JSON` replays it: 829/829 prompt rows and 128/128 reply rows on the numpy path.
+- Against the checkpoint's own code (transformers 5.22.1, `trust_remote_code`, torch 2.15.0, CPU), teacher-forced on
+  the float64 replies:
+
+| HF dtype | prompt rows | reply rows | largest \|f64 - HF\| logit | HF's own greedy == f64 |
+|---|---|---|---|---|
+| float32 | 829/829 | 128/128 | 1.05e-4 (capitals, t 14) | 4/4 |
+| bfloat16 | 825/829 | 127/128 | 0.394 (items, t 636) | 2/4 (capitals from token 5, chat from 27) |
+
+The five bfloat16 misses all sit where float64's margin is small: items t 131, 204, 338, 558 (0.109, 0.037, 0.0003,
+0.079) and chat reply t 45 (0.0035).
+
+```
+python -I tools/lfm3/ref64.py ref MODEL_DIR base-ref64.json          # torch path: 7 min 25 s, 17.2 GB peak (M3 Pro)
+python -I tools/lfm3/ref64.py MODEL_DIR base-ref64.json --numpy      # replay: 22 s
+```
