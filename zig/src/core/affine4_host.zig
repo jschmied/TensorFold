@@ -65,6 +65,107 @@ pub fn quantizeMlx(comptime gs: usize, values: []const f32, words: []u32, scales
     return null;
 }
 
+/// The nearest of the 16 codes to `x`, ties to even.
+fn nearest(x: f32) u8 {
+    const bounded = std.math.clamp(x, 0, 15);
+    const lo = @floor(bounded);
+    const integer: u8 = @intFromFloat(lo);
+    const fraction = bounded - lo;
+    return integer + @intFromBool(fraction > 0.5 or (fraction == 0.5 and integer & 1 == 1));
+}
+
+fn fitError(values: []const f32, w: []const f32, codes: []const u8, s: f32, b: f32) f64 {
+    var e: f64 = 0;
+    for (values, w, codes) |v, wi, q| {
+        const r = @as(f64, s) * @as(f64, @floatFromInt(q)) + b - v;
+        e += @as(f64, wi) * r * r;
+    }
+    return e;
+}
+
+/// Refits one group's codes, bf16 scale and bias by least squares weighted by `w`, kept only where its error drops.
+pub fn quantizeFit(values: []const f32, w: []const f32, codes: []u8, scale: *u16, bias: *u16) bool {
+    std.debug.assert(values.len == w.len and values.len == codes.len and values.len <= 256);
+    var best = fitError(values, w, codes, f32of(scale.*), f32of(bias.*));
+    var cur: [256]u8 = undefined;
+    var kept: [256]u8 = undefined;
+    @memcpy(cur[0..codes.len], codes);
+    var bs = scale.*;
+    var bb = bias.*;
+    var changed = false;
+    // up to three alternating steps: the line for the current codes, then the codes for that line
+    for (0..3) |_| {
+        var sw: f64 = 0;
+        var sq: f64 = 0;
+        var sqq: f64 = 0;
+        var sv: f64 = 0;
+        var sqv: f64 = 0;
+        for (values, w, cur[0..codes.len]) |v, wi, q| {
+            const qi: f64 = @floatFromInt(q);
+            sw += wi;
+            sq += wi * qi;
+            sqq += wi * qi * qi;
+            sv += wi * v;
+            sqv += wi * qi * v;
+        }
+        const det = sw * sqq - sq * sq;
+        if (!(det > 1e-30) or !(sw > 0)) break;
+        const sc = (sw * sqv - sq * sv) / det;
+        if (!(sc > 0)) break;
+        const s16 = bf16of(@floatCast(sc));
+        const b16 = bf16of(@floatCast((sv - sc * sq) / sw));
+        const s = f32of(s16);
+        const b = f32of(b16);
+        if (!(s > 0) or !std.math.isFinite(s) or !std.math.isFinite(b)) break;
+        for (values, cur[0..codes.len]) |v, *q| q.* = nearest((v - b) / s);
+        const e = fitError(values, w, cur[0..codes.len], s, b);
+        if (!(e < best)) break;
+        best = e;
+        bs = s16;
+        bb = b16;
+        @memcpy(kept[0..codes.len], cur[0..codes.len]);
+        changed = true;
+    }
+    if (!changed) return false;
+    scale.* = bs;
+    bias.* = bb;
+    @memcpy(codes, kept[0..codes.len]);
+    return true;
+}
+
+test "quantizeFit never raises a group's weighted error, keeps a flat group, and leaves zero weights' fit alone" {
+    var prng = std.Random.DefaultPrng.init(1870);
+    const r = prng.random();
+    var raised: usize = 0;
+    var moved: usize = 0;
+    for (0..512) |_| {
+        var v: [32]f32 = undefined;
+        var w: [32]f32 = undefined;
+        for (&v, &w) |*x, *y| {
+            x.* = f32of(bf16of(r.floatNorm(f32) * 0.02));
+            y.* = @exp(r.floatNorm(f32) * 2);
+        }
+        const lo = std.mem.min(f32, &v);
+        var scale = bf16of(@max((std.mem.max(f32, &v) - lo) / 15, 1e-8));
+        var bias = bf16of(lo);
+        var q: [32]u8 = undefined;
+        for (&q, v) |*c, x| c.* = nearest((x - f32of(bias)) / f32of(scale));
+        const e0 = fitError(&v, &w, &q, f32of(scale), f32of(bias));
+        if (quantizeFit(&v, &w, &q, &scale, &bias)) moved += 1;
+        if (fitError(&v, &w, &q, f32of(scale), f32of(bias)) > e0) raised += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), raised);
+    try std.testing.expect(moved > 256);
+    var flat: [32]f32 = @splat(0.25);
+    var ones: [32]f32 = @splat(1);
+    var q: [32]u8 = @splat(0);
+    var s = bf16of(1e-8);
+    var b = bf16of(0.25);
+    try std.testing.expect(!quantizeFit(&flat, &ones, &q, &s, &b));
+    var zero: [32]f32 = @splat(0);
+    try std.testing.expect(!quantizeFit(&flat, &zero, &q, &s, &b));
+}
+
 test "dequantized codes land within half a step, a flat group exactly on its bias; bf16 ties go to even" {
     var values: [2 * group]f32 = undefined;
     for (&values, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.37) * 0.05;

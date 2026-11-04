@@ -27,6 +27,7 @@ pub const proposal_rows = @import("proposal_rows.zig");
 pub const proposal_vocab = @import("proposal_vocab.zig");
 pub const ids_json = @import("ids_json.zig");
 pub const affine4_host = @import("affine4_host.zig");
+pub const draft_stats = @import("draft_stats.zig");
 pub const affine4_fold = @import("affine4_fold.zig");
 pub const shard_edit = @import("shard_edit.zig");
 pub const lora_merge = @import("lora_merge_dir.zig");
@@ -76,6 +77,7 @@ test {
     _ = safetensors;
     _ = gguf;
     _ = affine4_host;
+    _ = draft_stats;
     _ = rope_yarn;
     _ = rope_freq;
     _ = affine4_fold;
