@@ -213,6 +213,7 @@ pub const Head = struct {
     module: cuda.Module,
     best_fn: cuda.Function,
     topk_fn: cuda.Function, // fn_row_topk: a row's top_k candidates as drawRow ranks them (cuda_mtp_draw.zig)
+    capture: ?*@import("cuda_draft_stats.zig").Capture, // TF_FLASHNEXT_DRAFT_STATS_CAPTURE only
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, driver: *cuda.Driver, stream: *cuda.Stream, dir: []const u8) !*Head {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -255,8 +256,11 @@ pub const Head = struct {
         errdefer h.artifact.deinit();
         h.ids = h.artifact.ids();
         h.service = try lanes.proposal_head.Service.legacy(gpa, &h.artifact);
-        h.draft = try head_load.draft(gpa, driver, &store, &h.artifact, role);
+        var sum: u64 = 0;
+        h.draft = try head_load.draft(gpa, driver, &store, &h.artifact, role, &sum);
         errdefer h.draft.free();
+        h.capture = try @import("cuda_draft_stats.zig").Capture.fromEnv(gpa, sum);
+        errdefer if (h.capture) |c| gpa.destroy(c);
         h.module = try cuda.Module.load(driver, cuda.kernels.flashnext_mtp);
         errdefer h.module.unload();
         h.best_fn = try h.module.function("fn_row_best");
@@ -270,6 +274,10 @@ pub const Head = struct {
     }
 
     pub fn deinit(h: *Head) void {
+        if (h.capture) |c| {
+            c.write();
+            h.gpa.destroy(c);
+        }
         h.module.unload();
         h.draft.free();
         h.artifact.deinit();

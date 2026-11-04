@@ -153,6 +153,7 @@ pub fn Ops(comptime Tri: type) type {
                 try p.stage(next[at..][0..m]);
                 const one: pieces.Piece(Self, batch.Pass(Tri)) = .{ .o = o, .p = &p, .d = d, .input = rows + at * wide * 2, .m = m, .last = at + m == next.len, .score = at + m == next.len and scores };
                 try pieces.runPiece(one, score_rows);
+                if (one.score) if (h.capture) |c| try c.add(o.stream(), s.mixed);
                 d.len += m;
                 at += m;
             }
