@@ -337,6 +337,9 @@ below; these are estimates for planning a port, not results.
 
 15. **MTP drafts.** The checkpoint's own MTP head drafts tokens that the target verifies in one pass, with the same
     replies as serial decode. `--mtp-drafts` and `--mtp-confidence` size the drafts on Nemotron and GLM.
+    Flash Next's affine-4 head (`TF_FLASHNEXT_DRAFT_HEAD=affine4`) can refit its groups by core's `quantizeFit`,
+    weighted by the head input's diag(H) from a file keyed by the head's checksum (`TF_FLASHNEXT_DRAFT_FIT=weighted`,
+    opt-in, [#1870]): same replies, time −0.55..+0.15 % against min/max at 1, 4 and 8 streams, greedy and sampled.
 
 16. **DFlash and DFlash2 drafters.** An external block drafter reads the target's hidden taps and drafts a block (or a
     tree) a step. It needs a trained drafter for each target; see [training a drafter](recipes/training-a-drafter.md).
@@ -503,6 +506,7 @@ below; these are estimates for planning a port, not results.
 [#1823]: https://github.com/ashhart/TensorFold/pull/1823
 [#1836]: https://github.com/ashhart/TensorFold/pull/1836
 [#1850]: https://github.com/ashhart/TensorFold/pull/1850
+[#1870]: https://github.com/ashhart/TensorFold/issues/1870
 [#1873]: https://github.com/ashhart/TensorFold/issues/1873
 [#1880]: https://github.com/ashhart/TensorFold/pull/1880
 [#1883]: https://github.com/ashhart/TensorFold/pull/1883
