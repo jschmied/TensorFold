@@ -4,6 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
+- Qwen3.8-27B on Metal: prompt chunks of 64 rows or more run the wide projections with half operands wherever a tile's inputs all fit in half, and keep the fp32 path elsewhere, so logits and tokens are bit-equal to before. On an M3 Pro, served prefill is 3.0% faster at 4K (warm) and 2.5% at 16K (#2089). Thanks to @jschmied.
+
 - Vision: PDF pages reach the vision tower in their true colours. The render flags set `FPDF_REVERSE_BYTE_ORDER` where printing was meant, which swapped red and blue on every page (#2387, for #2386). Thanks to @gordonhatusupy for the report.
 
 - Tests: `test-gradient-serving` and `test-qwen-serving-host` pass again: their serving source pins take main's bytes after a read of every change since they were set, each a comment, an off-by-default path or a reviewed PR (#2418, part of #2031).
