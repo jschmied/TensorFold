@@ -20,6 +20,7 @@ pub const calib_env = @import("calib_env.zig");
 pub const calib_measure = @import("calib_measure.zig");
 pub const branches_oracle = @import("branches_oracle.zig");
 pub const spec = @import("spec.zig");
+pub const core_drafter = @import("core_drafter.zig");
 
 test {
     _ = @import("ownership_test.zig");
@@ -49,4 +50,6 @@ test {
     _ = @import("spec_test.zig");
     _ = lookup;
     _ = @import("lookup_test.zig");
+    _ = core_drafter;
+    _ = @import("core_drafter_test.zig");
 }
