@@ -157,6 +157,7 @@ pub const Engine = struct {
     hop: ?stage_fwd.Hop = null, // pipeline stage ring and host boundary
     boundary: ?cuda.HostBuffer = null,
     held: ?*stage_fwd.Held = null, // rank 0 with rounds in flight: head reads later
+    prompt_states: []const u64 = &.{}, // a prompt chunk's stream state table on the host (cuda_prompt.zig's delta)
     pub const ids_at = Round.ids_at;
     pub const segs_at = Round.segs_at;
     pub const rowseg_at = Round.rowseg_at;
@@ -217,6 +218,7 @@ pub const Engine = struct {
         e.hop = null;
         e.boundary = null;
         e.held = null;
+        e.prompt_states = &.{};
         e.stream = try cuda.Stream.init(d, true);
         errdefer e.stream.deinit();
         if (span != null) e.boundary = try cuda.HostBuffer.alloc(d, stage_fwd.bytes(g.hidden, grid_rows));
@@ -338,7 +340,7 @@ pub const Engine = struct {
         e.gpa.destroy(e);
     }
 
-    /// A stream's device bytes at a `cap`-token window: recurrences, convolution tails, keys and values, taps, log.
+    /// A stream's device bytes at a `cap`-token window: state, keys and values, taps, log and its state table.
     pub fn streamBytes(e: *const Engine, cap: usize) usize {
         return e.streamBytesWithTaps(cap, e.n_taps);
     }
@@ -346,7 +348,7 @@ pub const Engine = struct {
     /// The same allocation plan for a tap count known before `setTaps` mutates the engine.
     pub fn streamBytesWithTaps(e: *const Engine, cap: usize, taps: usize) usize {
         const c = @import("cuda_cache.zig");
-        return e.g.stateBytes() + c.scratchBytes(e) + e.g.kvBytes(cap, e.kv8) + e.tapRows() * taps * e.g.hidden * 2 + c.pendBytes(e.g);
+        return e.g.stateBytes() + c.scratchBytes(e) + e.g.kvBytes(cap, e.kv8) + e.tapRows() * taps * e.g.hidden * 2 + c.pendBytes(e.g) + c.States.bytes(e.g);
     }
 
     /// A stream's tap ring: tapRows() rows of the tapped layers' residuals.
@@ -462,8 +464,8 @@ pub const Engine = struct {
     }
 
     /// A window's staged segment: one-row windows that skip their rollback copy read no `before`.
-    pub fn stagedSeg(c: *Cache, e: *const Engine, len: usize, row0: usize, rows: usize, undo: bool) Seg {
-        var sg = c.fold(c.seg(e, len, row0, rows));
+    pub fn stagedSeg(c: *Cache, e: *const Engine, len: usize, row0: usize, rows: usize, undo: bool) !Seg {
+        var sg = c.fold(try c.seg(e, len, row0, rows));
         if (rows == 1 and !undo) sg.before = 0;
         return sg;
     }
@@ -490,9 +492,12 @@ pub const Engine = struct {
         }
         var row0: usize = 0;
         for (parts, 0..) |p, i| {
-            segs[i] = stagedSeg(p.cache, e, p.cache.len, row0, p.rows, p.undo);
+            segs[i] = try stagedSeg(p.cache, e, p.cache.len, row0, p.rows, p.undo);
             row0 += p.rows;
         }
+        // a prompt chunk is one stream's: its delta rule takes the recurrences' addresses on the host
+        e.prompt_states = if (!record) parts[0].cache.states.?.host else &.{};
+        defer e.prompt_states = &.{};
         if (keep == .draws) {
             const rules = std.mem.bytesAsSlice(cuda.sample.Rule, st[rules_at..][0 .. total * @sizeOf(cuda.sample.Rule)]);
             const meta = std.mem.bytesAsSlice(c_int, st[meta_at..][0 .. total * 4]);

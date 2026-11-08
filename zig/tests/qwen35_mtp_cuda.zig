@@ -49,7 +49,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, e: *E.Engine, dir: []const u8, id
             const last_rows = test_ids.len - last_start;
             const comparable_rows = last_rows - 1;
             if (comparable_rows > 0) {
-                const seg = cache.seg(e, last_start, 0, comparable_rows);
+                const seg = try cache.seg(e, last_start, 0, comparable_rows);
                 std.debug.print("  tap check setup: n_taps={d} layer={d}/{d} mode={s} cache={d}/{d} tap_ptr=0x{x} seg.tap=0x{x} seg.taps={d} seg.len={d} rows={d}\n", .{
                     e.n_taps,
                     e.taps[0],
