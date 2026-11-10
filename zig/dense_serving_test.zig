@@ -18,13 +18,14 @@ test "dense serving: owned CUDA images retain their reviewed lane and decode byt
     try std.testing.expectEqualStrings("8780fd710be3ce2f04e53fa1e69eb062809d3bec6391d9bd49983d0588e374d0", &hash(group));
     // #2825 hoists copy addresses before the K loop; copy order and math match prefill_kernel.
     try std.testing.expectEqualStrings("e3724114b87cae6f6f761b2f86357f05b1693d84a0233e4d58ce46349fa853f6", &hash(@embedFile("kernels/cuda/qmm_prefill.cu")));
-    // KIA14 adds all_rows (false keeps selection/arithmetic); #4706 adds TF_QWEN_PDL prologues
-    try std.testing.expectEqualStrings("79e97b0992f82e891ff8a80cdad68b534e07606b98feef3dffe25101477c99e1", &hash(@embedFile("kernels/cuda/qwen35.cu")));
-    // #1879's bytes: a comment names cuda_scratch.zig, where max_chunks moved; the code is unchanged
-    try std.testing.expectEqualStrings("f9e4a040cf219aac8db211df25d264dba390fce4a7e8da45557652c6ff0f28ba", &hash(@embedFile("kernels/cuda/qwen35.cuh")));
+    // #2620: state kernels in qwen35_gdn.cuh/qwen35_slots.cuh, main's and _table; KIA14 all_rows; #4706 TF_QWEN_PDL
+    try std.testing.expectEqualStrings("bc3361568b0526ab79ad432a837c83645936c761ea19a4284609fdacd827ec5e", &hash(@embedFile("kernels/cuda/qwen35.cu")));
+    // #2620's bytes: the state table entries and forward_states (SEG_STATES); main's kernels' SASS unchanged
+    try std.testing.expectEqualStrings("85cf7a5dd5aff724da5bcf1bf76d7bf8762a5ae8a0df5adebd0636c2f37dd949", &hash(@embedFile("kernels/cuda/qwen35.cuh")));
     // 67711a6aa7's bytes: the opt-in DSpine draft kernels (#2633); default serving unchanged
     try std.testing.expectEqualStrings("df06cb0ef07d12ca2296f7d1691678d0649a148f4abcbb3cb69f0d839e45295c", &hash(@embedFile("kernels/cuda/qwen35_draft.cu")));
-    try std.testing.expectEqualStrings("403cf841b89ad61da0818bdad8976ed4b286b3282c8c22df7171921b7e06eb6d", &hash(@embedFile("kernels/cuda/qwen35_keep.cu")));
+    // #2620: apply, apply_pend and conv moved to qwen35_keep_state.cuh, included as main's and as _table copies
+    try std.testing.expectEqualStrings("1bc333fa8b46407b25e0e100add5f015b77db6ba4e2036bd2627399cd1fcd2fd", &hash(@embedFile("kernels/cuda/qwen35_keep.cu")));
     try std.testing.expectEqualStrings("d1a379a98cf7504a7ed3b3f2d24c8ab6a39fe5511bcded6449e598ce5c3c79e7", &hash(@embedFile("kernels/cuda/scan_rows.cu")));
 }
 test "dense serving: owned launches and projections retain their reviewed argument sequence" {
@@ -51,6 +52,6 @@ test "dense serving: owned launches and projections retain their reviewed argume
             try out.append(std.testing.allocator, c);
         };
     }
-    // main's moved delta scan and MTP's retained-row tap argument stay; #4706 adds TF_QWEN_PDL glue
-    try std.testing.expectEqualStrings("2822d47ae041b6d7051e39209bd389cb5e4f01520efee64838c1c0e0e5428b75", &hash(out.items));
+    // #2620: gdn_pre and conv_commit pick _table under shape.table, same arguments; main's delta scan; #4706 PDL glue
+    try std.testing.expectEqualStrings("9cb172d1b51e97f8a716686b0f2b67923ce1dd580644609f2f03657c15ba05f9", &hash(out.items));
 }

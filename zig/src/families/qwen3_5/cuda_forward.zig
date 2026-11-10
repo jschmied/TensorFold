@@ -97,10 +97,10 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 const layer: c_int = @intCast(di);
                 try e.projManyPrompt(&.{ m.qkv, m.z, m.a, m.b }, e.x, &.{ e.qkv, e.z, e.a, e.b }, total, prompt);
                 if (e.learning) |k| try k.delta(i, e.qkv, e.z, e.b, e.a, total);
-                try e.runPdl(e.fns.gdn_pre, .{ 1, 2 * g.k_heads + g.v_heads, total }, .{ 32, 1, 1 }, .{ geo, e.qkv, t_segs, t_rows, t_par, layer, m.conv, e.a, e.b, m.a_log, m.dt_bias, e.q, e.k, e.v, e.g_, e.beta, t_params });
+                try e.runPdl(if (shape.table) e.fns.gdn_pre_table else e.fns.gdn_pre, .{ 1, 2 * g.k_heads + g.v_heads, total }, .{ 32, 1, 1 }, .{ geo, e.qkv, t_segs, t_rows, t_par, layer, m.conv, e.a, e.b, m.a_log, m.dt_bias, e.q, e.k, e.v, e.g_, e.beta, t_params });
                 // one recorded window of 2+ rows: gdn_pre logged its tails, conv_commit would only return
-                if (!(record and nseg == 1 and total > 1)) try e.run(e.fns.conv_commit, .{ (g.convWidth() + 255) / 256, nseg, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, t_par, layer, t_params });
-                if (prompt and nseg == 1) try @import("cuda_prompt.zig").delta(e, di, total) else try e.deltaScan(record, shape.slots, nseg, layer);
+                if (!(record and nseg == 1 and total > 1)) try e.run(if (shape.table) e.fns.conv_commit_table else e.fns.conv_commit, .{ (g.convWidth() + 255) / 256, nseg, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, t_par, layer, t_params });
+                if (prompt and nseg == 1) try @import("cuda_prompt.zig").delta(e, di, total) else try e.deltaScan(record, shape.slots, nseg, layer, shape.table);
                 try e.runPdl(e.fns.gdn_post, .{ 1, g.v_heads, total }, .{ 32, 1, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params, sums });
                 try e.projAgain(m.out, e.mix, e.r, total, prompt);
                 di += 1;
@@ -241,13 +241,14 @@ test "prompt MoE precision: every prompt piece through 128 and admitted verify w
 }
 
 /// The same scan selected by body, exposed for host launch-contract fixtures.
-pub fn deltaScan(e: anytype, record: bool, slot_count: u8, segments: usize, layer: c_int) !void {
-    const scan = if (!record) e.fns.gdn_chain else switch (slot_count) {
-        1 => e.fns.gdn_slots_1,
-        2 => e.fns.gdn_slots_2,
-        4 => e.fns.gdn_slots_4,
-        8 => e.fns.gdn_slots_8,
-        16 => e.fns.gdn_slots_16,
+pub fn deltaScan(e: anytype, record: bool, slot_count: u8, segments: usize, layer: c_int, table: bool) !void {
+    const f = &e.fns;
+    const scan = if (!record) (if (table) f.gdn_chain_table else f.gdn_chain) else switch (slot_count) {
+        1 => if (table) f.gdn_slots_1_table else f.gdn_slots_1,
+        2 => if (table) f.gdn_slots_2_table else f.gdn_slots_2,
+        4 => if (table) f.gdn_slots_4_table else f.gdn_slots_4,
+        8 => if (table) f.gdn_slots_8_table else f.gdn_slots_8,
+        16 => if (table) f.gdn_slots_16_table else f.gdn_slots_16,
         else => return error.InvalidGdnSlots,
     };
     const input = e.tables.ptr + @as(usize, if (record) @import("cuda_round.zig").steps_at else rowpar_at);

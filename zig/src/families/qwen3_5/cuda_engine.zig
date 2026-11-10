@@ -492,13 +492,15 @@ pub const Engine = struct {
             if (!(record and keep != .hidden)) try p.cache.flush(e);
             try recurrent.prepare(e, p.cache, p.rows, record, p.undo);
         }
+        // a pool lane among the parts: every segment's scans read state tables; else each stream's blocks, as on main
+        const table = Round.onTable(parts);
         var row0: usize = 0;
         for (parts, 0..) |p, i| {
-            segs[i] = try stagedSeg(p.cache, e, try Round.forwardStates(e, i, p.cache), p.cache.len, row0, p.rows, p.undo);
+            segs[i] = try stagedSeg(p.cache, e, if (table) try Round.forwardStates(e, i, p.cache) else null, p.cache.len, row0, p.rows, p.undo);
             row0 += p.rows;
         }
-        // a prompt chunk is one stream's: its delta rule takes the recurrences' addresses on the host
-        e.prompt_states = if (!record) parts[0].cache.states.?.host else &.{};
+        // a pool lane's prompt chunk is one stream's: its delta rule takes the recurrences' addresses on the host
+        e.prompt_states = if (!record and table) parts[0].cache.states.?.host else &.{};
         defer e.prompt_states = &.{};
         if (keep == .draws) {
             const rules = std.mem.bytesAsSlice(cuda.sample.Rule, st[rules_at..][0 .. total * @sizeOf(cuda.sample.Rule)]);
@@ -537,6 +539,7 @@ pub const Engine = struct {
         shape.unread = keep == .none;
         shape.paged = @import("cuda_attention.zig").hasPages(segs);
         shape.join = shape.paged and caches.anyShares(parts);
+        shape.table = table;
         shape.mt2 = @import("cuda_shapes.zig").useMt2(e.mt2.enabled, e.kv8, !record, total, parts.len, parts[0].cache.len);
         if (e.learning != null or e.pockets.any()) {
             shape.total = @intCast(total);
