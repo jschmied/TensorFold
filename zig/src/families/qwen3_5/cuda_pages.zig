@@ -7,6 +7,8 @@ const caches = @import("cuda_cache.zig");
 const platform = @import("sys");
 const kv_host = @import("cuda_kv_host.zig");
 const Storage = @import("cuda_pages_storage.zig").Storage;
+const pieces = @import("cuda_state_pieces.zig");
+const lane_mod = @import("cuda_cache_lane.zig");
 
 const Engine = engine.Engine;
 const Cache = caches.Cache;
@@ -46,13 +48,30 @@ fn mostPages(capacity: usize, tokens: usize) usize {
     return (capacity + window_rows + tokens - 1) / tokens;
 }
 
-/// A lane's tables and `fixed` bytes; its keys and values a token; a run of its state, log, taps and `ring` bytes.
-pub fn layout(e: *const Engine, capacity: usize, tokens: usize, ring: usize, fixed: usize) kv.Layout {
-    return .{ .fixed_bytes = mostPages(capacity, tokens) * 4 + caches.States.bytes(e.g) + fixed, .token_bytes = e.g.kvBytes(1, e.kv8), .page_tokens = @intCast(tokens), .snap_bytes = e.g.stateBytes(), .run_bytes = Cache.runBytes(e, ring) };
+/// A lane's layout: tables, taps, `ring` and `fixed` outside the pool, KV a token, `state` pieces on any pages.
+pub fn layout(e: *const Engine, capacity: usize, tokens: usize, ring: usize, fixed: usize, state: kv.groups.Pieces) kv.Layout {
+    const outside = lane_mod.outsideBytes(e, ring);
+    return .{ .fixed_bytes = mostPages(capacity, tokens) * 4 + caches.States.bytes(e.g) + outside + fixed, .token_bytes = e.g.kvBytes(1, e.kv8), .page_tokens = @intCast(tokens), .snap_bytes = e.g.stateBytes(), .pieces = state, .outside = outside };
 }
 
-/// One pool lane: a cache whose table maps its stream's pages, that stream's lease and its run's first page.
-const Lane = struct { cache: *Cache, lease: kv.Lease = .{}, used: bool = false, run: u32 = 0 };
+/// A lane's state pieces at `tokens`-position pages (0: no pool): count, pages, bytes (cuda_state_pieces.zig).
+pub fn statePieces(gpa: std.mem.Allocator, e: *const Engine, tokens: usize) !kv.groups.Pieces {
+    if (tokens == 0) return .{ .n = 0, .pages = 0, .bytes = 0 }; // no pool
+    var m = pieces.plan(gpa, e.g, e.g.kvBytes(tokens, e.kv8)) catch |err| switch (err) {
+        error.PieceOverPage, error.QwenLogRowOverPage => {
+            const one = e.g.kvBytes(1, e.kv8);
+            const most = @max(e.g.recBytes(), e.g.deltas() * e.g.logRowBytes());
+            if (!@import("builtin").is_test) std.log.err("TF_QWEN_KV_PAGES={d}: a page holds {d} bytes, and a lane's state lies in whole pieces of up to {d} bytes (a layer's recurrence or a log row): set {d} or more", .{ tokens, tokens * one, most, (most + one - 1) / one });
+            return error.QwenPageBelowState;
+        },
+        else => |x| return x,
+    };
+    defer m.deinit(gpa);
+    return m.summary();
+}
+
+/// One pool lane: a cache whose table maps its stream's pages, that stream's lease, its taps and ring outside the pool.
+const Lane = struct { cache: *Cache, lease: kv.Lease = .{}, used: bool = false, outside: ?cuda.DeviceBuffer = null };
 
 pub const Pages = struct {
     gpa: std.mem.Allocator,
@@ -66,41 +85,50 @@ pub const Pages = struct {
     host: ?cuda.HostBuffer = null,
     /// The arena's device address: `arena.ptr`, or the mapped host pointer when host-funded.
     base: u64 = 0,
-    /// Host capacity mode keeps its state run on the device.
+    /// Host capacity mode keeps its lanes' state pages on the device: page ids `host_ids` of this buffer.
     run_dev: ?cuda.DeviceBuffer = null,
+    host_ids: []const u32 = &.{},
     lanes: []Lane,
+    /// Where a lane's state pieces lie on its state pages.
+    map: pieces.Map,
 
-    /// `streams` lanes and `pages` pages of layout `l`, made and touched now; each run holds a `ring`-byte ring.
+    /// `streams` lanes and `pages` pages of layout `l`, made and touched now; each lane's taps and ring outside.
     pub fn init(gpa: std.mem.Allocator, e: *Engine, l: kv.Layout, capacity: usize, ring: usize, streams: usize, pages: usize) !*Pages {
         const tokens: usize = l.page_tokens;
         if (!caches.validPageTokens(tokens) or capacity > std.math.maxInt(c_int) - window_rows) return error.BadQwenKvPages;
         if (pages > @as(usize, std.math.maxInt(c_int)) + 1) return error.BadQwenKvPages;
         const page_bytes = try std.math.mul(usize, @intCast(l.token_bytes), tokens);
         if (page_bytes == 0) return error.BadQwenKvPages;
-        _ = try std.math.add(u64, l.run_bytes, page_bytes - 1);
+        var map = try pieces.plan(gpa, e.g, page_bytes);
+        errdefer map.deinit(gpa);
+        if (l.pieces == null or map.own.pages != l.pieces.?.pages) return error.BadQwenKvPages;
         const p = try gpa.create(Pages);
         errdefer gpa.destroy(p);
         const total = try std.math.mul(usize, pages, page_bytes);
         const host_mode = kv_host.onHost();
         if (host_mode and streams != 1) return error.QwenKvHostParallel;
-        const run_bytes = if (host_mode) try std.math.mul(usize, streams, try std.math.mul(usize, l.runPages(), page_bytes)) else 0;
+        // host capacity mode: each lane's state pages on the device, ids 0.. of `run_dev` (stateIds), never the pool's
+        const run_bytes = if (host_mode) try std.math.mul(usize, streams, try std.math.mul(usize, l.statePages(), page_bytes)) else 0;
         var storage = try Storage.init(e.d, total, run_bytes, host_mode);
         errdefer storage.deinit();
-        p.* = .{ .gpa = gpa, .e = e, .layout = l, .capacity = capacity, .ring = ring, .pool = try kv.Pool.init(gpa, pages, page_bytes), .arena = storage.arena, .host = storage.host, .base = storage.base, .run_dev = storage.run_dev, .lanes = &.{} };
+        p.* = .{ .gpa = gpa, .e = e, .layout = l, .capacity = capacity, .ring = ring, .pool = try kv.Pool.init(gpa, pages, page_bytes), .arena = storage.arena, .host = storage.host, .base = storage.base, .run_dev = storage.run_dev, .lanes = &.{}, .map = map };
         errdefer p.pool.deinit();
+        const ids = try gpa.alloc(u32, if (host_mode) streams * l.statePages() else 0);
+        errdefer gpa.free(ids);
+        for (ids, 0..) |*id, i| id.* = @intCast(i);
+        p.host_ids = ids;
         p.lanes = try gpa.alloc(Lane, streams);
         errdefer gpa.free(p.lanes);
         var made: usize = 0;
-        errdefer for (p.lanes[0..made]) |x| {
-            x.cache.deinit(gpa);
-            gpa.destroy(x.cache);
-        };
+        errdefer for (p.lanes[0..made]) |*x| freeLane(gpa, x);
         for (p.lanes) |*x| {
             const c = try gpa.create(Cache);
             errdefer gpa.destroy(c);
             c.* = try Cache.initPaged(gpa, e, mostPages(capacity, tokens), tokens, storage.base);
-            x.* = .{ .cache = c };
-            made += 1;
+            errdefer c.deinit(gpa);
+            const outside = if (l.outside > 0) try cuda.DeviceBuffer.alloc(e.d, l.outside) else null;
+            x.* = .{ .cache = c, .outside = outside };
+            made += 1; // counted once whole: the loop's errdefers own a lane until here, freeLane after
         }
         errdefer cuda.completion.drain(e.d, e.stream, "qwen3_5: a failed pool initialization did not drain");
         if (p.host) |h| {
@@ -118,32 +146,44 @@ pub const Pages = struct {
     pub fn deinit(p: *Pages) void {
         cuda.completion.drain(p.e.d, p.e.stream, "qwen3_5: the pool did not drain at close");
         for (p.lanes) |*x| {
-            if (x.used) {
-                if (p.host == null) p.pool.releaseRun(x.run, p.layout.runPages());
-                p.pool.finish(&x.lease);
-            }
-            x.cache.deinit(p.gpa);
-            p.gpa.destroy(x.cache);
+            if (x.used) p.pool.finish(&x.lease);
+            freeLane(p.gpa, x);
         }
         p.gpa.free(p.lanes);
         if (p.host != null) p.host.?.free() else p.arena.free();
         if (p.run_dev != null) p.run_dev.?.free();
+        p.gpa.free(p.host_ids);
         p.pool.deinit();
+        p.map.deinit(p.gpa);
         p.gpa.destroy(p);
     }
 
+    fn freeLane(gpa: std.mem.Allocator, x: *Lane) void {
+        x.cache.deinit(gpa);
+        gpa.destroy(x.cache);
+        if (x.outside) |*b| b.free();
+    }
+
     fn need(p: *const Pages, prompt: usize, max_tokens: usize) usize {
-        return p.layout.pages(prompt + max_tokens + window_rows) + p.runPages();
+        return p.layout.pages(prompt + max_tokens + window_rows) + p.statePages();
     }
 
-    fn runPages(p: *const Pages) usize {
-        return if (p.host != null) 0 else p.layout.runPages();
+    /// The pool pages a lane's state takes: none in host capacity mode, whose state pages sit in `run_dev`.
+    fn statePages(p: *const Pages) usize {
+        return if (p.host != null) 0 else p.layout.statePages();
     }
 
-    /// Whether a lane is free, the pool can promise a request's pages now and a run of them is free.
+    /// Host capacity mode: lane `x`'s state page ids in `run_dev` (lane i: i * statePages, the next statePages).
+    fn stateIds(p: *const Pages, x: *const Lane) []const u32 {
+        const k = p.layout.statePages();
+        const i = (@intFromPtr(x) - @intFromPtr(p.lanes.ptr)) / @sizeOf(Lane);
+        return p.host_ids[i * k ..][0..k];
+    }
+
+    /// Whether a lane is free and the pool can promise a request's pages now (any of them: no run is needed).
     pub fn fits(p: *const Pages, prompt: usize, max_tokens: usize) bool {
         if (prompt > p.capacity or max_tokens > p.capacity - prompt) return false;
-        for (p.lanes) |x| if (!x.used) return p.pool.fits(p.need(prompt, max_tokens)) and (p.runPages() == 0 or p.pool.findRun(p.runPages()) != null);
+        for (p.lanes) |x| if (!x.used) return p.pool.fits(p.need(prompt, max_tokens));
         return false;
     }
 
@@ -160,7 +200,7 @@ pub const Pages = struct {
         const x = for (p.lanes) |*x| {
             if (!x.used) break x;
         } else return error.LaneMemory;
-        const k = p.runPages();
+        const k = p.statePages();
         const n = p.need(prompt, max_tokens) - k; // keys and values
         if (n > mostPages(p.capacity, p.layout.page_tokens) or adopted.len > n or n * p.layout.page_tokens > std.math.maxInt(c_int)) return error.InvalidQwenPrompt;
         try p.pool.promise(&x.lease, n - adopted.len + k);
@@ -169,19 +209,18 @@ pub const Pages = struct {
             held = false;
             try p.pool.adopt(&x.lease, adopted); // the lease holds them now (its finish releases them)
         }
-        // the run first: KV pages fill from the bottom, runs from the top; a fragmented pool waits (LaneMemory)
-        const run = if (k == 0) 0 else p.pool.claimRun(&x.lease, k) orelse return error.LaneMemory;
-        errdefer if (k > 0) p.pool.releaseRun(run, k);
+        // the state's pages first, any of them: a fragmented pool still admits (finish gives them back)
+        try p.pool.takeState(&x.lease, k);
         errdefer cuda.completion.drain(p.e.d, p.e.stream, "qwen3_5: a failed lane open did not drain");
+        errdefer x.cache.unmapPieces(p.e);
         var up: Upload = .{ .p = p, .cache = x.cache };
         if (adopted.len > 0) try Upload.write(&up, x.lease.ids.items, 0);
         try p.pool.cover(&x.lease, n, .{ .ctx = &up, .write = Upload.write });
-        const run_base = if (p.run_dev) |rd| rd.ptr else p.base + run * p.layout.pageBytes();
-        try x.cache.mapRun(p.e, run_base, p.layout.runPages() * p.layout.pageBytes(), p.ring);
+        const base, const ids = if (p.run_dev) |rd| .{ rd.ptr, p.stateIds(x) } else .{ p.base, x.lease.state.items };
+        try x.cache.mapPieces(p.e, &p.map, base, ids, p.layout.pageBytes(), x.outside, p.ring);
         try x.cache.reset(p.e);
         x.cache.paged.?.ids = x.lease.ids.items;
         x.cache.cap = n * p.layout.page_tokens;
-        x.run = run;
         x.used = true;
         return x.cache;
     }
@@ -193,9 +232,8 @@ pub const Pages = struct {
         } else return false;
         if (!x.used) return true;
         cuda.completion.drain(p.e.d, p.e.stream, "qwen3_5: a closed stream did not drain");
-        if (p.host == null) p.pool.releaseRun(x.run, p.layout.runPages());
         p.pool.finish(&x.lease);
-        cache.unmapRun(p.e);
+        cache.unmapPieces(p.e);
         cache.paged.?.ids = &.{};
         cache.cap = 0;
         x.used = false;

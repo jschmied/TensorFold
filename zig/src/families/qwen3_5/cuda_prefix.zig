@@ -114,10 +114,8 @@ pub const Prefix = struct {
         const cache = owner.cache.?;
         const e = x.e;
         try cache.flush(e);
-        if (s.dev) |dev|
-            try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(cache.state.ptr, dev.ptr, e.g.stateBytes(), e.stream.handle), "cuMemcpyDtoDAsync")
-        else
-            try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(cache.state.ptr, s.host.bytes.ptr, e.g.stateBytes(), e.stream.handle), "cuMemcpyHtoDAsync");
+        const lane = @import("cuda_cache_lane.zig"); // a piece at a time on a lane
+        if (s.dev) |dev| try lane.copyStateDevice(cache, e, dev.ptr, true) else try lane.copyState(cache, e, s.host.bytes, true);
         try e.stream.synchronize();
     }
 
@@ -212,10 +210,8 @@ pub const Prefix = struct {
         s.* = .{ .host = host, .dev = dev };
         errdefer freeFailedSave(e, s);
         try cache.flush(e);
-        if (s.dev) |saved|
-            try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(saved.ptr, cache.state.ptr, e.g.stateBytes(), e.stream.handle), "cuMemcpyDtoDAsync")
-        else
-            try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(s.host.bytes.ptr, cache.state.ptr, e.g.stateBytes(), e.stream.handle), "cuMemcpyDtoHAsync");
+        const lane = @import("cuda_cache_lane.zig");
+        if (s.dev) |saved| try lane.copyStateDevice(cache, e, saved.ptr, false) else try lane.copyState(cache, e, s.host.bytes, false);
         try e.stream.synchronize();
         return @ptrCast(s);
     }

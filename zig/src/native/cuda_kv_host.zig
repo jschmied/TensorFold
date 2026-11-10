@@ -17,5 +17,5 @@ pub fn plan(a: std.mem.Allocator, l: kv.Layout, room: u64, o: api.Open, host: u6
 }
 
 pub fn deviceBytes(l: kv.Layout) !u64 {
-    return std.math.add(u64, try std.math.mul(u64, l.runPages(), l.pageBytes()), l.fixed_bytes);
+    return std.math.add(u64, try std.math.mul(u64, l.statePages(), l.pageBytes()), l.fixed_bytes); // a run, or pieces (#2939)
 }

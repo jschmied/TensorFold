@@ -158,7 +158,7 @@ pub const Engine = struct {
     boundary: ?cuda.HostBuffer = null,
     held: ?*stage_fwd.Held = null, // rank 0 with rounds in flight: head reads later
     prompt_states: []const u64 = &.{}, // a prompt chunk's stream state table on the host (cuda_prompt.zig's delta)
-    forward_from: [Round.max_segs]?[3]u64 = @splat(null), // state addresses each segment's table holds (null: none yet)
+    forward_from: [Round.max_segs]u64 = @splat(0), // States.version each segment's table copy holds (0: none yet)
     pub const ids_at = Round.ids_at;
     pub const segs_at = Round.segs_at;
     pub const rowseg_at = Round.rowseg_at;
@@ -220,7 +220,7 @@ pub const Engine = struct {
         e.boundary = null;
         e.held = null;
         e.prompt_states = &.{};
-        e.forward_from = @splat(null);
+        e.forward_from = @splat(0);
         e.stream = try cuda.Stream.init(d, true);
         errdefer e.stream.deinit();
         if (span != null) e.boundary = try cuda.HostBuffer.alloc(d, stage_fwd.bytes(g.hidden, grid_rows));

@@ -3,6 +3,8 @@ const std = @import("std");
 const cuda = @import("cuda");
 const pages = @import("cuda_pages.zig");
 const Prefix = @import("cuda_prefix.zig").Prefix;
+const pieces = @import("cuda_cache_lane.zig");
+const Cache = @import("cuda_cache.zig").Cache;
 const E = @import("cuda_engine.zig").Engine;
 const D = cuda.paging_test_device.Device;
 const t = std.testing;
@@ -51,10 +53,28 @@ const World = struct {
 
     const SaveFault = enum { none, device_alloc, copy, wait };
 
-    fn seed(w: *World, ptr: u64, ids: []const u32) void {
-        for (D.bytes(ptr, w.e.g.stateBytes()), 0..) |*b, i| {
-            const token = ids[i % ids.len] ^ @as(u32, @truncate(i * 31));
-            b.* = @truncate(token);
+    /// Device copies a state copy makes: one a piece, a recurrence and a tail a linear layer.
+    fn copies(w: *const World) usize {
+        return 2 * w.e.g.deltas();
+    }
+
+    /// The lane's state in a one-block layout, gathered from its pieces (the caller frees it).
+    fn stateOf(w: *World, c: *const Cache) ![]u8 {
+        const out = try t.allocator.alloc(u8, w.e.g.stateBytes());
+        for (0..pieces.parts(c, w.e.g)) |k| {
+            const p = pieces.part(c, w.e.g, k, false);
+            @memcpy(out[p.at..][0..p.len], D.bytes(p.dev, p.len));
+        }
+        return out;
+    }
+
+    fn seed(w: *World, c: *const Cache, ids: []const u32) void {
+        for (0..pieces.parts(c, w.e.g)) |k| {
+            const p = pieces.part(c, w.e.g, k, false);
+            for (D.bytes(p.dev, p.len), p.at..) |*b, i| {
+                const token = ids[i % ids.len] ^ @as(u32, @truncate(i * 31));
+                b.* = @truncate(token);
+            }
         }
     }
 
@@ -74,7 +94,7 @@ const World = struct {
         defer _ = env.unsetenv(name);
         w.d = D.driver();
         w.e = engine(&w.d);
-        const l = pages.layout(&w.e, capacity, page, 0, 0);
+        const l = pages.layout(&w.e, capacity, page, 0, 0, try pages.statePieces(std.testing.allocator, &w.e, page));
         w.p = try pages.Pages.init(gpa, &w.e, l, capacity, 0, 2, 3 * l.need(capacity, 0, pages.window_rows));
         w.base_devices = D.devices;
         errdefer w.p.deinit();
@@ -86,10 +106,10 @@ const World = struct {
         errdefer t.allocator.free(w.next);
         const r = try w.x.open(w.ids, 16, 9000, &.{}, null);
         defer w.x.gpa.free(r.plan.marks);
-        w.initial = try t.allocator.dupe(u8, D.bytes(r.cache.state.ptr, w.e.g.stateBytes()));
+        w.initial = try w.stateOf(r.cache);
         errdefer t.allocator.free(w.initial);
-        w.seed(r.cache.state.ptr, w.ids[0..4096]);
-        w.state = try t.allocator.dupe(u8, D.bytes(r.cache.state.ptr, w.e.g.stateBytes()));
+        w.seed(r.cache, w.ids[0..4096]);
+        w.state = try w.stateOf(r.cache);
         errdefer t.allocator.free(w.state);
         switch (fault) {
             .none => {},
@@ -129,7 +149,9 @@ const World = struct {
         defer w.x.gpa.free(r.plan.marks);
         try t.expectEqual(@as(u32, 4096), r.plan.from);
         try t.expectEqualSlices(u32, &.{8960}, r.plan.marks);
-        try t.expectEqualSlices(u8, w.state, D.bytes(r.cache.state.ptr, w.e.g.stateBytes()));
+        const got = try w.stateOf(r.cache);
+        defer t.allocator.free(got);
+        try t.expectEqualSlices(u8, w.state, got);
         try t.expect(w.p.close(r.cache));
         try settled(w.p);
     }
@@ -246,10 +268,10 @@ test "Qwen share faults: device snapshots restore D2D and eviction frees their b
     var w: World = undefined;
     try w.gpu(t.allocator, .none);
     try t.expectEqual(@as(usize, 0), D.hosts);
-    try t.expectEqual(@as(usize, 1), D.dtods);
+    try t.expectEqual(w.copies(), D.dtods);
     const saved = D.last_dtod;
     try w.resumes();
-    try t.expectEqual(@as(usize, 2), D.dtods);
+    try t.expectEqual(2 * w.copies(), D.dtods);
     try t.expectEqual(saved.src, D.last_dtod.dst);
     try t.expectEqual(saved.dst, D.last_dtod.src);
     try t.expectEqual(saved.len, D.last_dtod.len);
@@ -261,10 +283,14 @@ test "Qwen share faults: device snapshots restore D2D and eviction frees their b
     const fresh = try w.x.open(w.next, 16, 9100, &.{}, null);
     defer w.x.gpa.free(fresh.plan.marks);
     try t.expectEqual(@as(u32, 0), fresh.plan.from);
-    try t.expectEqual(@as(usize, 2), D.dtods);
-    try t.expectEqualSlices(u8, w.initial, D.bytes(fresh.cache.state.ptr, w.e.g.stateBytes()));
-    w.seed(fresh.cache.state.ptr, w.next[0..4096]);
-    try t.expectEqualSlices(u8, w.state, D.bytes(fresh.cache.state.ptr, w.e.g.stateBytes()));
+    try t.expectEqual(2 * w.copies(), D.dtods);
+    const zeroed = try w.stateOf(fresh.cache);
+    defer t.allocator.free(zeroed);
+    try t.expectEqualSlices(u8, w.initial, zeroed);
+    w.seed(fresh.cache, w.next[0..4096]);
+    const seeded = try w.stateOf(fresh.cache);
+    defer t.allocator.free(seeded);
+    try t.expectEqualSlices(u8, w.state, seeded);
     try t.expect(w.p.close(fresh.cache));
     try settled(w.p);
     try w.deinit();
@@ -290,9 +316,10 @@ test "Qwen share faults: failed device snapshot copies drain before retry withou
         try t.expectEqual(@as(usize, 1), w.x.store.tree.snaps);
         try t.expectEqual(@as(usize, 1), w.x.store.tree.counts.failed);
         try t.expectEqual(@as(usize, 0), D.freed_pending);
-        try t.expectEqual(@as(usize, 2), D.dtods);
+        const failed: usize = if (fault == .copy) 1 else w.copies(); // the failed save's copies: its first, or all
+        try t.expectEqual(failed + w.copies(), D.dtods);
         try w.resumes();
-        try t.expectEqual(@as(usize, 3), D.dtods);
+        try t.expectEqual(failed + 2 * w.copies(), D.dtods);
         try w.deinit();
     }
 }
@@ -306,6 +333,6 @@ test "Qwen share faults: a failed D2D restore keeps its snapshot and settles eve
     try t.expectEqual(@as(usize, 0), D.freed_pending);
     try settled(w.p);
     try w.resumes();
-    try t.expectEqual(@as(usize, 3), D.dtods);
+    try t.expectEqual(2 * w.copies() + 1, D.dtods);
     try w.deinit();
 }

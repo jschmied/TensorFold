@@ -12,7 +12,7 @@ pub fn room(l: anytype) !u64 {
     if (!onHost()) return 0;
     const cap = try environment.read(u64, "TF_QWEN_KV_HOST_GIB", 0);
     const p = @import("cuda_pages.zig");
-    const layout = p.layout(l.e, l.capacity, l.page_tokens, l.ringBytes(), l.extra);
+    const layout = p.layout(l.e, l.capacity, l.page_tokens, l.ringBytes(), l.extra, l.state_pieces);
     return bytes(l.capacity + p.window_rows, l.page_tokens, layout.pageBytes(), if (cap == 0) null else cap << 30);
 }
 

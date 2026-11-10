@@ -24,6 +24,7 @@ pub fn explain(ctx: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.QwenKvHostRunAllocation => "TF_QWEN_KV_HOST could not allocate its device state run; lower --context or free device memory",
         error.QwenKvHostParallel => "TF_QWEN_KV_HOST supports one stream: set --parallel 1",
         error.QwenKvHostNeedsPages => "TF_QWEN_KV_HOST keeps the KV pages in pinned host memory: set TF_QWEN_KV_PAGES (with TF_QWEN_KV_PAGES_ALL=1 for a single stream) so there are pages to place",
+        error.QwenPageBelowState => "TF_QWEN_KV_PAGES: a page must hold a lane's largest state piece (a layer's recurrence or a log row); the log above names the smallest page that does",
         error.UnsupportedQwenVision => "--vision: this checkpoint's image tower or text M-RoPE is not one the CUDA engine reads",
         else => sm110_modes.explain(err),
     };

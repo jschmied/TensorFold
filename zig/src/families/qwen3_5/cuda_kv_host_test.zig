@@ -55,16 +55,19 @@ test "kv safety: Qwen host KV pool contains only KV and maps its separately size
     var d = D.driver();
     d.api.cuMemHostGetDevicePointer_v2 = mapped;
     var e = engine(&d);
-    const l = pages.layout(&e, 64, 16, 0, 0);
+    const l = pages.layout(&e, 64, 64, 0, 0, try pages.statePieces(t.allocator, &e, 64)); // a page holds the largest piece
     const count = l.pages(64 + pages.window_rows);
     const before = cuda.usage(false);
     const p = try pages.Pages.init(t.allocator, &e, l, 64, 0, 1, count);
     try t.expectEqual(@intFromPtr(p.host.?.bytes.ptr), p.base);
     for (p.host.?.bytes) |byte| try t.expectEqual(@as(u8, 0), byte);
     try t.expectEqual(count * l.pageBytes(), p.host.?.bytes.len);
-    try t.expectEqual(l.runPages() * l.pageBytes(), p.run_dev.?.len);
+    try t.expectEqual(l.statePages() * l.pageBytes(), p.run_dev.?.len);
     try t.expectEqual(count, p.pool.total());
     const c = try p.open(64, 0);
+    // #2939: the state's pieces lie on the device run's pages, never on a pool page
+    try t.expectEqual(p.run_dev.?.ptr, c.pieces.?.base);
+    try t.expectEqual(@as(usize, 0), p.pool.census().free);
     try t.expectEqual(count, p.pool.census().leased);
     try t.expectEqual(@as(usize, 0), p.pool.census().free);
     try t.expect(p.close(c));
