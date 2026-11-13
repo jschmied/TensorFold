@@ -1,4 +1,4 @@
-//! Admission for LFM3-1.7B and LFM3-VL-2B MLX checkpoints; this parser does not advertise an engine.
+//! Admission for LFM3-1.7B and LFM3-VL-2B checkpoints (MLX, NVFP4, FP8, plain bf16); it advertises no engine.
 const std = @import("std");
 
 pub const hidden = 2048;
@@ -22,14 +22,16 @@ pub const schedule: [layers]LayerType = .{
 };
 
 pub const Width = struct { bits: u8, group: u16 };
-/// The projections' storage: MLX affine at `quant`'s widths, ModelOpt NVFP4 (FFN) or block FP8 (FFN, q/k/v/o).
-pub const Scheme = enum { mlx_affine, modelopt_nvfp4, fp8_block };
+/// The projections' storage: MLX affine at `quant`'s widths, NVFP4 (FFN), block FP8 (FFN, q/k/v/o) or plain bf16.
+pub const Scheme = enum { mlx_affine, modelopt_nvfp4, fp8_block, bf16 };
 /// The width `quant` reports for a ModelOpt NVFP4 export (its FFN): 4 bits in groups of 16.
 pub const nvfp4_width: Width = .{ .bits = 4, .group = 16 };
 /// The width `quant` reports for a block FP8 export: 8 bits, one scale a 128 x 128 block.
 pub const fp8_width: Width = .{ .bits = 8, .group = 128 };
 /// The rows and inputs a block FP8 scale covers.
 pub const fp8_block = 128;
+/// The width `quant` reports for a plain checkpoint (no quantization block): every projection stored as bf16.
+pub const bf16_width: Width = .{ .bits = 16, .group = 0 };
 pub const Quant = struct {
     global: Width,
     modules: std.StringHashMapUnmanaged(Width) = .empty,
@@ -371,10 +373,11 @@ fn equalQuant(a: Quant, b: Quant) bool {
 /// The backends a decoder of this admission runs on.
 pub const Backend = enum { metal, cuda };
 
-/// Whether `backend` serves this scheme: NVFP4 and block FP8 are CUDA's only, so Metal refuses them by name.
+/// Whether `backend` serves this scheme: NVFP4, block FP8 and plain bf16 are CUDA's only; Metal refuses them by name.
 pub fn servedOn(config: *const Config, backend: Backend) !void {
     if (config.scheme == .modelopt_nvfp4 and backend == .metal) return error.Lfm3ModeloptNvfp4NotOnMetal;
     if (config.scheme == .fp8_block and backend == .metal) return error.Lfm3Fp8BlockNotOnMetal;
+    if (config.scheme == .bf16 and backend == .metal) return error.Lfm3Bf16NotOnMetal;
 }
 
 pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Config {
@@ -388,6 +391,11 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Config {
     const language = if (kind == .text) root else try object(try field(root, "text_config"));
     const context = try text(language, kind);
     if (kind == .vision_language) try vision(root);
+    // no quantization block at all: the plain text checkpoint (LFM3-1.7B-Base); its tensors must all be bf16
+    if (!root.contains("quantization") and !root.contains("quantization_config")) {
+        if (kind != .text) return error.UnsupportedLfm3Quantization;
+        return .{ .arena = arena, .kind = kind, .context = context, .scheme = .bf16, .quant = .{ .global = bf16_width } };
+    }
     if (root.get("quantization") == null) if (root.get("quantization_config")) |qc| if (try modelopt(qc, kind))
         return .{ .arena = arena, .kind = kind, .context = context, .scheme = .modelopt_nvfp4, .quant = .{ .global = nvfp4_width } };
     if (root.get("quantization") == null) if (root.get("quantization_config")) |qc| if (try compressed(qc, kind))

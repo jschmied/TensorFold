@@ -36,6 +36,10 @@ fn named(a: Allocator, out: *std.ArrayList(Expected), prefix: []const u8, suffix
 fn affine(a: Allocator, out: *std.ArrayList(Expected), cfg: *const c.Config, prefix: []const u8, suffix: []const u8, n: usize, k: usize) !void {
     if (cfg.scheme == .modelopt_nvfp4) return modelopt(a, out, prefix, suffix, n, k);
     if (cfg.scheme == .fp8_block) return fp8Block(a, out, prefix, suffix, n, k);
+    if (cfg.scheme == .bf16) {
+        var name: [272]u8 = undefined;
+        return dense(a, out, try std.fmt.bufPrint(&name, "{s}{s}.weight", .{ prefix, suffix }), &.{ n, k }, .bf16);
+    }
     var buf: [256]u8 = undefined;
     const module = try std.fmt.bufPrint(&buf, "{s}{s}", .{ prefix, suffix });
     const q = try cfg.width(module);
@@ -102,6 +106,15 @@ pub fn schema(a: Allocator, cfg: *const c.Config, namespace: Namespace) ![]Expec
     return out.toOwnedSlice(a);
 }
 
+/// A plain checkpoint: one bf16 weight a projection under `model.`, the head tied; other layouts are refused by name.
+fn plain(header: *const st.Header) !void {
+    if (header.contains("lm_head.weight")) return error.Lfm3Bf16UntiedHead;
+    if (!header.contains("model.embed_tokens.weight")) return error.Lfm3Bf16WrappedNamespace;
+    for (header.keys()) |name| for ([_][]const u8{ ".scales", ".biases", ".weight_scale", ".weight_scale_2", ".input_scale" }) |tail| {
+        if (std.mem.endsWith(u8, name, tail)) return error.Lfm3Bf16QuantizedTensor;
+    };
+}
+
 /// Validate a merged safetensors header; the shared parser must have checked shard byte ranges first.
 pub fn validate(a: Allocator, cfg: *const c.Config, header: *const st.Header) !Manifest {
     const bare = header.contains("model.embed_tokens.weight");
@@ -109,6 +122,7 @@ pub fn validate(a: Allocator, cfg: *const c.Config, header: *const st.Header) !M
     if (bare and wrapped) return error.MixedNamespaces;
     if (!bare and !wrapped) return error.MissingTensor;
     const namespace: Namespace = if (bare) .bare else .wrapped;
+    if (cfg.scheme == .bf16) try plain(header);
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const expected = try schema(arena.allocator(), cfg, namespace);

@@ -4,6 +4,7 @@ const c = @import("config.zig");
 
 test {
     _ = @import("config_fp8_test.zig");
+    _ = @import("config_bf16_test.zig");
 }
 
 test "text and VL preserve their distinct context and actual mixed embedding width" {
