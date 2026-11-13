@@ -40,6 +40,25 @@ pub fn inverseFrequencies(is_global: bool, out: []f32) void {
     rope_freq.proportional(cfg.global_theta, cfg.global_dim, cfg.global_rotated, out);
 }
 
+/// TF_GEMMA4_V_ONLY's text: 0 or 1 through environment.zig (unset or blank: 0), any other text refused by name.
+pub fn vOnlyAsked(raw: ?[]const u8) !bool {
+    return @import("sys").environment.value(bool, "TF_GEMMA4_V_ONLY", raw, false) catch error.BadGemmaVOnly;
+}
+
+/// TF_GEMMA4_V_ONLY as the process has it.
+pub fn vOnlyRead() !bool {
+    return @import("sys").environment.read(bool, "TF_GEMMA4_V_ONLY", false) catch error.BadGemmaVOnly;
+}
+
+/// V-only pages need pages, keys that are values, no TF_KV_SHARE and no drafter that reads keys; else refused.
+pub fn vOnlyRefusal(paged: bool, keys_are_values: bool, kv_share: bool, drafter: bool) ?anyerror {
+    if (drafter) return error.GemmaVOnlyDrafter;
+    if (kv_share) return error.GemmaVOnlyKvShare;
+    if (!paged) return error.GemmaVOnlyUnpaged;
+    if (!keys_are_values) return error.GemmaVOnlyKeysNotValues;
+    return null;
+}
+
 pub const Model = struct {
     gpa: std.mem.Allocator,
     d: *const cuda.Driver,
@@ -51,6 +70,8 @@ pub const Model = struct {
     kc: []u64, // per layer: keys [slots, len, kv heads, head dim] bf16 (len: the ring, or the context if global)
     vc: []u64,
     paged: bool = false,
+    /// TF_GEMMA4_V_ONLY=1: global layers' pages hold V alone; their attention makes each key from its value.
+    v_only: bool = false,
     pages: usize = 0,
     table: u64 = 0,
     ids: []u32 = &.{},
@@ -129,6 +150,7 @@ pub const Model = struct {
     pub fn initPaged(gpa: std.mem.Allocator, d: *const cuda.Driver, s: cuda.Stream, w: *const wts.Weights, context: usize, slots: usize, paged: bool) !Model {
         var m = blank(gpa, d, w, context, if (paged) 1 else slots);
         m.paged = paged;
+        m.v_only = try vOnlyFor(&m);
         m.prompt_most = try solo.rows(); // refused before anything allocates
         errdefer m.deinit();
         try m.build(s);
@@ -143,11 +165,19 @@ pub const Model = struct {
     pub fn openPagedBytes(gpa: std.mem.Allocator, d: *const cuda.Driver, s: cuda.Stream, w: *const wts.Weights, context: usize, slots: usize, paged: bool) !usize {
         var m = blank(gpa, d, w, context, if (paged) 1 else slots);
         m.paged = paged;
+        m.v_only = try vOnlyFor(&m);
         m.prompt_most = try solo.rows();
         defer m.deinit();
         m.planned = 0;
         try m.build(s);
         return m.planned.?;
+    }
+
+    /// TF_GEMMA4_V_ONLY for this model (cuda_native refuses the forms it does not serve before the weights load).
+    fn vOnlyFor(m: *const Model) !bool {
+        if (!try vOnlyRead()) return false;
+        if (vOnlyRefusal(m.paged, m.geo.keys_are_values, try @import("core").kv_prompts.sharing() > 0, false)) |e| return e;
+        return true;
     }
 
     fn blank(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const wts.Weights, context: usize, slots: usize) Model {
@@ -408,14 +438,20 @@ pub const Model = struct {
         const direct = own and pg == null;
         const out: cuda.qk_rows.Out = .{ .q = x.qr, .k = x.kr, .v = x.vr, .kc = if (direct) m.kc[i] else null, .vc = if (direct) m.vc[i] else null, .len = len };
         try k.qk.rowsFrom(s, src, .{ .h = geo.query_heads, .hk = if (own) kvh else 0, .dim = dh }, shape, x.pos, x.slot, out, rows);
-        const w: Window = .{ .h = geo.query_heads, .hk = kvh, .d = dh, .win = if (global) 0 else geo.sliding_window, .ring = len, .scale = 1, .p32 = true, .pg = pg };
-        if (own and pg != null) try k.win.put(s, x.kr, x.vr, m.kc[i], m.vc[i], x.pos, x.slot, w, rows);
+        // TF_GEMMA4_V_ONLY: a global layer's keys from its values; a shared layer's from its owner's k norm
+        const vk: ?cuda.window_attention.Vk = if (global and m.v_only) .{ .w = m.w.layers[cfg.cacheOwner(i, geo.cacheLayers()) orelse i].k_norm, .inv = m.inv_global } else null;
+        const w: Window = .{ .h = geo.query_heads, .hk = kvh, .d = dh, .win = if (global) 0 else geo.sliding_window, .ring = len, .scale = 1, .p32 = true, .pg = pg, .vk = vk };
+        if (own and pg != null) {
+            if (vk != null) {
+                try k.win.putV(s, x.vr, m.vc[i], x.pos, x.slot, w, rows);
+            } else try k.win.put(s, x.kr, x.vr, m.kc[i], m.vc[i], x.pos, x.slot, w, rows);
+        }
         if (unread) return;
         if (prompt) {
             const c = chains[0];
             const off = if (pg != null) 0 else c.slot * len * kw * 2;
             const hi: ?u64 = if (!global and c.images.len > 0) x.hi else null;
-            try k.win.promptRows(s, x.qr, m.kc[i] + off, m.vc[i] + off, x.att, c.p0, rows, if (global) .{ .h = w.h, .hk = w.hk, .d = w.d, .win = 0, .ring = 0, .scale = 1, .p32 = true, .pg = m.pagesFor(c.slot) } else w, hi);
+            try k.win.promptRows(s, x.qr, m.kc[i] + off, m.vc[i] + off, x.att, c.p0, rows, if (global) .{ .h = w.h, .hk = w.hk, .d = w.d, .win = 0, .ring = 0, .scale = 1, .p32 = true, .pg = m.pagesFor(c.slot), .vk = vk } else w, hi);
         } else {
             var r: usize = 0;
             while (r < rows) : (r += attend_rows) {
@@ -450,6 +486,22 @@ test "a stream's caches count the owning layers only: the E4B's 24 of 42" {
     try std.testing.expect(Model.streamBytes(g, 23, 4096, ring) < Model.streamBytes(g, 24, 4096, ring));
     try std.testing.expectEqual(@as(?usize, 22), cfg.cacheOwner(40, g.cacheLayers()));
     try std.testing.expectEqual(@as(?usize, 23), cfg.cacheOwner(41, g.cacheLayers()));
+}
+
+test "TF_GEMMA4_V_ONLY takes exactly 0 or 1 through environment.zig; every other text is refused by name" {
+    try std.testing.expect(!try vOnlyAsked(null));
+    try std.testing.expect(!try vOnlyAsked(""));
+    try std.testing.expect(!try vOnlyAsked("0"));
+    try std.testing.expect(try vOnlyAsked("1"));
+    for ([_][]const u8{ "off", "false", "no", "on", "2", " 0", "1 ", "yes", "true" }) |v| try std.testing.expectError(error.BadGemmaVOnly, vOnlyAsked(v));
+}
+
+test "TF_GEMMA4_V_ONLY refuses drafters, the TF_KV_SHARE store, linear caches and the E-series by name" {
+    try std.testing.expectEqual(@as(?anyerror, null), vOnlyRefusal(true, true, false, false));
+    try std.testing.expectEqual(@as(?anyerror, error.GemmaVOnlyDrafter), vOnlyRefusal(true, true, false, true));
+    try std.testing.expectEqual(@as(?anyerror, error.GemmaVOnlyKvShare), vOnlyRefusal(true, true, true, false));
+    try std.testing.expectEqual(@as(?anyerror, error.GemmaVOnlyUnpaged), vOnlyRefusal(false, true, false, false));
+    try std.testing.expectEqual(@as(?anyerror, error.GemmaVOnlyKeysNotValues), vOnlyRefusal(true, false, false, false));
 }
 
 test "the embedding scale is bf16(sqrt(hidden)): 62 for the 12B, 73.5 for the 31B" {

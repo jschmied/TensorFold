@@ -132,6 +132,10 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     if (o.lanes_fixed and o.lanes > be.round_rows) return error.ParallelPastRound;
     // TF_KV_SHARE keeps prompts as the pool's pages, so it pages too; otherwise the default, unless turned off
     const paged = try @import("core").kv_prompts.sharing() > 0 or pagesOn(o);
+    // TF_GEMMA4_V_ONLY's forms refused by name before any weight or kernel loads (the E-series' keys at initPaged)
+    if (try fwd.vOnlyRead()) {
+        if (fwd.vOnlyRefusal(paged, true, try @import("core").kv_prompts.sharing() > 0, o.drafts and o.drafter != null)) |e| return e;
+    }
     const own = try gpa.create(Owned);
     errdefer gpa.destroy(own);
     own.* = .{ .gpa = gpa, .w = undefined, .k = undefined, .s = undefined, .m = undefined, .gb = undefined };
@@ -270,6 +274,11 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.ParallelPastMemory => "--parallel: the CUDA memory budget fits fewer Gemma 4 streams than asked (each stream's caches are allocated at load): lower --parallel or --context, serve --parallel auto, or adjust TENSORFOLD_MEMORY_RESERVE_GIB / TENSORFOLD_CUDA_MEMORY_LIMIT_GB",
         error.DrafterPastMemory => "--drafter: the CUDA memory budget leaves less room than the drafter's weights need after the streams: lower --parallel or --context, or adjust TENSORFOLD_MEMORY_RESERVE_GIB / TENSORFOLD_CUDA_MEMORY_LIMIT_GB",
         error.BadChunkSolo => "TF_GEMMA4_CHUNK_SOLO: a solo prompt pass's rows, a multiple of 512 up to 4096",
+        error.BadGemmaVOnly => "TF_GEMMA4_V_ONLY: 0 or 1 (1: Gemma 4's global layers keep V alone and attention makes each key from it)",
+        error.GemmaVOnlyDrafter => "TF_GEMMA4_V_ONLY=1: an assistant or DFlash drafter reads the target's global keys, which V-only pages do not hold: serve --no-drafts, drop --drafter, or unset TF_GEMMA4_V_ONLY",
+        error.GemmaVOnlyKvShare => "TF_GEMMA4_V_ONLY=1: the TF_KV_SHARE store keeps K and V regions a layer: unset one of them",
+        error.GemmaVOnlyUnpaged => "TF_GEMMA4_V_ONLY=1 needs the global caches in pool pages: unset TENSORFOLD_GEMMA4_KV_PAGES=0 or TF_GEMMA4_V_ONLY",
+        error.GemmaVOnlyKeysNotValues => "TF_GEMMA4_V_ONLY=1: this Gemma 4 checkpoint's global layers have their own v_proj (attention_k_eq_v false), so keys are not made from values: unset TF_GEMMA4_V_ONLY",
         error.NoStreamFits => "the CUDA memory budget fits no Gemma 4 stream after the weights: lower --context, free device memory, or adjust TENSORFOLD_MEMORY_RESERVE_GIB / TENSORFOLD_CUDA_MEMORY_LIMIT_GB",
         else => null,
     };
@@ -367,4 +376,9 @@ test "admission counts the vision workspace: more bytes per open, fewer streams 
     const room = 4 * g + visionBytes(true, true) / 2;
     try std.testing.expectEqual(@as(usize, 4), try fit(room, 8, false, plain));
     try std.testing.expectEqual(@as(usize, 3), try fit(room, 8, false, with));
+}
+
+test "TF_GEMMA4_V_ONLY's refusals each name the flag and what to change" {
+    for ([_]anyerror{ error.BadGemmaVOnly, error.GemmaVOnlyDrafter, error.GemmaVOnlyKvShare, error.GemmaVOnlyUnpaged, error.GemmaVOnlyKeysNotValues }) |e|
+        try std.testing.expect(std.mem.indexOf(u8, explain(null, e).?, "TF_GEMMA4_V_ONLY") != null);
 }

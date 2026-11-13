@@ -41,69 +41,12 @@ using qmm_frag::mma0;
 
 __device__ __forceinline__ float lo16(uint32_t w) { return __uint_as_float(w << 16); }
 __device__ __forceinline__ float hi16(uint32_t w) { return __uint_as_float(w & 0xffff0000u); }
+} // namespace tf_wrows
 
-// A float64 value to bf16 in one rounding, ties to even: toward zero to fp32 with a sticky last bit, then nearest.
-__device__ __forceinline__ __nv_bfloat16 d2bf(double x) {
-    if (x != x) return __float2bfloat16_rn(__int_as_float(0x7fc00000));
-    float f = __double2float_rz(x);
-    if ((double)f != x && isfinite(f)) f = __int_as_float(__float_as_int(f) | 1);
-    return __float2bfloat16_rn(f);
-}
+#include "window_rows_f64.cuh"
+#include "window_vonly.cuh"
 
-// q . k in float64, lanes over the head's dims, then a xor tree; every lane gets the sum.
-template <int D>
-__device__ __forceinline__ double dot64(const __nv_bfloat16* q, const __nv_bfloat16* k, int lane) {
-    double s = 0.0;
-#pragma unroll 4
-    for (int e = lane; e < D; e += 32) s += (double)__bfloat162float(q[e]) * (double)__bfloat162float(k[e]);
-    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(FULL, s, o);
-    return s;
-}
-
-// A head over keys [lo, hi] in float64 for columns c0 + threadIdx.x + NT i < c1 (kv(key, 0): K row, 1: V); a block.
-template <int D, typename KV>
-__device__ __noinline__ void slow_head(const __nv_bfloat16* qh, KV kv, int lo, int hi, double scale,
-                                       __nv_bfloat16* out, int c0, int c1) {
-    __shared__ double red[NW];
-    __shared__ double pw[NW];
-    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    double m = -INFINITY;
-    for (int j = lo + warp; j <= hi; j += NW) m = fmax(m, dot64<D>(qh, kv(j, 0), lane) * scale);
-    __syncthreads();
-    if (lane == 0) red[warp] = m;
-    __syncthreads();
-    m = -INFINITY;
-    for (int w = 0; w < NW; ++w) m = fmax(m, red[w]);
-    constexpr int CPT = D / NT;
-    double acc[CPT], l = 0.0;
-#pragma unroll
-    for (int i = 0; i < CPT; ++i) acc[i] = 0.0;
-    for (int jb = lo; jb <= hi; jb += NW) {
-        const int j = jb + warp;
-        if (j <= hi) {
-            const double s = dot64<D>(qh, kv(j, 0), lane) * scale;
-            if (lane == 0) pw[warp] = exp(s - m);
-        }
-        __syncthreads();
-        const int nb = min(NW, hi - jb + 1);
-        for (int w = 0; w < nb; ++w) {
-            const double p = pw[w];
-            l += p;
-            const __nv_bfloat16* v = kv(jb + w, 1);
-#pragma unroll
-            for (int i = 0; i < CPT; ++i) {
-                const int c = c0 + threadIdx.x + NT * i;
-                if (c < c1) acc[i] += p * (double)__bfloat162float(v[c]);
-            }
-        }
-        __syncthreads();
-    }
-#pragma unroll
-    for (int i = 0; i < CPT; ++i) {
-        const int c = c0 + threadIdx.x + NT * i;
-        if (c < c1) out[c] = d2bf(acc[i] / l);
-    }
-}
+namespace tf_wrows {
 
 // Decode partials, a block a (row, key head, chunk): the chunk's max, weights and o; empty chunks write m = -inf.
 template <int D, int FAULT, bool PG = false>
@@ -254,14 +197,16 @@ __device__ __forceinline__ void part(const __nv_bfloat16* __restrict__ q, const 
 
 // merge's float64 replay of a head over pages (window_pages.cu), off the fast path: its frame and divisions with it.
 template <int D> __device__ __noinline__ void merge_pg_odd(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, const int*, const int*, int, int, int, float, Pg, __nv_bfloat16*, int64_t, int, int);
+// The same over V-only pages: each key from its value row (vk_row).
+template <int D> __device__ __noinline__ void merge_pg_odd_vo(const __nv_bfloat16*, const __nv_bfloat16*, const int*, const int*, int, int, int, float, Pg, Vk, __nv_bfloat16*, int64_t, int, int);
 // out = sum_c a_c o_c / sum_c a_c l_c, a_c = expf(m_c - M), chunks in order; NaN or inf: the head again in float64.
-template <int D, int FAULT, bool PG = false>
+template <int D, int FAULT, bool PG = false, bool VO = false>
 __device__ __forceinline__ void merge(const float* __restrict__ po, const float* __restrict__ pm,
                                       const float* __restrict__ pl, __nv_bfloat16* __restrict__ out, int h, int hk,
                                       int chunks, const __nv_bfloat16* __restrict__ q,
                                       const __nv_bfloat16* __restrict__ kc, const __nv_bfloat16* __restrict__ vc,
                                       const int* __restrict__ pos, const int* __restrict__ slot, int win,
-                                      long long ring, float scale, Pg pg = Pg{}) {
+                                      long long ring, float scale, Pg pg = Pg{}, Vk vk = Vk{}) {
     const int64_t r = blockIdx.x;
     const int kh = blockIdx.y, G = h / hk;
     const int o = blockIdx.z * NT + threadIdx.x; // NT divides D: the block's outputs are one head's
@@ -280,7 +225,9 @@ __device__ __forceinline__ void merge(const float* __restrict__ po, const float*
     const float x = __fdiv_rn(acc, l);
     __nv_bfloat16* oh = out + (r * h + kh * G + hd) * D;
     oh[e] = FAULT == TRUNC ? __float2bfloat16_rz(x) : __float2bfloat16_rn(x);
-    if constexpr (PG) {
+    if constexpr (VO) {
+        if (__syncthreads_or(!isfinite(x))) merge_pg_odd_vo<D>(q, vc, pos, slot, h, hk, win, scale, pg, vk, oh, r, kh, hd);
+    } else if constexpr (PG) {
         if (__syncthreads_or(!isfinite(x))) merge_pg_odd<D>(q, kc, vc, pos, slot, h, hk, win, scale, pg, oh, r, kh, hd);
     } else if (__syncthreads_or(!isfinite(x))) {
         const int p = pos[r];
@@ -324,11 +271,11 @@ struct Cfg {
 };
 
 // Prompt rows p0..: row i sees keys [p0 + i - win + 1, hi[i]]; CS warps a 16-row band, slices summed; P32: P halves.
-template <int D, bool P32, int FAULT, bool PG = false>
+template <int D, bool P32, int FAULT, bool PG = false, bool VO = false>
 __device__ __forceinline__ bool rows(const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ kc,
                                      const __nv_bfloat16* __restrict__ vc, __nv_bfloat16* __restrict__ out,
                                      const int* __restrict__ hi, int p0, int W, int H, int HK, int G, float scale,
-                                     int win, int ring, Pg pg = Pg{}) {
+                                     int win, int ring, Pg pg = Pg{}, Vk vk = Vk{}) {
     using K = Cfg<D>;
     constexpr int CS = K::CS, NG = K::NG, C = K::C, NS = K::NS, SL = K::SL, K16 = K::K16, NB = K::NB;
     extern __shared__ uint4 wsmem[];
@@ -361,7 +308,7 @@ __device__ __forceinline__ bool rows(const __nv_bfloat16* __restrict__ q, const 
         if (t0 * BN - pk + pg.tok <= klast) nxt = tp[1];
     }
     auto stage = [&](int item) { // item 2t: tile t's keys, 2t + 1: its values (items staged in order)
-        const __nv_bfloat16* src = item % 2 == 0 ? kc : vc;
+        const __nv_bfloat16* src = (!VO && item % 2 == 0) ? kc : vc;
         const int key0 = (t0 + item / 2) * BN;
         uint4* dst = slots + (item % NS) * K::SLOT;
         if (PG && item % 2 == 0 && item > 0) { // the next tile: a tile on, or at a page end the id loaded a page ago
@@ -420,6 +367,8 @@ __device__ __forceinline__ bool rows(const __nv_bfloat16* __restrict__ q, const 
         float s[4][4];
         {
             const uint4* sl = take(2 * t);
+            if constexpr (VO) // the staged values made keys in place (window_vonly.cuh)
+                vk_tile<D>(BN, (t0 + t) * BN, vk, [&](int u, int d) { return smem_bf(sl + sw<D>(u, d / 8)) + d % 8; });
 #pragma unroll
             for (int k = 0; k < K16; ++k) {
 #pragma unroll
@@ -587,12 +536,17 @@ __device__ __noinline__ void odd(const __nv_bfloat16* q, const __nv_bfloat16* kc
     }
 }
 
-template <int D, bool P32, int FAULT, bool PG = false>
+// odd over a stream's V-only pages (window_pages.cu): each key from its value row (vk_row).
+template <int D> __device__ __noinline__ void odd_vo(const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, const int*, int, int, int, int, int, float, int, Pg, Vk);
+
+template <int D, bool P32, int FAULT, bool PG = false, bool VO = false>
 __device__ __forceinline__ void kernel(const __nv_bfloat16* q, const __nv_bfloat16* kc, const __nv_bfloat16* vc,
                                        __nv_bfloat16* out, const int* hi, int p0, int W, int H, int HK, int G,
-                                       float scale, int win, int ring, Pg pg = Pg{}) {
-    if (rows<D, P32, FAULT, PG>(q, kc, vc, out, hi, p0, W, H, HK, G, scale, win, ring, pg))
-        odd<D, PG>(q, kc, vc, out, hi, p0, W, H, HK, G, scale, win, ring, pg);
+                                       float scale, int win, int ring, Pg pg = Pg{}, Vk vk = Vk{}) {
+    if (rows<D, P32, FAULT, PG, VO>(q, kc, vc, out, hi, p0, W, H, HK, G, scale, win, ring, pg, vk)) {
+        if constexpr (VO) odd_vo<D>(q, vc, out, hi, p0, W, H, HK, G, scale, win, pg, vk);
+        else odd<D, PG>(q, kc, vc, out, hi, p0, W, H, HK, G, scale, win, ring, pg);
+    }
 }
 
 } // namespace prompt

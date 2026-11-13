@@ -34,8 +34,13 @@ pub fn globalLayers(m: anytype) usize {
     return n;
 }
 
+/// K and V regions a global layer's page holds: 2, or V alone (TF_GEMMA4_V_ONLY).
+pub fn copies(m: anytype) usize {
+    return if (m.v_only) 1 else 2;
+}
+
 pub fn pageBytes(m: anytype) u64 {
-    return globalLayers(m) * 2 * pageElems(m) * 2;
+    return globalLayers(m) * copies(m) * pageElems(m) * 2;
 }
 
 pub fn layout(m: anytype) kv.Layout {
@@ -46,7 +51,7 @@ pub fn layout(m: anytype) kv.Layout {
         sliding += 2 * m.geo.kvHeads(i) * cfg.headDim(i) * 2;
     };
     const n: u32 = @intCast(globalLayers(m));
-    var l = kv.Layout.ofRows(.{ .kind = .full, .row = 2 * m.geo.global_kv_heads * cfg.global_dim * 2, .layers = n }, tokens, fixed, 0);
+    var l = kv.Layout.ofRows(.{ .kind = .full, .row = copies(m) * m.geo.global_kv_heads * cfg.global_dim * 2, .layers = n }, tokens, fixed, 0);
     l.window = kv.groups.Group.split(.window, sliding, @intCast(ownLayers(m) - n));
     return l;
 }
@@ -105,13 +110,13 @@ pub fn attach(m: anytype, s: cuda.Stream, extra: usize, count: usize) !void {
     m.slots = extra + 1;
     m.pages = count;
     const region = count * pageElems(m) * 2;
-    const arena = try m.zeros(s, globalLayers(m) * 2 * region);
+    const arena = try m.zeros(s, globalLayers(m) * copies(m) * region);
     var block: usize = 0;
     for (0..ownLayers(m)) |i| {
         if (cfg.global(i)) {
             m.kc[i] = arena + block * region;
-            m.vc[i] = m.kc[i] + region;
-            block += 2;
+            m.vc[i] = m.kc[i] + (copies(m) - 1) * region; // V-only: kc aliases vc and is never read as keys
+            block += copies(m);
         } else {
             const bytes = m.slots * m.cacheLen(i) * m.geo.kvHeads(i) * cfg.headDim(i) * 2;
             m.kc[i] = try m.zeros(s, bytes);
