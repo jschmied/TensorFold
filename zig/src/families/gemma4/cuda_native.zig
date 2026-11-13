@@ -180,7 +180,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .backend = own.gb.backend(),
         .facts = own.gb.facts(),
         .rows = be.max_window,
-        .stream_bytes = fwd.Model.streamBytes(own.w.config.geo, own.w.layers.len, context, own.m.ringRows()),
+        .stream_bytes = fwd.Model.streamBytes(own.w.config.geo, own.w.layers.len, context, own.m.ringRows(), own.m.v_only),
         .free_streams = @intCast(n),
         .ctx = own,
         .deinit = release,

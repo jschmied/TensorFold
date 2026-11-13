@@ -137,9 +137,12 @@ pub const Model = struct {
     }
 
     /// Bytes one stream's caches take: the owning layers' (a shared layer reads its owner's), rings `rings` rows each.
-    pub fn streamBytes(geo: cfg.Geometry, layers: usize, context: usize, rings: usize) usize {
+    pub fn streamBytes(geo: cfg.Geometry, layers: usize, context: usize, rings: usize, v_only: bool) usize {
         var total: usize = 0;
-        for (0..@min(layers, geo.cacheLayers())) |i| total += 2 * (if (cfg.global(i)) context else rings) * geo.kvHeads(i) * cfg.headDim(i) * 2;
+        for (0..@min(layers, geo.cacheLayers())) |i| {
+            const rows: usize = if (cfg.global(i)) @as(usize, if (v_only) 1 else 2) * context else 2 * rings; // V-only: V alone
+            total += rows * geo.kvHeads(i) * cfg.headDim(i) * 2;
+        }
         return total;
     }
 
@@ -481,9 +484,9 @@ test "a stream's caches count the owning layers only: the E4B's 24 of 42" {
     const g = cfg.e4b;
     var own: usize = 0;
     for (0..g.cacheLayers()) |i| own += 2 * (if (cfg.global(i)) @as(usize, 4096) else ring) * g.kvHeads(i) * cfg.headDim(i) * 2;
-    try std.testing.expectEqual(own, Model.streamBytes(g, g.layers, 4096, ring));
-    try std.testing.expectEqual(Model.streamBytes(g, 24, 4096, ring), Model.streamBytes(g, 42, 4096, ring));
-    try std.testing.expect(Model.streamBytes(g, 23, 4096, ring) < Model.streamBytes(g, 24, 4096, ring));
+    try std.testing.expectEqual(own, Model.streamBytes(g, g.layers, 4096, ring, false));
+    try std.testing.expectEqual(Model.streamBytes(g, 24, 4096, ring, false), Model.streamBytes(g, 42, 4096, ring, false));
+    try std.testing.expect(Model.streamBytes(g, 23, 4096, ring, false) < Model.streamBytes(g, 24, 4096, ring, false));
     try std.testing.expectEqual(@as(?usize, 22), cfg.cacheOwner(40, g.cacheLayers()));
     try std.testing.expectEqual(@as(?usize, 23), cfg.cacheOwner(41, g.cacheLayers()));
 }
@@ -502,6 +505,17 @@ test "TF_GEMMA4_V_ONLY refuses drafters, the TF_KV_SHARE store, linear caches an
     try std.testing.expectEqual(@as(?anyerror, error.GemmaVOnlyKvShare), vOnlyRefusal(true, true, true, false));
     try std.testing.expectEqual(@as(?anyerror, error.GemmaVOnlyUnpaged), vOnlyRefusal(false, true, false, false));
     try std.testing.expectEqual(@as(?anyerror, error.GemmaVOnlyKeysNotValues), vOnlyRefusal(true, false, false, false));
+}
+
+test "V-only stream bytes count the global layers' V alone: the 31B's 10 globals save 4 KiB a position each" {
+    const g = cfg.dense31b;
+    const both = Model.streamBytes(g, g.layers, 32768, ring, false);
+    const v = Model.streamBytes(g, g.layers, 32768, ring, true);
+    var globals: usize = 0;
+    for (0..g.cacheLayers()) |i| globals += @intFromBool(cfg.global(i));
+    try std.testing.expectEqual(@as(usize, 10), globals);
+    try std.testing.expectEqual(globals * 32768 * g.global_kv_heads * cfg.global_dim * 2, both - v);
+    try std.testing.expectEqual(@as(usize, 1280) << 20, both - v);
 }
 
 test "the embedding scale is bf16(sqrt(hidden)): 62 for the 12B, 73.5 for the 31B" {

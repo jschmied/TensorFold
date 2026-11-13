@@ -85,6 +85,7 @@ const window_tests = @import("window_tests.zig");
 const window_rows_tests = @import("window_rows_tests.zig");
 const window_pages512_tests = @import("window_pages512_tests.zig");
 const window_vonly_tests = @import("window_vonly_tests.zig");
+const window_vonly_bench = @import("window_vonly_bench.zig");
 const window_bench = @import("window_bench.zig");
 const moe_glue_tests = @import("moe_glue_tests.zig");
 const dense_rows_tests = @import("dense_rows_tests.zig");
@@ -242,6 +243,7 @@ const usage =
     \\  window-rows               window attention at head dims 256 and 512 against float64 ranges (synthetic)
     \\  window-pages-512          head dim 512 decode and prompt rows over shuffled pages: the contiguous bits (synthetic)
     \\  window-vonly-512          TF_GEMMA4_V_ONLY: keys from values equal qk_round's; V-only pages give the K+V bits
+    \\  window-vonly-bench CTX    TF_GEMMA4_V_ONLY vs K+V paged decode and prompt GPU time at CTX keys, cold L2
     \\  window-bench WHICH        window attention's GPU time: callers (Kolibri-1's shapes) or gemma (head dims 256, 512)
     \\  moe-glue                  sigmoid top-k routing and the weighted combine against float64 references (synthetic)
     \\  dense-rows                bf16 rows times weight rows (routers, heads) against float64 references (synthetic)
@@ -545,6 +547,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "window-rows")) return window_rows_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "window-pages-512")) return window_pages512_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "window-vonly-512")) return window_vonly_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "window-vonly-bench")) return window_vonly_bench.run(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "window-bench")) return window_bench.run(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "moe-glue")) return moe_glue_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "dense-rows")) return dense_rows_tests.run(gpu);
