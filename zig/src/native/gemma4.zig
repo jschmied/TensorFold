@@ -65,7 +65,20 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
 
 /// The host, or error.Refused once `problem` says why; either error path releases what was made before it.
 fn start(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !*Host {
+    // TF_GEMMA4_V_ONLY's text and drafts refused before anything loads; the model refuses the geometries it can't take
+    const v_only = g.vonly.read() catch |err| {
+        problem.* = g.vonly.explain(err).?;
+        return error.Refused;
+    };
+    if (v_only and o.drafts) {
+        problem.* = g.vonly.explain(error.GemmaVOnlyDrafts).?;
+        return error.Refused;
+    }
     const model = g.Model.load(gpa, io, o.dir) catch |err| {
+        if (g.vonly.explain(err)) |why| {
+            problem.* = why;
+            return error.Refused;
+        }
         problem.* = try std.fmt.allocPrint(a, "the native Gemma 4 engine cannot load this checkpoint ({s}): it serves Gemma 4 31B and 12B as MLX affine 2-6 or 8 bits in groups of 64, uniform or per module", .{@errorName(err)});
         return error.Refused;
     };
@@ -120,9 +133,10 @@ fn start(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Open, 
     const drafter: ?lanes.drafter.Drafter = if (h.draft) |d| d.drafter() else if (h.assist) |d| d.drafter() else null;
     if (drafter) |d| h.wrap = try lanes.drafted.Drafted.init(gpa, h.metal.backend(), d);
     errdefer if (h.wrap) |*w| w.deinit();
-    const served = try metal_admit.streams(a, "gemma4", g.state.cacheBytes(model.config.geo, @intCast(window)), metal_admit.room(model.device), o, @intCast(window), problem) orelse return error.Refused;
+    const served = try metal_admit.streams(a, "gemma4", g.state.cacheBytes(model.config.geo, @intCast(window), v_only), metal_admit.room(model.device), o, @intCast(window), problem) orelse return error.Refused;
     h.metal.options.streams = @max(served, 2);
-    const facts = if (h.wrap) |*w| w.facts(h.metal.facts()) else h.metal.facts();
+    var facts = if (h.wrap) |*w| w.facts(h.metal.facts()) else h.metal.facts();
+    facts.copy_drafts = !v_only; // TF_GEMMA4_V_ONLY decodes one row a round: no copied drafts either
     h.config = try lanes.Config.init(gpa, facts, g.state.max_rows, g.state.max_rows - 1);
     errdefer h.config.deinit(gpa);
     h.clock = .{ .io = io };
@@ -138,7 +152,7 @@ fn start(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Open, 
     errdefer g.residency.drop(h);
     h.host.keepalive_target = .{ .ctx = &h.warm, .tick = mtl.keepalive.Target.tick };
     try h.host.start(); // the host's lists are empty until its thread runs, so a failed start leaves nothing to free
-    std.log.info("gemma4: Gemma 4 {s}, context {d} tokens, {d} streams{s}{s}", .{ model.config.geo.name, window, @max(served, 2), if (h.draft != null) ", DFlash drafts" else if (h.assist != null) ", MTP assistant drafts" else "", if (vis != null) ", images" else "" });
+    std.log.info("gemma4: Gemma 4 {s}, context {d} tokens, {d} streams{s}{s}{s}, caches {d} MiB a stream", .{ model.config.geo.name, window, @max(served, 2), if (h.draft != null) ", DFlash drafts" else if (h.assist != null) ", MTP assistant drafts" else "", if (vis != null) ", images" else "", if (v_only) ", V-only global caches (TF_GEMMA4_V_ONLY)" else "", g.state.cacheBytes(model.config.geo, @intCast(window), v_only) >> 20 });
     return h;
 }
 
@@ -171,7 +185,7 @@ const Snaps = struct {
 
 /// Prompt reuse in what 70% of RAM leaves beside the streams' caches (16 GiB by default), at planned chunk starts.
 fn enableCache(h: *Host, a: std.mem.Allocator, o: api.Open, served: u32, window: usize, problem: *[]const u8) !void {
-    const later = @as(u64, @max(served, 2)) * g.state.cacheBytes(h.model.config.geo, window);
+    const later = @as(u64, @max(served, 2)) * g.state.cacheBytes(h.model.config.geo, window, h.model.v_only != null);
     const room = h.model.device.maxWorkingSet() -| h.model.device.allocated() -| (8 << 30) -| later;
     var why: []const u8 = "";
     const plan = cache_fit.budgetBeside(o.prompt_cache_gib, o.prompt_cache_over_cap, room, later, a, &why, "") catch |err| switch (err) {

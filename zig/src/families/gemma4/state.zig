@@ -33,9 +33,15 @@ pub const Cache = struct {
     tap: Tap = .{},
     last_tap: ?mtl.Buffer = null,
     follow: ?mtl.ResidencySet.Follow = null,
+    /// TF_GEMMA4_V_ONLY: a global layer's k is a placeholder no kernel reads or writes; its keys come from v.
+    v_only: bool = false,
 
     pub fn init(device: mtl.Device, geo: cfg.Geometry, capacity: usize) !Cache {
-        var c: Cache = .{ .k = undefined, .v = undefined, .geo = geo, .capacity = capacity, .logits = try device.buffer(cfg.vocab * 2, shared) };
+        return initMode(device, geo, capacity, false);
+    }
+
+    pub fn initMode(device: mtl.Device, geo: cfg.Geometry, capacity: usize, v_only: bool) !Cache {
+        var c: Cache = .{ .k = undefined, .v = undefined, .geo = geo, .capacity = capacity, .logits = try device.buffer(cfg.vocab * 2, shared), .v_only = v_only };
         errdefer c.logits.deinit();
         var made: usize = 0;
         errdefer for (0..made) |i| {
@@ -45,7 +51,7 @@ pub const Cache = struct {
         for (0..geo.layers) |i| {
             const slots = slotsOf(i, capacity);
             const bytes = geo.kvHeads(i) * slots * cfg.headDim(i) * 2;
-            c.k[i] = try device.buffer(bytes, opts);
+            c.k[i] = try device.buffer(if (v_only and cfg.global(i)) 16 else bytes, opts);
             c.v[i] = device.buffer(bytes, opts) catch |e| {
                 c.k[i].deinit();
                 return e;
@@ -93,11 +99,16 @@ pub const Cache = struct {
     }
 };
 
-/// Bytes a stream's caches take at `capacity` (Cache.init's buffers).
-pub fn cacheBytes(geo: cfg.Geometry, capacity: usize) u64 {
+/// Bytes a stream's caches take at `capacity` (Cache.initMode's buffers); V-only global layers hold values alone.
+pub fn cacheBytes(geo: cfg.Geometry, capacity: usize, v_only: bool) u64 {
     var total: u64 = cfg.vocab * 2;
-    for (0..geo.layers) |i| total += 2 * geo.kvHeads(i) * slotsOf(i, capacity) * cfg.headDim(i) * 2;
+    for (0..geo.layers) |i| total += copies(i, v_only) * geo.kvHeads(i) * slotsOf(i, capacity) * cfg.headDim(i) * 2;
     return total;
+}
+
+/// The caches layer `i` keeps: keys and values, or (V-only, a global layer) values alone.
+pub fn copies(i: usize, v_only: bool) usize {
+    return if (v_only and cfg.global(i)) 1 else 2;
 }
 
 /// Cache slots for layer `i`: the ring on a sliding layer, the whole capacity on a global one.

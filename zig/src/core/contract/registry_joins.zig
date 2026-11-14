@@ -72,6 +72,7 @@ pub const all_metal = @import("lane_q8_records.zig").records ++
     @import("flashnext_attention_records.zig").records ++
     @import("spark25_records.zig").records ++
     @import("gemma_attention_records.zig").records ++
+    @import("gemma_vonly_records.zig").records ++
     @import("moss_image_records.zig").records ++
     @import("dsv41_metal_records.zig").records ++
     @import("minimax_records.zig").records ++

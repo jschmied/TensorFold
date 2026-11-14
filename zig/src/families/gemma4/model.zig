@@ -6,6 +6,7 @@ const ckpt = @import("../../core/checkpoint_metal.zig");
 const shards = @import("../../core/checkpoint.zig");
 const weights = @import("weights.zig");
 const kernels = @import("kernels.zig");
+const vonly = @import("vonly.zig");
 const affine_mm = @import("affine_mm.zig");
 const round = @import("tree_round_gpu");
 const vision = @import("vision.zig");
@@ -74,6 +75,8 @@ pub const Model = struct {
     fuse: bool = true,
     /// The image input, once loadVision read it (serve --vision).
     vision: ?Tower = null,
+    /// TF_GEMMA4_V_ONLY=1: global layers' caches hold values alone; their attention makes each key from its value.
+    v_only: ?vonly.Pipes = null,
 
     pub fn load(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !*Model {
         const m = try gpa.create(Model);
@@ -83,9 +86,12 @@ pub const Model = struct {
         m.tap_of = @splat(-1);
         m.taps = 0;
         m.vision = null;
+        m.v_only = null;
         m.mm = @splat(null);
         m.config = try cfg.Config.read(gpa, io, dir);
         try m.config.requireDense();
+        const v_only = try vonly.read(); // drafts are refused by the host, before the model loads
+        if (v_only) if (vonly.refusal(m.config.geo, false)) |e| return e;
         m.projections = .{ .geo = m.config.geo };
         m.device = try mtl.Device.init();
         errdefer m.device.deinit();
@@ -102,6 +108,8 @@ pub const Model = struct {
         errdefer m.weights.deinit(gpa);
         m.kernels = try kernels.Kernels.init(gpa, m.device, m.config.geo, m.weights.embed_bits);
         errdefer m.kernels.deinit();
+        if (v_only) m.v_only = try vonly.Pipes.init(gpa, m.device, m.config.geo, m.weights.embed_bits);
+        errdefer if (m.v_only) |p| p.deinit();
         m.picks = try round.Ops.init(m.device);
         errdefer m.picks.deinit();
         try m.loadPromptPipelines();
@@ -187,6 +195,7 @@ pub const Model = struct {
         m.projections.deinit(m.gpa);
         m.picks.deinit();
         for (m.mm) |o| if (o) |ps| for (ps) |p| p.deinit();
+        if (m.v_only) |p| p.deinit();
         m.kernels.deinit();
         m.weights.deinit(m.gpa);
         m.checkpoint.deinit();

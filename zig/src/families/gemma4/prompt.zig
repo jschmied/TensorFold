@@ -4,6 +4,7 @@ const mtl = @import("metal");
 const cfg = @import("config.zig");
 const state = @import("state.zig");
 const kernels = @import("kernels.zig");
+const vonly = @import("vonly.zig");
 const affine_mm = @import("affine_mm.zig");
 const lane = @import("../../core/lane_projection.zig");
 const Model = @import("model.zig").Model;
@@ -38,6 +39,9 @@ pub const Scratch = struct {
     logits: mtl.Buffer,
     /// The drafter's tapped rows [rows, taps x hidden] bf16, once a drafter asked for them.
     taps: ?mtl.Buffer = null,
+    /// TF_GEMMA4_V_ONLY: a global layer's keys [kv heads, capacity, head dim], made from its values for each chunk.
+    keys: ?mtl.Buffer = null,
+    keys_capacity: usize = 0,
 
     pub fn init(device: mtl.Device, geo: cfg.Geometry, capacity: usize) !Scratch {
         const d = geo.hidden;
@@ -46,6 +50,8 @@ pub const Scratch = struct {
         _ = capacity;
         var s: Scratch = undefined;
         s.taps = null;
+        s.keys = null;
+        s.keys_capacity = 0;
         var made: usize = 0;
         errdefer s.release(made);
         inline for (.{ .{ "ids", R * 4, true }, .{ "pos", R * 4, true }, .{ "hi", R * 4, true }, .{ "qkv", R * (qd + 2 * kv) * 2, false }, .{ "q", R * qd * 2, false }, .{ "k", R * kv * 2, false }, .{ "v", R * kv * 2, false }, .{ "attn", R * qd * 2, false }, .{ "o", R * d * 2, false }, .{ "hn", R * d * 2, false }, .{ "n_mlp", R * d * 2, false }, .{ "gate_up", R * 2 * geo.intermediate * 2, false }, .{ "act", R * geo.intermediate * 2, false }, .{ "y", R * d * 2, false }, .{ "logits", cfg.vocab * 2, true } }) |f| {
@@ -62,6 +68,7 @@ pub const Scratch = struct {
     pub fn deinit(s: *Scratch) void {
         s.release(std.math.maxInt(usize));
         if (s.taps) |b| b.deinit();
+        if (s.keys) |b| b.deinit();
     }
 
     /// Releases the first `made` buffers in init's order, so a failed init frees what it made.
@@ -188,8 +195,9 @@ pub fn layer(m: *Model, e: mtl.ComputeEncoder, s: *Scratch, c: *state.Cache, i: 
         mm(m, e, l.mlx[1], s.normed[cur], s.qkv, qn, width, rows);
         if (!global) mm(m, e, l.mlx[2], s.normed[cur], s.qkv, qn + nk * dh, width, rows);
     }
+    const vo: ?vonly.Pipes = if (global) m.v_only else null; // TF_GEMMA4_V_ONLY: values alone, keys made from them
     if (st.glue) {
-        e.setPipeline(kd.qkv);
+        e.setPipeline(if (vo) |p| p.prep else kd.qkv);
         bind(e, &.{s.qkv}, 0);
         e.setBuffer(l.q_norm.buf, l.q_norm.off, 1);
         e.setBuffer(l.k_norm.buf, l.k_norm.off, 2);
@@ -200,8 +208,19 @@ pub fn layer(m: *Model, e: mtl.ComputeEncoder, s: *Scratch, c: *state.Cache, i: 
         e.dispatchGroups(.{ .width = geo.query_heads + 2 * nk, .height = rows }, .{ .width = 32 });
     }
     if (st.attn) {
+        if (vo) |p| { // the chunk's keys [0, len + rows) made once from the values; the K+V prompt kernel reads them
+            const keys = s.keys orelse return error.GemmaVOnlyNoScratch;
+            if (c.capacity > s.keys_capacity) return error.GemmaVOnlyNoScratch;
+            e.setPipeline(p.rebuild);
+            bind(e, &.{c.v[i]}, 0);
+            e.setBuffer(l.k_norm.buf, l.k_norm.off, 1);
+            bind(e, &.{ m.inv_global, s.pos }, 2);
+            e.setValue([2]i32{ @intCast(c.capacity), 0 }, 4);
+            bind(e, &.{keys}, 5);
+            e.dispatchGroups(.{ .width = c.len + rows, .height = nk }, .{ .width = 32 });
+        }
         e.setPipeline(kd.prompt_attn);
-        bind(e, &.{ s.q, c.k[i], c.v[i], s.attn }, 0);
+        bind(e, &.{ s.q, if (vo != null) s.keys.? else c.k[i], c.v[i], s.attn }, 0);
         e.setValue([3]i32{ @intCast(rows), @intCast(c.len), @intCast(state.slotsOf(i, c.capacity)) }, 4);
         bind(e, &.{s.hi}, 5);
         e.dispatchGroups(.{ .width = (rows + 31) / 32, .height = geo.query_heads }, .{ .width = 32 * dh / 64 });

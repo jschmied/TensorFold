@@ -4,6 +4,7 @@ const mtl = @import("metal");
 const cfg = @import("config.zig");
 const state = @import("state.zig");
 const kernels = @import("kernels.zig");
+const vonly = @import("vonly.zig");
 const weights = @import("weights.zig");
 const lane = @import("../../core/lane_projection.zig");
 const Model = @import("model.zig").Model;
@@ -219,8 +220,9 @@ pub fn layer(m: *Model, e: mtl.ComputeEncoder, s: *state.Scratch, segments: []co
         const kv_off = at * nk * dh * 2; // this stream's keys and values [nk, n, dh] in s.k, s.v
         const q_off = at * geo.query_heads * dh * 2;
         const prep = !(fused and !global); // a fused sliding layer's attention kernel preps its own heads
+        const vo: ?vonly.Pipes = if (global) m.v_only else null; // TF_GEMMA4_V_ONLY: values alone, keys made from them
         if (prep) {
-            e.setPipeline(kd.qkv);
+            e.setPipeline(if (vo) |p| p.prep else kd.qkv);
             e.setBuffer(s.qkv, at * width * 2, 0);
             bindRef(e, l.q_norm, 1);
             bindRef(e, l.k_norm, 2);
@@ -240,11 +242,15 @@ pub fn layer(m: *Model, e: mtl.ComputeEncoder, s: *state.Scratch, segments: []co
             const rn = @min(attend_rows, n - sub);
             if (global) { // a key head's eight query heads as one tile: each key read once a token (M5's tensor units)
                 const nch = chunks[r][kind]; // from the first key, in 256-key chunks (prepare)
-                e.setPipeline(kd.decode_attn);
+                e.setPipeline(if (vo) |p| p.decode else kd.decode_attn);
                 e.setBuffer(s.q, r * geo.query_heads * dh * 2, 0);
                 bind(e, &.{ c.k[i], c.v[i] }, 1);
                 e.setValue([4]i32{ @intCast(rn), @intCast(c.len + sub), @intCast(state.slotsOf(i, c.capacity)), @intCast(nch) }, 3);
                 bind(e, &.{ s.pm, s.pl, s.po }, 4);
+                if (vo != null) {
+                    bindRef(e, l.k_norm, 7);
+                    bind(e, &.{m.inv_global}, 8);
+                }
                 e.dispatchGroups(.{ .width = nch, .height = nk, .depth = (rn * kd.heads_per_kv + 15) / 16 }, .{ .width = 32 * dh / 128 });
                 e.setPipeline(kd.merge);
                 bind(e, &.{ s.pm, s.pl, s.po }, 0);
