@@ -30,15 +30,13 @@ __device__ __forceinline__ __nv_bfloat16* smem_bf(const uint4* p) {
     return reinterpret_cast<__nv_bfloat16*>(const_cast<uint4*>(p));
 }
 
-// A staged tile's rows of values made keys in place (key0 + u for row u, at(u, d) its dim d); then a block barrier.
+// A staged tile's rows of values made keys in place (key0 + u for row u, at(u, d) its dim d): a warp a row; then a barrier.
 template <int D, typename At>
 __device__ __forceinline__ void vk_tile(int rows, int key0, const Vk& vk, At at) {
-    static_assert(D / 2 == 256, "a block's 256 threads take a row's 256 pairs, pair groups rotated over the warps");
-    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    for (int u = 0; u < rows; ++u) {
-        const int d = ((warp + u) % 8) * 32 + lane;
-        vk_pair<D>(at(u, d), at(u, d + D / 2), d, key0 + u, vk);
-    }
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, warps = blockDim.x / 32;
+    for (int u = warp; u < rows; u += warps)
+#pragma unroll
+        for (int j = 0; j < D / 64; ++j) vk_pair<D>(at(u, 32 * j + lane), at(u, 32 * j + lane + D / 2), 32 * j + lane, key0 + u, vk);
     __syncthreads();
 }
 
