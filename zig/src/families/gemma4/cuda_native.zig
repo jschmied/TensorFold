@@ -132,9 +132,9 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     if (o.lanes_fixed and o.lanes > be.round_rows) return error.ParallelPastRound;
     // TF_KV_SHARE keeps prompts as the pool's pages, so it pages too; otherwise the default, unless turned off
     const paged = try @import("core").kv_prompts.sharing() > 0 or pagesOn(o);
-    // TF_GEMMA4_V_ONLY's forms refused by name before any weight or kernel loads (the E-series' keys at initPaged)
+    // TF_GEMMA4_V_ONLY's forms refused by name before any weight or kernel loads (the E-series and 12B at initPaged)
     if (try fwd.vOnlyRead()) {
-        if (fwd.vOnlyRefusal(paged, true, try @import("core").kv_prompts.sharing() > 0, o.drafts and o.drafter != null)) |e| return e;
+        if (fwd.vOnlyRefusal(paged, true, 4, try @import("core").kv_prompts.sharing() > 0, o.drafts and o.drafter != null)) |e| return e;
     }
     const own = try gpa.create(Owned);
     errdefer gpa.destroy(own);
@@ -162,7 +162,6 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     };
     own.m = try fwd.Model.initPaged(gpa, ctx.d, own.s, &own.w, context, n, paged);
     errdefer own.m.deinit();
-    if (own.m.v_only) try own.k.win.ropeTable(own.s, own.m.inv_global, @import("cuda_config.zig").global_rotated, context, own.m.rope_cs);
     const most = own.m.prompt_most;
     const busy = fwd.prompt_rows;
     if (most != busy) std.log.info("gemma4: prompt passes of {d} rows, {d} beside a decode", .{ most, busy });
@@ -279,7 +278,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.GemmaVOnlyDrafter => "TF_GEMMA4_V_ONLY=1: an assistant or DFlash drafter reads the target's global keys, which V-only pages do not hold: serve --no-drafts, drop --drafter, or unset TF_GEMMA4_V_ONLY",
         error.GemmaVOnlyKvShare => "TF_GEMMA4_V_ONLY=1: the TF_KV_SHARE store keeps K and V regions a layer: unset one of them",
         error.GemmaVOnlyUnpaged => "TF_GEMMA4_V_ONLY=1 needs the global caches in pool pages: unset TENSORFOLD_GEMMA4_KV_PAGES=0 or TF_GEMMA4_V_ONLY",
-        error.GemmaVOnlyRotation => "TF_GEMMA4_V_ONLY=1: this checkpoint's global RoPE does not rotate exactly the first 64 pairs the key table holds: unset TF_GEMMA4_V_ONLY",
+        error.GemmaVOnlyOneKeyHead => "TF_GEMMA4_V_ONLY=1: this Gemma 4 model's global layers have one key head, where V-only attention is slower than K+V: unset TF_GEMMA4_V_ONLY",
         error.GemmaVOnlyKeysNotValues => "TF_GEMMA4_V_ONLY=1: this Gemma 4 checkpoint's global layers have their own v_proj (attention_k_eq_v false), so keys are not made from values: unset TF_GEMMA4_V_ONLY",
         error.NoStreamFits => "the CUDA memory budget fits no Gemma 4 stream after the weights: lower --context, free device memory, or adjust TENSORFOLD_MEMORY_RESERVE_GIB / TENSORFOLD_CUDA_MEMORY_LIMIT_GB",
         else => null,
@@ -381,6 +380,6 @@ test "admission counts the vision workspace: more bytes per open, fewer streams 
 }
 
 test "TF_GEMMA4_V_ONLY's refusals each name the flag and what to change" {
-    for ([_]anyerror{ error.BadGemmaVOnly, error.GemmaVOnlyDrafter, error.GemmaVOnlyKvShare, error.GemmaVOnlyUnpaged, error.GemmaVOnlyKeysNotValues, error.GemmaVOnlyRotation }) |e|
+    for ([_]anyerror{ error.BadGemmaVOnly, error.GemmaVOnlyDrafter, error.GemmaVOnlyKvShare, error.GemmaVOnlyUnpaged, error.GemmaVOnlyKeysNotValues, error.GemmaVOnlyOneKeyHead }) |e|
         try std.testing.expect(std.mem.indexOf(u8, explain(null, e).?, "TF_GEMMA4_V_ONLY") != null);
 }

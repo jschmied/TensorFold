@@ -22,7 +22,6 @@ const cases = [_]Case{
 
 /// Positions past 2^16 at the 31B's frequencies: the angles' reduction at a 64K context.
 const far = 70000;
-const table_positions = 262164;
 
 /// k and v rows [n, hk, 512] as the served writer makes them (tf_qk_rows_round, v from k), positions p0 + i.
 fn written(b: *rows.Bufs, a: std.mem.Allocator, s: cuda.Stream, k: *const qk.QkRows, rng: std.Random, c: Case, p0: usize, n: usize, kn: u64, qn: u64, inv: u64, edges: bool) !struct { k: u64, v: u64, pos: u64 } {
@@ -84,7 +83,7 @@ fn keysEqual(b: *rows.Bufs, s: cuda.Stream, g: *const wa.WindowAttention, c: Cas
     return counts[0];
 }
 
-fn case(gpu: check.Gpu, a: std.mem.Allocator, s: cuda.Stream, g: *const wa.WindowAttention, k: *const qk.QkRows, rng: std.Random, c: Case, inv: u64, cs: u64) !u64 {
+fn case(gpu: check.Gpu, a: std.mem.Allocator, s: cuda.Stream, g: *const wa.WindowAttention, k: *const qk.QkRows, rng: std.Random, c: Case, inv: u64) !u64 {
     var b: rows.Bufs = .{ .gpu = gpu };
     defer b.deinit();
     var kn_h: [d]u16 = undefined;
@@ -95,13 +94,12 @@ fn case(gpu: check.Gpu, a: std.mem.Allocator, s: cuda.Stream, g: *const wa.Windo
     }
     const kn = try b.up(std.mem.sliceAsBytes(&kn_h));
     const qn = try b.up(std.mem.sliceAsBytes(&qn_h));
-    const plain: wa.Vk = .{ .w = kn, .inv = inv };
-    const vk: wa.Vk = .{ .w = kn, .inv = inv, .cs = cs, .rot = 64 };
+    const vk: wa.Vk = .{ .w = kn, .inv = inv };
     var compared: u64 = 0;
     // edge values and positions: the first, page edges, 2^16, a 64K context's angles, the 12B's 256K (cosf's slow path)
     for ([_]usize{ 0, 250, 65530, far, 262100 }) |p0| {
         const e = try written(&b, a, s, k, rng, c, p0, 64, kn, qn, inv, true);
-        for ([_]wa.Vk{ plain, vk }) |v| compared += try keysEqual(&b, s, g, c, e, 64, v, if (v.cs == 0) "edges, cosf in place" else "edges, the GPU table");
+        compared += try keysEqual(&b, s, g, c, e, 64, vk, "edges");
     }
     const far_kv = try written(&b, a, s, k, rng, c, far, 512, kn, qn, inv, false);
     compared += try keysEqual(&b, s, g, c, far_kv, 512, vk, "at positions 70000..70511");
@@ -198,13 +196,11 @@ pub fn run(gpu: check.Gpu) !void {
     var b: rows.Bufs = .{ .gpu = gpu };
     defer b.deinit();
     const inv = try b.up(std.mem.sliceAsBytes(&inv_h));
-    const cs = try b.out(s, table_positions * 2 * 64 * 4);
-    try g.ropeTable(s, inv, 64, table_positions, cs);
     var prng = std.Random.DefaultPrng.init(0x7e0f);
     var compared: u64 = 0;
     for (cases) |c| {
         _ = arena.reset(.retain_capacity);
-        compared += try case(gpu, arena.allocator(), s, &g, &k, prng.random(), c, inv, cs);
+        compared += try case(gpu, arena.allocator(), s, &g, &k, prng.random(), c, inv);
     }
-    check.pass("window vonly 512: {d} keys made from values equal qk_round's bit for bit (edge values at positions 0 to 262163, cosf in place and the GPU table; the planted flip red), and decode (pages of 37, 256) and prompt rows (P as bf16 and P32, pages of 32, 256) over keys made once a chunk give the K+V kernels' bits, float64 replays included", .{compared});
+    check.pass("window vonly 512: {d} keys made from values equal qk_round's bit for bit (edge values at positions 0 to 262163; the planted flip red), and decode (pages of 37, 256) and prompt rows (P as bf16 and P32, pages of 32, 256) over keys made once a chunk give the K+V kernels' bits, float64 replays included", .{compared});
 }

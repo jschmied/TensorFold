@@ -17,7 +17,7 @@ pub const Pages = struct { table: u64, page_elems: usize, tokens: usize, stride:
 pub const Window = struct { h: usize, hk: usize, d: usize, win: usize, ring: usize, scale: f32, p32: bool = false, pg: ?Pages = null, vk: ?Vk = null };
 
 /// TF_GEMMA4_V_ONLY: head dim 512 keys made from values by the k norm w (bf16 [d]) and inv (f32 [d / 2]).
-pub const Vk = struct { w: u64, inv: u64, cs: u64 = 0, rot: u32 = 0 };
+pub const Vk = struct { w: u64, inv: u64 };
 
 /// Positions a head dim 256 page holds (a multiple of): the decode chunk, so a chunk and a prompt tile stay in a page.
 pub const page_unit = chunk_keys;
@@ -84,7 +84,7 @@ pub const WindowAttention = struct {
     pub const Paged = struct { part: Function, merge: Function, prompt: [2]?Function = .{ null, null }, vo: ?Vo = null };
 
     /// The V-only twins at head dim 512 (TF_GEMMA4_V_ONLY), the v half of `put`, and the keys' bit check.
-    pub const Vo = struct { part: Function, merge: Function, put: Function, check: Function, table: Function, keys: Function };
+    pub const Vo = struct { part: Function, merge: Function, put: Function, check: Function, keys: Function };
 
     pub fn load(d: *const Driver) !WindowAttention {
         if (!kernels.available) return error.BuiltWithoutKernels;
@@ -123,7 +123,7 @@ pub const WindowAttention = struct {
         var p512: Paged = .{ .part = try pages.function("tf_wrows_part_512_pg"), .merge = try pages.function("tf_wrows_merge_512_pg"), .prompt = .{ try pages.function("tf_wrows_prompt_512_pg"), try pages.function("tf_wrows_prompt_512_p32_pg") } };
         try p512.part.allowDynamicShared(staged_smem);
         for (p512.prompt) |pf| try pf.?.allowDynamicShared(rows_smem[1]);
-        const vo: Vo = .{ .part = try pages.function("tf_wrows_part_512_pg_vo"), .merge = try pages.function("tf_wrows_merge_512_pg_vo"), .put = try pages.function("tf_wrows_put_v"), .check = try pages.function("tf_vonly_check"), .table = try pages.function("tf_vonly_rope_table"), .keys = try pages.function("tf_vonly_keys") };
+        const vo: Vo = .{ .part = try pages.function("tf_wrows_part_512_pg_vo"), .merge = try pages.function("tf_wrows_merge_512_pg_vo"), .put = try pages.function("tf_wrows_put_v"), .check = try pages.function("tf_vonly_check"), .keys = try pages.function("tf_vonly_keys") };
         try vo.part.allowDynamicShared(staged_smem);
         p512.vo = vo;
         g.put_fn = try pages.function("tf_wrows_put");
@@ -233,8 +233,6 @@ pub const WindowAttention = struct {
         if (w.vk) |v| {
             a.add(v.w);
             a.add(v.inv);
-            a.add(v.cs);
-            a.add(@as(i32, @intCast(v.rot)));
         }
         const pairs = if (vo != null) 1 else if (w.d == 512) (w.h / w.hk + 3) / 4 else 1; // 512: a block 4 query heads; V-only: a key head
         try launch_.launch(if (vo) |x| x.part else if (pf) |x| x.part else f.part, .{ .grid = .{ .x = @intCast(n), .y = @intCast(w.hk * pairs), .z = @intCast(t) }, .block = .{ .x = 256 }, .shared = if (w.d == 512) staged_smem else 0 }, s, &a);
@@ -251,8 +249,6 @@ pub const WindowAttention = struct {
         if (w.vk) |v| {
             b.add(v.w);
             b.add(v.inv);
-            b.add(v.cs);
-            b.add(@as(i32, @intCast(v.rot)));
         }
         try launch_.launch(if (vo) |x| x.merge else if (pf) |x| x.merge else f.merge, .{ .grid = .{ .x = @intCast(n), .y = @intCast(w.hk), .z = @intCast(w.h / w.hk * w.d / 256) }, .block = .{ .x = 256 } }, s, &b);
     }
@@ -303,8 +299,6 @@ pub const WindowAttention = struct {
         a.add(@as(i32, @intCast(hk)));
         a.add(vk.w);
         a.add(vk.inv);
-        a.add(vk.cs);
-        a.add(@as(i32, @intCast(vk.rot)));
         a.add(@as(i32, @intFromBool(plant)));
         a.add(counts);
         try launch_.launch(vo.check, .{ .grid = .{ .x = @intCast(n), .y = @intCast(hk) }, .block = .{ .x = 256 } }, s, &a);
@@ -321,20 +315,7 @@ pub const WindowAttention = struct {
         a.add(@as(i32, @intCast(hk)));
         a.add(vk.w);
         a.add(vk.inv);
-        a.add(vk.cs);
-        a.add(@as(i32, @intCast(vk.rot)));
         try launch_.launch(vo.keys, .{ .grid = .{ .x = @intCast(n), .y = @intCast(hk) }, .block = .{ .x = 256 } }, s, &a);
-    }
-
-    /// The V-only keys' cos and sin table for positions [0, n): `out` f32 [n, 2 rot] from inv's first rot pairs.
-    pub fn ropeTable(g: *const WindowAttention, s: Stream, inv: u64, rot: usize, n: usize, out: u64) !void {
-        const vo = g.wide_fns[1].paged.?.vo orelse return error.WindowShape;
-        if (n == 0) return;
-        var a: launch_.Args = .{};
-        a.add(inv);
-        a.add(@as(i32, @intCast(rot)));
-        a.add(out);
-        try launch_.launch(vo.table, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 128 } }, s, &a);
     }
 
     /// n prompt rows of one stream at p0, p0 + 1, ... (d 128): kc/vc its ring, key p at row p % ring, or (pg) pages.

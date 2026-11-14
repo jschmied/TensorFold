@@ -19,7 +19,7 @@ fn median(xs: []f64) f64 {
     return xs[xs.len / 2];
 }
 
-/// Arms "kv", "vo" or both (TF_VONLY_BENCH_ARM), reps (TF_VONLY_BENCH_REPS, ncu: 1), TABLE=0: no cos/sin table.
+/// Arms "kv", "vo" or both (TF_VONLY_BENCH_ARM), reps (TF_VONLY_BENCH_REPS, ncu: 1).
 pub fn run(gpu: check.Gpu, ctx_text: []const u8) !void {
     const ctx = try std.fmt.parseInt(usize, ctx_text, 10);
     const arm = std.mem.span(std.c.getenv("TF_VONLY_BENCH_ARM") orelse "both");
@@ -41,10 +41,7 @@ pub fn run(gpu: check.Gpu, ctx_text: []const u8) !void {
     var kn_h: [d]u16 = undefined;
     for (&kn_h) |*x| x.* = @import("core").bf16_round.bits(0.25 + 1.5 * rng.float(f32));
     const inv = try b.up(std.mem.sliceAsBytes(&inv_h));
-    const cs = try b.out(s, ctx * 2 * 64 * 4);
-    try g.ropeTable(s, inv, 64, ctx, cs);
-    const table = if (std.c.getenv("TF_VONLY_BENCH_TABLE")) |t| t[0] != '0' else true; // 0: cosf in place
-    const vk: wa.Vk = .{ .w = try b.up(std.mem.sliceAsBytes(&kn_h)), .inv = inv, .cs = if (table) cs else 0, .rot = if (table) 64 else 0 };
+    const vk: wa.Vk = .{ .w = try b.up(std.mem.sliceAsBytes(&kn_h)), .inv = inv };
     const flush = try b.out(s, 96 << 20); // past the 24 MiB L2: every rep starts cold
     var start = try cuda.Event.init(gpu.d, true);
     defer start.deinit();
@@ -87,7 +84,7 @@ pub fn run(gpu: check.Gpu, ctx_text: []const u8) !void {
                 try s.synchronize();
                 if (i >= warm) us[i - warm] = @as(f64, try start.elapsedMs(end)) * 1000;
             }
-            std.debug.print("RESULT window-vonly-bench {s} {s} {s}{s} ctx {d}: {d:.1} us (median of {d}, cold L2)\n", .{ x.name, if (prompt) "prompt 512 rows" else "decode 1 row", which, if (table or std.mem.eql(u8, which, "kv")) "" else " (no table)", ctx, median(us), reps });
+            std.debug.print("RESULT window-vonly-bench {s} {s} {s} ctx {d}: {d:.1} us (median of {d}, cold L2)\n", .{ x.name, if (prompt) "prompt 512 rows" else "decode 1 row", which, ctx, median(us), reps });
         };
     }
 }

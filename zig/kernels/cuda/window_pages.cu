@@ -104,17 +104,17 @@ extern "C" __global__ void __launch_bounds__(128) tf_wrows_put(const __nv_bfloat
 extern "C" __global__ void __launch_bounds__(NT) tf_wrows_part_512_pg_vo(
     const __nv_bfloat16* q, const __nv_bfloat16* kc, const __nv_bfloat16* vc, const int* pos, const int* slot,
     float* po, float* pm, float* pl, int h, int hk, int win, long long ring, float scale, const int* tab,
-    long long page, int tok, int stride, const __nv_bfloat16* kw, const float* inv, const float* cs, int rot) {
-    part_vo<512>(q, vc, pos, slot, po, pm, pl, h, hk, scale, Vk{kw, inv, cs, rot}, Pg{tab, page, tok, stride});
+    long long page, int tok, int stride, const __nv_bfloat16* kw, const float* inv) {
+    part_vo<512>(q, vc, pos, slot, po, pm, pl, h, hk, scale, Vk{kw, inv}, Pg{tab, page, tok, stride});
 }
 
 extern "C" __global__ void __launch_bounds__(NT) tf_wrows_merge_512_pg_vo(
     const float* po, const float* pm, const float* pl, __nv_bfloat16* out, int h, int hk, int chunks,
     const __nv_bfloat16* q, const __nv_bfloat16* kc, const __nv_bfloat16* vc, const int* pos, const int* slot, int win,
     long long ring, float scale, const int* tab, long long page, int tok, int stride, const __nv_bfloat16* kw,
-    const float* inv, const float* cs, int rot) {
+    const float* inv) {
     merge_vo<512>(po, pm, pl, out, h, hk, chunks, q, vc, pos, slot, scale, Pg{tab, page, tok, stride},
-                  Vk{kw, inv, cs, rot});
+                  Vk{kw, inv});
 }
 
 // Rows v [n, row] into the V pages only (tf_wrows_put's v half).
@@ -132,14 +132,14 @@ extern "C" __global__ void __launch_bounds__(128) tf_wrows_put_v(const __nv_bflo
 // K from rows v vs the k rows qk_round wrote: counts += values compared, values differing; plant flips one bit.
 extern "C" __global__ void __launch_bounds__(256) tf_vonly_check(const __nv_bfloat16* k, const __nv_bfloat16* v,
                                                                  const int* pos, int hk, const __nv_bfloat16* kw,
-                                                                 const float* inv, const float* cs, int rot, int plant,
+                                                                 const float* inv, int plant,
                                                                  unsigned long long* counts) {
     constexpr int D = 512;
     const int64_t r = blockIdx.x;
     const int kh = blockIdx.y, d = threadIdx.x;
     const int64_t at = (r * hk + kh) * D;
     __nv_bfloat16 e[2] = {v[at + d], v[at + d + D / 2]};
-    vk_pair<D>(&e[0], &e[1], d, pos[r], Vk{kw, inv, cs, rot});
+    vk_pair<D>(&e[0], &e[1], d, pos[r], Vk{kw, inv});
     uint16_t a0 = __bfloat16_as_ushort(e[0]);
     const uint16_t a1 = __bfloat16_as_ushort(e[1]);
     if (plant && r == 0 && kh == 0 && d == 3) a0 ^= 1;
@@ -148,25 +148,15 @@ extern "C" __global__ void __launch_bounds__(256) tf_vonly_check(const __nv_bflo
     if (threadIdx.x == 0) atomicAdd(&counts[0], static_cast<unsigned long long>(D));
 }
 
-// V-only keys' cos, then sin, of each position's rot rotated pairs (a block a position), shared by the global layers.
-extern "C" __global__ void __launch_bounds__(128) tf_vonly_rope_table(const float* inv, int rot, float* out) {
-    const int64_t p = blockIdx.x;
-    for (int j = threadIdx.x; j < rot; j += blockDim.x) {
-        const float a = __fmul_rn(static_cast<float>(p), inv[j]); // qk_rows.cuh rope_at's angle, then cosf and sinf
-        out[p * 2 * rot + j] = cosf(a);
-        out[p * 2 * rot + rot + j] = sinf(a);
-    }
-}
-
 // A V-only prompt chunk's keys [0, gridDim.x) of key head blockIdx.y made from their values into ks, in vc's layout.
 extern "C" __global__ void __launch_bounds__(256) tf_vonly_keys(const __nv_bfloat16* vc, __nv_bfloat16* ks, const int* tab,
                                                                 long long page, int tok, int hk, const __nv_bfloat16* kw,
-                                                                const float* inv, const float* cs, int rot) {
+                                                                const float* inv) {
     constexpr int D = 512;
     const int key = blockIdx.x, kh = blockIdx.y, d = threadIdx.x;
     const int64_t at = static_cast<int64_t>(tab[key / tok]) * page + (static_cast<int64_t>(key % tok) * hk + kh) * D;
     __nv_bfloat16 e[2] = {vc[at + d], vc[at + d + D / 2]};
-    vk_pair<D>(&e[0], &e[1], d, key, Vk{kw, inv, cs, rot});
+    vk_pair<D>(&e[0], &e[1], d, key, Vk{kw, inv});
     ks[at + d] = e[0];
     ks[at + d + D / 2] = e[1];
 }

@@ -50,12 +50,13 @@ pub fn vOnlyRead() !bool {
     return @import("sys").environment.read(bool, "TF_GEMMA4_V_ONLY", false) catch error.BadGemmaVOnly;
 }
 
-/// V-only pages need pages, keys that are values, no TF_KV_SHARE and no drafter that reads keys; else refused.
-pub fn vOnlyRefusal(paged: bool, keys_are_values: bool, kv_share: bool, drafter: bool) ?anyerror {
+/// V-only pages need pages, keys that are values, several key heads, no TF_KV_SHARE and no drafter that reads keys.
+pub fn vOnlyRefusal(paged: bool, keys_are_values: bool, key_heads: usize, kv_share: bool, drafter: bool) ?anyerror {
     if (drafter) return error.GemmaVOnlyDrafter;
     if (kv_share) return error.GemmaVOnlyKvShare;
     if (!paged) return error.GemmaVOnlyUnpaged;
     if (!keys_are_values) return error.GemmaVOnlyKeysNotValues;
+    if (key_heads < 2) return error.GemmaVOnlyOneKeyHead; // the 12B: one block a key head leaves 1 / 4 of the 31B's grid
     return null;
 }
 
@@ -72,8 +73,6 @@ pub const Model = struct {
     paged: bool = false,
     /// TF_GEMMA4_V_ONLY=1: global layers' pages hold V alone; their attention makes each key from its value.
     v_only: bool = false,
-    /// V-only: f32 [context, 2 rotated pairs], each position's cos then sin (window_attention.ropeTable), else 0.
-    rope_cs: u64 = 0,
     /// V-only: a prompt layer's keys in the pages' layout (cuda_pages.regions' last), made from its values per chunk.
     k_scratch: u64 = 0,
     pages: usize = 0,
@@ -183,7 +182,7 @@ pub const Model = struct {
     /// TF_GEMMA4_V_ONLY for this model (cuda_native refuses the forms it does not serve before the weights load).
     fn vOnlyFor(m: *const Model) !bool {
         if (!try vOnlyRead()) return false;
-        if (vOnlyRefusal(m.paged, m.geo.keys_are_values, try @import("core").kv_prompts.sharing() > 0, false)) |e| return e;
+        if (vOnlyRefusal(m.paged, m.geo.keys_are_values, m.geo.global_kv_heads, try @import("core").kv_prompts.sharing() > 0, false)) |e| return e;
         return true;
     }
 
@@ -200,10 +199,6 @@ pub const Model = struct {
         var gl: [cfg.global_dim / 2]f32 = undefined;
         inverseFrequencies(false, &sl);
         inverseFrequencies(true, &gl);
-        if (m.v_only) { // the table holds the rotated pairs; vk_pair takes cos 1, sin 0 for the rest, inv 0 there
-            for (gl, 0..) |v, i| if ((v != 0) != (i < cfg.global_rotated)) return error.GemmaVOnlyRotation;
-            m.rope_cs = try m.alloc(m.context * 2 * cfg.global_rotated * 4);
-        }
         m.inv_sliding = try m.alloc(sl.len * 4);
         m.inv_global = try m.alloc(gl.len * 4);
         if (m.planned == null) {
@@ -450,7 +445,7 @@ pub const Model = struct {
         const out: cuda.qk_rows.Out = .{ .q = x.qr, .k = x.kr, .v = x.vr, .kc = if (direct) m.kc[i] else null, .vc = if (direct) m.vc[i] else null, .len = len };
         try k.qk.rowsFrom(s, src, .{ .h = geo.query_heads, .hk = if (own) kvh else 0, .dim = dh }, shape, x.pos, x.slot, out, rows);
         // TF_GEMMA4_V_ONLY: a global layer's keys from its values; a shared layer's from its owner's k norm
-        const vk: ?cuda.window_attention.Vk = if (global and m.v_only) .{ .w = m.w.layers[cfg.cacheOwner(i, geo.cacheLayers()) orelse i].k_norm, .inv = m.inv_global, .cs = m.rope_cs, .rot = cfg.global_rotated } else null;
+        const vk: ?cuda.window_attention.Vk = if (global and m.v_only) .{ .w = m.w.layers[cfg.cacheOwner(i, geo.cacheLayers()) orelse i].k_norm, .inv = m.inv_global } else null;
         const w: Window = .{ .h = geo.query_heads, .hk = kvh, .d = dh, .win = if (global) 0 else geo.sliding_window, .ring = len, .scale = 1, .p32 = true, .pg = pg, .vk = vk };
         if (own and pg != null) {
             if (vk != null) {
@@ -511,12 +506,13 @@ test "TF_GEMMA4_V_ONLY takes exactly 0 or 1 through environment.zig; every other
     for ([_][]const u8{ "off", "false", "no", "on", "2", " 0", "1 ", "yes", "true" }) |v| try std.testing.expectError(error.BadGemmaVOnly, vOnlyAsked(v));
 }
 
-test "TF_GEMMA4_V_ONLY refuses drafters, the TF_KV_SHARE store, linear caches and the E-series by name" {
-    try std.testing.expectEqual(@as(?anyerror, null), vOnlyRefusal(true, true, false, false));
-    try std.testing.expectEqual(@as(?anyerror, error.GemmaVOnlyDrafter), vOnlyRefusal(true, true, false, true));
-    try std.testing.expectEqual(@as(?anyerror, error.GemmaVOnlyKvShare), vOnlyRefusal(true, true, true, false));
-    try std.testing.expectEqual(@as(?anyerror, error.GemmaVOnlyUnpaged), vOnlyRefusal(false, true, false, false));
-    try std.testing.expectEqual(@as(?anyerror, error.GemmaVOnlyKeysNotValues), vOnlyRefusal(true, false, false, false));
+test "TF_GEMMA4_V_ONLY refuses drafters, the TF_KV_SHARE store, linear caches, the E-series and the 12B by name" {
+    try std.testing.expectEqual(@as(?anyerror, null), vOnlyRefusal(true, true, 4, false, false));
+    try std.testing.expectEqual(@as(?anyerror, error.GemmaVOnlyDrafter), vOnlyRefusal(true, true, 4, false, true));
+    try std.testing.expectEqual(@as(?anyerror, error.GemmaVOnlyKvShare), vOnlyRefusal(true, true, 4, true, false));
+    try std.testing.expectEqual(@as(?anyerror, error.GemmaVOnlyUnpaged), vOnlyRefusal(false, true, 4, false, false));
+    try std.testing.expectEqual(@as(?anyerror, error.GemmaVOnlyKeysNotValues), vOnlyRefusal(true, false, 4, false, false));
+    try std.testing.expectEqual(@as(?anyerror, error.GemmaVOnlyOneKeyHead), vOnlyRefusal(true, true, cfg.unified12b.global_kv_heads, false, false));
 }
 
 test "V-only stream bytes count the global layers' V alone: the 31B's 10 globals save 4 KiB a position each" {
