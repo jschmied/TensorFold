@@ -237,7 +237,7 @@ pub const WindowAttention = struct {
             a.add(v.cs);
             a.add(@as(i32, @intCast(v.rot)));
         }
-        const pairs = if (w.d == 512) (w.h / w.hk + 3) / 4 else 1; // head dim 512: a block 4 query heads
+        const pairs = if (vo != null) 1 else if (w.d == 512) (w.h / w.hk + 3) / 4 else 1; // 512: a block 4 query heads; V-only: a key head
         try launch_.launch(if (vo) |x| x.part else if (pf) |x| x.part else f.part, .{ .grid = .{ .x = @intCast(n), .y = @intCast(w.hk * pairs), .z = @intCast(t) }, .block = .{ .x = 256 }, .shared = if (w.d == 512) staged_smem else 0 }, s, &a);
         var b: launch_.Args = .{};
         for ([_]u64{ po, pm, pl, out }) |v| b.add(v);

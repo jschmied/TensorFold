@@ -2,6 +2,7 @@
 
 #include "window_rows.cuh"
 #include "window_rows512.cuh"
+#include "window_vonly_part.cuh"
 
 using namespace tf_wrows;
 
@@ -100,7 +101,7 @@ extern "C" __global__ void __launch_bounds__(NT) tf_wrows_part_512_pg(
     const __nv_bfloat16* q, const __nv_bfloat16* kc, const __nv_bfloat16* vc, const int* pos, const int* slot,
     float* po, float* pm, float* pl, int h, int hk, int win, long long ring, float scale, const int* tab,
     long long page, int tok, int stride) {
-    part_staged<512, NONE>(q, kc, vc, pos, slot, po, pm, pl, h, hk, win, ring, scale, Vk{}, Pg{tab, page, tok, stride});
+    part_staged<512, NONE>(q, kc, vc, pos, slot, po, pm, pl, h, hk, win, ring, scale, Pg{tab, page, tok, stride});
 }
 
 extern "C" __global__ void __launch_bounds__(NT) tf_wrows_merge_512_pg(
@@ -146,8 +147,7 @@ extern "C" __global__ void __launch_bounds__(NT) tf_wrows_part_512_pg_vo(
     const __nv_bfloat16* q, const __nv_bfloat16* kc, const __nv_bfloat16* vc, const int* pos, const int* slot,
     float* po, float* pm, float* pl, int h, int hk, int win, long long ring, float scale, const int* tab,
     long long page, int tok, int stride, const __nv_bfloat16* kw, const float* inv, const float* cs, int rot) {
-    part_staged<512, NONE, true>(q, kc, vc, pos, slot, po, pm, pl, h, hk, win, ring, scale, Vk{kw, inv, cs, rot},
-                                 Pg{tab, page, tok, stride});
+    part_vo<512>(q, vc, pos, slot, po, pm, pl, h, hk, scale, Vk{kw, inv, cs, rot}, Pg{tab, page, tok, stride});
 }
 
 extern "C" __global__ void __launch_bounds__(NT) tf_wrows_merge_512_pg_vo(

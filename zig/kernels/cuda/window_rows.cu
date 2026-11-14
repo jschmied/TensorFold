@@ -42,7 +42,7 @@ extern "C" __global__ void __launch_bounds__(NT) tf_wrows_part_512(const __nv_bf
                                                                    const __nv_bfloat16* vc, const int* pos,
                                                                    const int* slot, float* po, float* pm, float* pl,
                                                                    int h, int hk, int win, long long ring, float scale) {
-    part_staged<512, NONE>(q, kc, vc, pos, slot, po, pm, pl, h, hk, win, ring, scale, Vk{});
+    part_staged<512, NONE>(q, kc, vc, pos, slot, po, pm, pl, h, hk, win, ring, scale);
 }
 
 extern "C" __global__ void __launch_bounds__(NT) tf_wrows_merge_512(const float* po, const float* pm, const float* pl,

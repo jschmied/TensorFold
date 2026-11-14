@@ -8,13 +8,13 @@ namespace tf_wrows {
 // part's arithmetic for head dim 512: a block 4 heads, K and V tiles in shared memory, a warp a key run.
 constexpr int TK = 32, NSG = 2;
 
-// P: empty, or one Pg (window_pages.cu): key k of slot s at its page, tab[s * stride + k / tok]; VO: keys from vc.
-template <int D, int FAULT, bool VO = false, typename... P>
+// P: empty, or one Pg (window_pages.cu): key k of slot s at its page, tab[s * stride + k / tok] (no window).
+template <int D, int FAULT, typename... P>
 __device__ __forceinline__ void part_staged(const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ kc,
                                             const __nv_bfloat16* __restrict__ vc, const int* __restrict__ pos,
                                             const int* __restrict__ slot, float* __restrict__ po, float* __restrict__ pm,
                                             float* __restrict__ pl, int h, int hk, int win, long long ring, float scale,
-                                            Vk vk, P... pg) {
+                                            P... pg) {
     constexpr int DPL = D / 32, HW = 4, C = D / 8; // a lane's dims and columns, heads a block (and warp), uint4 a key
     extern __shared__ uint4 tiles[];                       // [NSG][TK][C] K or V tiles; then the runs' partial o
     __shared__ float sp[CK * SP];
@@ -88,15 +88,13 @@ __device__ __forceinline__ void part_staged(const __nv_bfloat16* __restrict__ q,
         load(reinterpret_cast<const uint4*>(q + (r * h + kh * G + hd) * D + lane * DPL), qv[hh]);
     }
     for (int t = 0; t < NSG - 1; ++t)
-        if (t < nt) stage(VO ? vc : kc, t);
+        if (t < nt) stage(kc, t);
         else commit();
     for (int t = 0; t < nt; ++t) { // scores: a lane's DPL dims in an fma chain, then a xor tree over the lanes
-        if (t + NSG - 1 < nt) stage(VO ? vc : kc, t + NSG - 1);
+        if (t + NSG - 1 < nt) stage(kc, t + NSG - 1);
         else commit();
         asm volatile("cp.async.wait_group %0;\n" ::"n"(NSG - 1));
         __syncthreads();
-        if constexpr (VO) // the tile's values made keys in place (window_vonly.cuh)
-            vk_tile<D>(min(TK, nk - t * TK), k0 + t * TK, vk, [&](int u, int d) { return smem_bf(tiles + (t % NSG) * TK * C) + u * D + d; });
         if (busy) {
             for (int u0 = kg; u0 < TK; u0 += 4 * WG) { // four keys' chains side by side
                 float kf[4][DPL], sc[4][HW];
