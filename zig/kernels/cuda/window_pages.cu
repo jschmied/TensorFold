@@ -22,48 +22,6 @@ __device__ __noinline__ void tf_wrows::merge_pg_odd(const __nv_bfloat16* q, cons
                  c0 + NT);
 }
 
-// merge_pg_odd over V-only pages (TF_GEMMA4_V_ONLY): a warp's keys from their value rows (vk_row).
-template <int D>
-__device__ __noinline__ void tf_wrows::merge_pg_odd_vo(const __nv_bfloat16* q, const __nv_bfloat16* vc, const int* pos,
-                                                       const int* slot, int h, int hk, int win, float scale, Pg pg,
-                                                       Vk vk, __nv_bfloat16* oh, int64_t r, int kh, int hd) {
-    __shared__ __nv_bfloat16 kr[NW][D];
-    const int p = pos[r], G = h / hk, ts = (slot != nullptr ? slot[r] : 0) * pg.stride;
-    const auto kv = [&](int key, int which) -> const __nv_bfloat16* {
-        const int64_t pid = pg.tab[ts + key / pg.tok];
-        const __nv_bfloat16* row = vc + pid * pg.page + (static_cast<int64_t>(key % pg.tok) * hk + kh) * D;
-        return which == 0 ? vk_row<D>(row, key, vk, kr[threadIdx.x / 32]) : row;
-    };
-    const int c0 = blockIdx.z * NT % D;
-    slow_head<D>(q + (r * h + kh * G + hd) * D, kv, win > 0 ? max(p - win + 1, 0) : 0, p, (double)scale, oh, c0,
-                 c0 + NT);
-}
-
-// prompt::odd over a stream's V-only pages (TF_GEMMA4_V_ONLY): a warp's keys from their value rows (vk_row).
-template <int D>
-__device__ __noinline__ void tf_wrows::prompt::odd_vo(const __nv_bfloat16* q, const __nv_bfloat16* vc, __nv_bfloat16* out, const int* hi,
-                                    int p0, int W, int H, int HK, int G, float scale, int win, Pg pg, Vk vk) {
-    using K = Cfg<D>;
-    __shared__ __nv_bfloat16 kr[NW][D];
-    const int HB = G % K::NG == 0 ? K::NG : 1, RB = K::NG / HB;
-    const int hk = blockIdx.y / (G / HB), hg = blockIdx.y % (G / HB);
-    const int row0 = blockIdx.x * 16 * RB;
-    const auto kv = [&](int key, int which) -> const __nv_bfloat16* {
-        const __nv_bfloat16* row = vc + (int64_t)pg.tab[key / pg.tok] * pg.page + ((int64_t)(key % pg.tok) * HK + hk) * D;
-        return which == 0 ? vk_row<D>(row, key, vk, kr[threadIdx.x / 32]) : row;
-    };
-    for (int i = 0; i < 16 * RB * HB; ++i) {
-        const int r = row0 + i % (16 * RB), head = hk * G + hg * HB + i / (16 * RB);
-        if (r >= W) continue;
-        __nv_bfloat16* dst = out + ((int64_t)r * H + head) * D;
-        const bool affected = tf_wrows_head_affected(reinterpret_cast<const uint16_t*>(dst), D, threadIdx.x, NT);
-        if (!__syncthreads_or(affected)) continue;
-        const int p = p0 + r;
-        slow_head<D>(q + ((int64_t)r * H + head) * D, kv, win > 0 ? max(p - win + 1, 0) : 0,
-                     hi != nullptr ? hi[r] : p, (double)scale, dst, 0, D);
-    }
-}
-
 // Dory's full-attention caches in pages (head dim 256, no window): kc/vc a layer's part of page 0, tab a row of ids.
 extern "C" __global__ void __launch_bounds__(NT) tf_wrows_part_256_pg(
     const __nv_bfloat16* q, const __nv_bfloat16* kc, const __nv_bfloat16* vc, const int* pos, const int* slot,
@@ -155,24 +113,8 @@ extern "C" __global__ void __launch_bounds__(NT) tf_wrows_merge_512_pg_vo(
     const __nv_bfloat16* q, const __nv_bfloat16* kc, const __nv_bfloat16* vc, const int* pos, const int* slot, int win,
     long long ring, float scale, const int* tab, long long page, int tok, int stride, const __nv_bfloat16* kw,
     const float* inv, const float* cs, int rot) {
-    merge<512, NONE, true, true>(po, pm, pl, out, h, hk, chunks, q, kc, vc, pos, slot, win, ring, scale,
-                                 Pg{tab, page, tok, stride}, Vk{kw, inv, cs, rot});
-}
-
-extern "C" __global__ void __launch_bounds__(NT, 1) tf_wrows_prompt_512_pg_vo(
-    const __nv_bfloat16* q, const __nv_bfloat16* kc, const __nv_bfloat16* vc, __nv_bfloat16* out, const int* hi,
-    int p0, int W, int H, int HK, int G, float scale, int win, int ring, const int* tab, long long page, int tok,
-    const __nv_bfloat16* kw, const float* inv, const float* cs, int rot) {
-    prompt::kernel<512, false, NONE, true, true>(q, kc, vc, out, hi, p0, W, H, HK, G, scale, win, ring,
-                                                 Pg{tab, page, tok, 0}, Vk{kw, inv, cs, rot});
-}
-
-extern "C" __global__ void __launch_bounds__(NT, 1) tf_wrows_prompt_512_p32_pg_vo(
-    const __nv_bfloat16* q, const __nv_bfloat16* kc, const __nv_bfloat16* vc, __nv_bfloat16* out, const int* hi,
-    int p0, int W, int H, int HK, int G, float scale, int win, int ring, const int* tab, long long page, int tok,
-    const __nv_bfloat16* kw, const float* inv, const float* cs, int rot) {
-    prompt::kernel<512, true, NONE, true, true>(q, kc, vc, out, hi, p0, W, H, HK, G, scale, win, ring,
-                                                Pg{tab, page, tok, 0}, Vk{kw, inv, cs, rot});
+    merge_vo<512>(po, pm, pl, out, h, hk, chunks, q, vc, pos, slot, scale, Pg{tab, page, tok, stride},
+                  Vk{kw, inv, cs, rot});
 }
 
 // Rows v [n, row] into the V pages only (tf_wrows_put's v half).
@@ -214,4 +156,17 @@ extern "C" __global__ void __launch_bounds__(128) tf_vonly_rope_table(const floa
         out[p * 2 * rot + j] = cosf(a);
         out[p * 2 * rot + rot + j] = sinf(a);
     }
+}
+
+// A V-only prompt chunk's keys [0, gridDim.x) of key head blockIdx.y made from their values into ks, in vc's layout.
+extern "C" __global__ void __launch_bounds__(256) tf_vonly_keys(const __nv_bfloat16* vc, __nv_bfloat16* ks, const int* tab,
+                                                                long long page, int tok, int hk, const __nv_bfloat16* kw,
+                                                                const float* inv, const float* cs, int rot) {
+    constexpr int D = 512;
+    const int key = blockIdx.x, kh = blockIdx.y, d = threadIdx.x;
+    const int64_t at = static_cast<int64_t>(tab[key / tok]) * page + (static_cast<int64_t>(key % tok) * hk + kh) * D;
+    __nv_bfloat16 e[2] = {vc[at + d], vc[at + d + D / 2]};
+    vk_pair<D>(&e[0], &e[1], d, key, Vk{kw, inv, cs, rot});
+    ks[at + d] = e[0];
+    ks[at + d + D / 2] = e[1];
 }

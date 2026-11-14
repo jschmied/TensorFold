@@ -161,13 +161,14 @@ fn case(gpu: check.Gpu, a: std.mem.Allocator, s: cuda.Stream, g: *const wa.Windo
     const top = c.p0 + c.n;
     for ([_]bool{ false, true }) |p32| for ([_]usize{ 32, 256 }) |tok| {
         const pool = try pages512.paged(&b, a, rng, kc[0 .. top * c.hk * d], vc[0 .. top * c.hk * d], 1, top, c.hk, tok);
-        var pw: wa.Window = .{ .h = c.h, .hk = c.hk, .d = d, .win = 0, .ring = 0, .scale = 1, .p32 = p32, .pg = pool.pages };
+        const pw: wa.Window = .{ .h = c.h, .hk = c.hk, .d = d, .win = 0, .ring = 0, .scale = 1, .p32 = p32, .pg = pool.pages };
         const m = c.n * c.h * d;
         const want_d = try b.out(s, m * 2);
         try g.promptRows(s, dpq, pool.kc, pool.vc, want_d, c.p0, c.n, pw, null);
-        pw.vk = vk;
+        const ks = try b.out(s, ((top + tok - 1) / tok + 3) * tok * c.hk * d * 2); // NaN (0xffff) until made
+        try g.keysVo(s, pool.vc, ks, pool.pages, c.hk, vk, top);
         const got_d = try b.out(s, m * 2);
-        try g.promptRows(s, dpq, no_keys, pool.vc, got_d, c.p0, c.n, pw, null);
+        try g.promptRows(s, dpq, ks, pool.vc, got_d, c.p0, c.n, pw, null);
         try s.synchronize();
         const want = try a.alloc(u16, m);
         const got = try a.alloc(u16, m);
@@ -177,7 +178,7 @@ fn case(gpu: check.Gpu, a: std.mem.Allocator, s: cuda.Stream, g: *const wa.Windo
         for (want) |x| odd += @intFromBool(x & 0x7f80 == 0x7f80);
         try check.expect(odd > 0, "window vonly {s}: the planted +inf reaches the prompt's replay", .{c.name});
         var what: [200]u8 = undefined;
-        try check.sameBytes(try std.fmt.bufPrint(&what, "window vonly {s}: prompt rows ({s}) over V-only pages of {d} give the K+V bits", .{ c.name, if (p32) "P32" else "P as bf16", tok }), std.mem.sliceAsBytes(got), std.mem.sliceAsBytes(want));
+        try check.sameBytes(try std.fmt.bufPrint(&what, "window vonly {s}: prompt rows ({s}) over keys made once a chunk (keysVo), pages of {d}, give the K+V bits", .{ c.name, if (p32) "P32" else "P as bf16", tok }), std.mem.sliceAsBytes(got), std.mem.sliceAsBytes(want));
     };
     return compared;
 }
@@ -205,5 +206,5 @@ pub fn run(gpu: check.Gpu) !void {
         _ = arena.reset(.retain_capacity);
         compared += try case(gpu, arena.allocator(), s, &g, &k, prng.random(), c, inv, cs);
     }
-    check.pass("window vonly 512: {d} keys made from values equal qk_round's bit for bit (edge values at positions 0 to 262163, cosf in place and the GPU table; the planted flip red), and decode (pages of 37, 256) and prompt rows (P as bf16 and P32, pages of 32, 256) over V-only pages with NaN keys give the K+V kernels' bits, float64 replays included", .{compared});
+    check.pass("window vonly 512: {d} keys made from values equal qk_round's bit for bit (edge values at positions 0 to 262163, cosf in place and the GPU table; the planted flip red), and decode (pages of 37, 256) and prompt rows (P as bf16 and P32, pages of 32, 256) over keys made once a chunk give the K+V kernels' bits, float64 replays included", .{compared});
 }

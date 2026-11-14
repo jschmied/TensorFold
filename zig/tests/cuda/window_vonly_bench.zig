@@ -19,7 +19,7 @@ fn median(xs: []f64) f64 {
     return xs[xs.len / 2];
 }
 
-/// Arms "kv", "vo" or both (TF_VONLY_BENCH_ARM), reps from TF_VONLY_BENCH_REPS (ncu: 1); decode 1 row, prompt 512 rows.
+/// Arms "kv", "vo" or both (TF_VONLY_BENCH_ARM), reps (TF_VONLY_BENCH_REPS, ncu: 1), TABLE=0: no cos/sin table.
 pub fn run(gpu: check.Gpu, ctx_text: []const u8) !void {
     const ctx = try std.fmt.parseInt(usize, ctx_text, 10);
     const arm = std.mem.span(std.c.getenv("TF_VONLY_BENCH_ARM") orelse "both");
@@ -40,7 +40,11 @@ pub fn run(gpu: check.Gpu, ctx_text: []const u8) !void {
     @import("core").rope_freq.proportional(1000000.0, d, 64, &inv_h);
     var kn_h: [d]u16 = undefined;
     for (&kn_h) |*x| x.* = @import("core").bf16_round.bits(0.25 + 1.5 * rng.float(f32));
-    const vk: wa.Vk = .{ .w = try b.up(std.mem.sliceAsBytes(&kn_h)), .inv = try b.up(std.mem.sliceAsBytes(&inv_h)) };
+    const inv = try b.up(std.mem.sliceAsBytes(&inv_h));
+    const cs = try b.out(s, ctx * 2 * 64 * 4);
+    try g.ropeTable(s, inv, 64, ctx, cs);
+    const table = if (std.c.getenv("TF_VONLY_BENCH_TABLE")) |t| t[0] != '0' else true; // 0: cosf in place
+    const vk: wa.Vk = .{ .w = try b.up(std.mem.sliceAsBytes(&kn_h)), .inv = inv, .cs = if (table) cs else 0, .rot = if (table) 64 else 0 };
     const flush = try b.out(s, 96 << 20); // past the 24 MiB L2: every rep starts cold
     var start = try cuda.Event.init(gpu.d, true);
     defer start.deinit();
@@ -61,6 +65,7 @@ pub fn run(gpu: check.Gpu, ctx_text: []const u8) !void {
         var w: wa.Window = .{ .h = x.h, .hk = x.hk, .d = d, .win = 0, .ring = ctx, .scale = 0.0625, .p32 = true, .pg = pool.pages };
         const scratch = try b.out(s, wa.WindowAttention.scratchBytes(w, 1));
         const out = try b.out(s, 512 * x.h * d * 2);
+        const ks = try b.out(s, (ctx / tok + 3) * tok * x.hk * d * 2); // V-only prompt keys, the pool's layout
         for ([_]bool{ false, true }) |prompt| for ([_][]const u8{ "kv", "vo" }) |which| {
             if (!std.mem.eql(u8, arm, "both") and !std.mem.eql(u8, arm, which)) continue;
             w.vk = if (std.mem.eql(u8, which, "vo")) vk else null;
@@ -72,13 +77,17 @@ pub fn run(gpu: check.Gpu, ctx_text: []const u8) !void {
                 if (prompt) {
                     var pw = w;
                     pw.ring = 0;
-                    try g.promptRows(s, dq, pool.kc, pool.vc, out, ctx - 512, 512, pw, null);
+                    pw.vk = null;
+                    if (w.vk) |v| { // V-only: the chunk's keys made once into the scratch, then the K+V kernel
+                        try g.keysVo(s, pool.vc, ks, pool.pages, x.hk, v, ctx);
+                        try g.promptRows(s, dq, ks, pool.vc, out, ctx - 512, 512, pw, null);
+                    } else try g.promptRows(s, dq, pool.kc, pool.vc, out, ctx - 512, 512, pw, null);
                 } else try g.decode(s, dq, pool.kc, pool.vc, out, dp, ds, w, scratch, 1);
                 try end.record(s);
                 try s.synchronize();
                 if (i >= warm) us[i - warm] = @as(f64, try start.elapsedMs(end)) * 1000;
             }
-            std.debug.print("RESULT window-vonly-bench {s} {s} {s} ctx {d}: {d:.1} us (median of {d}, cold L2)\n", .{ x.name, if (prompt) "prompt 512 rows" else "decode 1 row", which, ctx, median(us), reps });
+            std.debug.print("RESULT window-vonly-bench {s} {s} {s}{s} ctx {d}: {d:.1} us (median of {d}, cold L2)\n", .{ x.name, if (prompt) "prompt 512 rows" else "decode 1 row", which, if (table or std.mem.eql(u8, which, "kv")) "" else " (no table)", ctx, median(us), reps });
         };
     }
 }

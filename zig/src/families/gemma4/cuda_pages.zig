@@ -39,8 +39,13 @@ pub fn copies(m: anytype) usize {
     return if (m.v_only) 1 else 2;
 }
 
+/// V-only: one more region a page, the prompt's key scratch (one layer's keys at most, made from its values).
+pub fn regions(m: anytype) usize {
+    return globalLayers(m) * copies(m) + @intFromBool(m.v_only);
+}
+
 pub fn pageBytes(m: anytype) u64 {
-    return globalLayers(m) * copies(m) * pageElems(m) * 2;
+    return regions(m) * pageElems(m) * 2;
 }
 
 pub fn layout(m: anytype) kv.Layout {
@@ -51,7 +56,7 @@ pub fn layout(m: anytype) kv.Layout {
         sliding += 2 * m.geo.kvHeads(i) * cfg.headDim(i) * 2;
     };
     const n: u32 = @intCast(globalLayers(m));
-    var l = kv.Layout.ofRows(.{ .kind = .full, .row = copies(m) * m.geo.global_kv_heads * cfg.global_dim * 2, .layers = n }, tokens, fixed, 0);
+    var l = kv.Layout.ofRows(.{ .kind = .full, .row = copies(m) * m.geo.global_kv_heads * cfg.global_dim * 2, .layers = n + @intFromBool(m.v_only) }, tokens, fixed, 0);
     l.window = kv.groups.Group.split(.window, sliding, @intCast(ownLayers(m) - n));
     return l;
 }
@@ -110,7 +115,8 @@ pub fn attach(m: anytype, s: cuda.Stream, extra: usize, count: usize) !void {
     m.slots = extra + 1;
     m.pages = count;
     const region = count * pageElems(m) * 2;
-    const arena = try m.zeros(s, globalLayers(m) * copies(m) * region);
+    const arena = try m.zeros(s, regions(m) * region);
+    if (m.v_only) m.k_scratch = arena + (regions(m) - 1) * region; // the prompt's keys, a layer at a time
     var block: usize = 0;
     for (0..ownLayers(m)) |i| {
         if (cfg.global(i)) {

@@ -74,6 +74,8 @@ pub const Model = struct {
     v_only: bool = false,
     /// V-only: f32 [context, 2 rotated pairs], each position's cos then sin (window_attention.ropeTable), else 0.
     rope_cs: u64 = 0,
+    /// V-only: a prompt layer's keys in the pages' layout (cuda_pages.regions' last), made from its values per chunk.
+    k_scratch: u64 = 0,
     pages: usize = 0,
     table: u64 = 0,
     ids: []u32 = &.{},
@@ -460,7 +462,11 @@ pub const Model = struct {
             const c = chains[0];
             const off = if (pg != null) 0 else c.slot * len * kw * 2;
             const hi: ?u64 = if (!global and c.images.len > 0) x.hi else null;
-            try k.win.promptRows(s, x.qr, m.kc[i] + off, m.vc[i] + off, x.att, c.p0, rows, if (global) .{ .h = w.h, .hk = w.hk, .d = w.d, .win = 0, .ring = 0, .scale = 1, .p32 = true, .pg = m.pagesFor(c.slot), .vk = vk } else w, hi);
+            if (vk) |v| { // the chunk's keys [0, p0 + rows) made once into the scratch; the K+V prompt kernel reads them
+                const pgs = m.pagesFor(c.slot).?;
+                try k.win.keysVo(s, m.vc[i], m.k_scratch, pgs, kvh, v, c.p0 + rows);
+                try k.win.promptRows(s, x.qr, m.k_scratch, m.vc[i], x.att, c.p0, rows, .{ .h = w.h, .hk = w.hk, .d = w.d, .win = 0, .ring = 0, .scale = 1, .p32 = true, .pg = pgs }, hi);
+            } else try k.win.promptRows(s, x.qr, m.kc[i] + off, m.vc[i] + off, x.att, c.p0, rows, if (global) .{ .h = w.h, .hk = w.hk, .d = w.d, .win = 0, .ring = 0, .scale = 1, .p32 = true, .pg = m.pagesFor(c.slot) } else w, hi);
         } else {
             var r: usize = 0;
             while (r < rows) : (r += attend_rows) {

@@ -84,7 +84,7 @@ pub const WindowAttention = struct {
     pub const Paged = struct { part: Function, merge: Function, prompt: [2]?Function = .{ null, null }, vo: ?Vo = null };
 
     /// The V-only twins at head dim 512 (TF_GEMMA4_V_ONLY), the v half of `put`, and the keys' bit check.
-    pub const Vo = struct { part: Function, merge: Function, prompt: [2]Function, put: Function, check: Function, table: Function };
+    pub const Vo = struct { part: Function, merge: Function, put: Function, check: Function, table: Function, keys: Function };
 
     pub fn load(d: *const Driver) !WindowAttention {
         if (!kernels.available) return error.BuiltWithoutKernels;
@@ -123,9 +123,8 @@ pub const WindowAttention = struct {
         var p512: Paged = .{ .part = try pages.function("tf_wrows_part_512_pg"), .merge = try pages.function("tf_wrows_merge_512_pg"), .prompt = .{ try pages.function("tf_wrows_prompt_512_pg"), try pages.function("tf_wrows_prompt_512_p32_pg") } };
         try p512.part.allowDynamicShared(staged_smem);
         for (p512.prompt) |pf| try pf.?.allowDynamicShared(rows_smem[1]);
-        const vo: Vo = .{ .part = try pages.function("tf_wrows_part_512_pg_vo"), .merge = try pages.function("tf_wrows_merge_512_pg_vo"), .prompt = .{ try pages.function("tf_wrows_prompt_512_pg_vo"), try pages.function("tf_wrows_prompt_512_p32_pg_vo") }, .put = try pages.function("tf_wrows_put_v"), .check = try pages.function("tf_vonly_check"), .table = try pages.function("tf_vonly_rope_table") };
+        const vo: Vo = .{ .part = try pages.function("tf_wrows_part_512_pg_vo"), .merge = try pages.function("tf_wrows_merge_512_pg_vo"), .put = try pages.function("tf_wrows_put_v"), .check = try pages.function("tf_vonly_check"), .table = try pages.function("tf_vonly_rope_table"), .keys = try pages.function("tf_vonly_keys") };
         try vo.part.allowDynamicShared(staged_smem);
-        for (vo.prompt) |pf| try pf.allowDynamicShared(rows_smem[1]);
         p512.vo = vo;
         g.put_fn = try pages.function("tf_wrows_put");
         g.wide_fns[0].paged = p;
@@ -311,6 +310,22 @@ pub const WindowAttention = struct {
         try launch_.launch(vo.check, .{ .grid = .{ .x = @intCast(n), .y = @intCast(hk) }, .block = .{ .x = 256 } }, s, &a);
     }
 
+    /// A V-only prompt chunk's keys [0, n) made from their values into ks (vc's page layout, the stream's row pg).
+    pub fn keysVo(g: *const WindowAttention, s: Stream, vc: u64, ks: u64, pg: Pages, hk: usize, vk: Vk, n: usize) !void {
+        const vo = g.wide_fns[1].paged.?.vo orelse return error.WindowShape;
+        if (n == 0) return;
+        var a: launch_.Args = .{};
+        for ([_]u64{ vc, ks, pg.table }) |x| a.add(x);
+        a.add(@as(i64, @intCast(pg.page_elems)));
+        a.add(@as(i32, @intCast(pg.tokens)));
+        a.add(@as(i32, @intCast(hk)));
+        a.add(vk.w);
+        a.add(vk.inv);
+        a.add(vk.cs);
+        a.add(@as(i32, @intCast(vk.rot)));
+        try launch_.launch(vo.keys, .{ .grid = .{ .x = @intCast(n), .y = @intCast(hk) }, .block = .{ .x = 256 } }, s, &a);
+    }
+
     /// The V-only keys' cos and sin table for positions [0, n): `out` f32 [n, 2 rot] from inv's first rot pairs.
     pub fn ropeTable(g: *const WindowAttention, s: Stream, inv: u64, rot: usize, n: usize, out: u64) !void {
         const vo = g.wide_fns[1].paged.?.vo orelse return error.WindowShape;
@@ -355,8 +370,8 @@ pub const WindowAttention = struct {
         var paged: ?Function = null;
         if (w.pg != null) { // the head dim has this P's paged twin
             paged = (f.paged orelse return error.WindowShape).prompt[@intFromBool(w.p32)] orelse return error.WindowShape;
-            if (w.vk != null) paged = ((f.paged.?.vo) orelse return error.WindowShape).prompt[@intFromBool(w.p32)];
-        } else if (w.vk != null) return error.WindowShape;
+        }
+        if (w.vk != null) return error.WindowShape; // V-only prompt rows read keysVo's keys through the K+V kernel
         if (n == 0) return;
         const ng = 1024 / w.d; // 16-row groups a block: 8 warps, a 128-dim slice each
         const hb = if (grp % ng == 0) ng else 1;
@@ -368,12 +383,6 @@ pub const WindowAttention = struct {
         a.add(@as(i32, @intCast(w.win)));
         a.add(@as(i32, @intCast(w.ring)));
         if (w.pg) |p| addPages(&a, p, false);
-        if (w.vk) |v| {
-            a.add(v.w);
-            a.add(v.inv);
-            a.add(v.cs);
-            a.add(@as(i32, @intCast(v.rot)));
-        }
         const cfg: launch_.Config = .{ .grid = .{ .x = @intCast((n + rows - 1) / rows), .y = @intCast(w.hk * (grp / hb)), .z = 1 }, .block = .{ .x = 256 }, .shared = promptShared(w.d) };
         try launch_.launch(paged orelse f.prompt[@intFromBool(w.p32)], cfg, s, &a);
     }

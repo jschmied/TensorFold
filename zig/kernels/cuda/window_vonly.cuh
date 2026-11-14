@@ -33,7 +33,7 @@ __device__ __forceinline__ __nv_bfloat16* smem_bf(const uint4* p) {
     return reinterpret_cast<__nv_bfloat16*>(const_cast<uint4*>(p));
 }
 
-// A staged tile's rows of values made keys in place (key0 + u for row u, at(u, d) its dim d): a warp a row; then a barrier.
+// A staged tile's rows made keys in place (key0 + u for row u, at(u, d) its dim d): a warp a row; then a barrier.
 template <int D, typename At>
 __device__ __forceinline__ void vk_tile(int rows, int key0, const Vk& vk, At at) {
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, warps = blockDim.x / 32;

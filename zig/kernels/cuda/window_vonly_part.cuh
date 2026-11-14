@@ -2,6 +2,7 @@
 #pragma once
 
 #include "window_rows512.cuh"
+#include "window_vonly.cuh"
 
 namespace tf_wrows {
 
@@ -171,6 +172,50 @@ __device__ __forceinline__ void part_vo(const __nv_bfloat16* __restrict__ q, con
         __syncthreads(); // ox is the next group's tiles
     }
     for (int i = threadIdx.x; i < G; i += NT) pm[part * G + i] = mx[i], pl[part * G + i] = ls[i];
+}
+
+// merge_pg_odd over V-only pages: the float64 replay with each key from its value row (a warp's own, vk_row).
+template <int D>
+__device__ __noinline__ void merge_pg_odd_vo(const __nv_bfloat16* q, const __nv_bfloat16* vc, const int* pos,
+                                             const int* slot, int h, int hk, float scale, Pg pg, Vk vk,
+                                             __nv_bfloat16* oh, int64_t r, int kh, int hd) {
+    __shared__ __nv_bfloat16 kr[NW][D];
+    const int p = pos[r], G = h / hk, ts = (slot != nullptr ? slot[r] : 0) * pg.stride;
+    const auto kv = [&](int key, int which) -> const __nv_bfloat16* {
+        const int64_t pid = pg.tab[ts + key / pg.tok];
+        const __nv_bfloat16* row = vc + pid * pg.page + (static_cast<int64_t>(key % pg.tok) * hk + kh) * D;
+        return which == 0 ? vk_row<D>(row, key, vk, kr[threadIdx.x / 32]) : row;
+    };
+    const int c0 = blockIdx.z * NT % D;
+    slow_head<D>(q + (r * h + kh * G + hd) * D, kv, 0, p, (double)scale, oh, c0, c0 + NT);
+}
+
+// merge<D, NONE, true> over V-only pages (no window): its sums in its order, merge_pg_odd_vo as its replay.
+template <int D>
+__device__ __forceinline__ void merge_vo(const float* __restrict__ po, const float* __restrict__ pm,
+                                         const float* __restrict__ pl, __nv_bfloat16* __restrict__ out, int h, int hk,
+                                         int chunks, const __nv_bfloat16* __restrict__ q,
+                                         const __nv_bfloat16* __restrict__ vc, const int* __restrict__ pos,
+                                         const int* __restrict__ slot, float scale, Pg pg, Vk vk) {
+    const int64_t r = blockIdx.x;
+    const int kh = blockIdx.y, G = h / hk;
+    const int o = blockIdx.z * NT + threadIdx.x;
+    const int hd = o / D, e = o % D;
+    const int64_t part0 = (r * hk + kh) * chunks;
+    float m = -INFINITY;
+    for (int c = 0; c < chunks; ++c) m = fmaxf(m, pm[(part0 + c) * G + hd]);
+    float acc = 0.0f, l = 0.0f;
+    for (int c = 0; c < chunks; ++c) {
+        const float mc = pm[(part0 + c) * G + hd];
+        if (mc == -INFINITY) continue;
+        const float a = expf(__fsub_rn(mc, m));
+        acc = __fmaf_rn(a, po[((part0 + c) * G + hd) * D + e], acc);
+        l = __fmaf_rn(a, pl[(part0 + c) * G + hd], l);
+    }
+    const float x = __fdiv_rn(acc, l);
+    __nv_bfloat16* oh = out + (r * h + kh * G + hd) * D;
+    oh[e] = __float2bfloat16_rn(x);
+    if (__syncthreads_or(!isfinite(x))) merge_pg_odd_vo<D>(q, vc, pos, slot, h, hk, scale, pg, vk, oh, r, kh, hd);
 }
 
 } // namespace tf_wrows
