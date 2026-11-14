@@ -7,6 +7,7 @@ const st = @import("state.zig");
 const fwd = @import("forward.zig");
 const prompt = @import("prompt.zig");
 const snapshot = @import("snapshot.zig");
+const vonly = @import("vonly.zig");
 const Model = @import("model.zig").Model;
 const draw = @import("../qwen3_5/backend.zig").draw;
 const be = lanes.backend;
@@ -41,6 +42,11 @@ pub const Metal = struct {
         var scratch = try st.Scratch.init(model.device, model.config.geo, options.capacity);
         errdefer scratch.deinit();
         out.* = .{ .gpa = gpa, .io = io, .trace = std.c.getenv("GEMMA_DRAFT_TRACE") != null, .model = model, .options = options, .scratch = scratch, .prompt_scratch = try prompt.Scratch.init(model.device, model.config.geo, options.capacity) };
+        errdefer out.prompt_scratch.deinit();
+        if (model.v_only != null) { // a prompt chunk's global keys, one layer at a time (TF_GEMMA4_V_ONLY)
+            out.prompt_scratch.keys = try model.device.buffer(@intCast(vonly.scratchBytes(model.config.geo, options.capacity)), mtl.ResourceOptions.private | mtl.ResourceOptions.untracked);
+            out.prompt_scratch.keys_capacity = options.capacity;
+        }
         return out;
     }
 
@@ -74,7 +80,7 @@ pub const Metal = struct {
     pub fn createCache(self: *Metal, capacity: usize) !*st.Cache {
         const cache = try self.gpa.create(st.Cache);
         errdefer self.gpa.destroy(cache);
-        cache.* = try st.Cache.init(self.model.device, self.model.config.geo, capacity);
+        cache.* = try st.Cache.initMode(self.model.device, self.model.config.geo, capacity, self.model.v_only != null);
         cache.setResident(self.follow);
         return cache;
     }
@@ -87,7 +93,7 @@ pub const Metal = struct {
     /// A window of each width 1..16 at position 0 on a throwaway cache, the second of two runs timed.
     pub fn measure(self: *Metal) !void {
         const io = self.io;
-        var cache = try st.Cache.init(self.model.device, self.model.config.geo, 256);
+        var cache = try st.Cache.initMode(self.model.device, self.model.config.geo, 256, self.model.v_only != null);
         defer cache.deinit();
         var ids: [st.max_rows]u32 = @splat(2);
         for (1..st.max_rows + 1) |rows| {
@@ -109,7 +115,7 @@ pub const Metal = struct {
     /// The forward's ms at `rows` rows (up to 128) of one stream, the second of two runs.
     pub fn timeRows(self: *Metal, rows: usize) !f64 {
         const io = self.io;
-        var cache = try st.Cache.init(self.model.device, self.model.config.geo, 256);
+        var cache = try st.Cache.initMode(self.model.device, self.model.config.geo, 256, self.model.v_only != null);
         defer cache.deinit();
         var ids: [st.prompt_rows]u32 = @splat(2);
         var ms: f64 = 0;
@@ -371,7 +377,7 @@ pub const Metal = struct {
 
     /// The prompt cache's Snapshots functions: a stream's caches at a mark, copied on the GPU.
     pub fn snapBytes(ptr: *anyopaque, at: u32) u64 {
-        return snapshot.bytes(cast(ptr).model.config.geo, at);
+        return snapshot.bytes(cast(ptr).model.config.geo, at, cast(ptr).model.v_only != null);
     }
 
     pub fn snapSave(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {

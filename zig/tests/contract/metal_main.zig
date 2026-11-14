@@ -445,6 +445,9 @@ pub fn main(init: std.process.Init) !u8 {
     var gemma_glu: @import("metal_gemma4_glu.zig").Suite = .{ .a = a, .device = device, .queue = queue, .kernels = &kernels };
     defer gemma_glu.deinit();
     try gemma_glu.collect(o.only);
+    var gemma_vonly: @import("metal_gemma4_vonly.zig").Suite = .{ .a = a, .device = device, .queue = queue, .kernels = &kernels };
+    defer gemma_vonly.deinit();
+    try gemma_vonly.collect(o.only);
     var nemotron_unroll: @import("metal_nemotron_unroll.zig").Suite = .{ .a = a, .device = device, .queue = queue, .kernels = &kernels };
     defer nemotron_unroll.deinit();
     try nemotron_unroll.collect(o.only);

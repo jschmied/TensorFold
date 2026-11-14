@@ -22,6 +22,9 @@ pub const gemma4_glue = @embedFile("gemma4/glue.metal");
 pub const gemma4_fused = @embedFile("gemma4/fused.metal");
 /// Gemma 4 prompt attention on the tensor units (families/gemma4/kernels.zig).
 pub const gemma4_prompt_attention = @embedFile("gemma4/prompt_attention.metal");
+/// Gemma 4 V-only global layers (TF_GEMMA4_V_ONLY): the prep without key writes; decode and rebuild from the values.
+pub const gemma4_vonly_glue = @import("gemma4/vonly.zig").glue;
+pub const gemma4_vonly_prompt = @import("gemma4/vonly.zig").prompt;
 /// The prefill GEMM template and its one kernel macro, ahead of every family's gemm_nax instantiations.
 const gemm_nax = @embedFile("prefill/gemm_nax.metal") ++ @embedFile("prefill/gemm_nax_kernel.metal");
 /// gemm_nax and the image towers' shared glue: bf16 rounding, threadgroup sum and max, row softmax.

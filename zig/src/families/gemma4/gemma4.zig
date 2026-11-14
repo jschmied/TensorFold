@@ -17,6 +17,7 @@ pub const vision = @import("vision.zig");
 pub const vision_unified = @import("vision_unified.zig");
 pub const residency = @import("residency.zig");
 pub const snapshot = @import("snapshot.zig");
+pub const vonly = @import("vonly.zig");
 
 test {
     _ = backend;
@@ -28,6 +29,7 @@ test {
     _ = snapshot;
     _ = vision;
     _ = weights;
+    _ = vonly;
 }
 
 pub const affine_mm = @import("affine_mm.zig");

@@ -195,6 +195,11 @@ fn resolve(a: std.mem.Allocator, device: mtl.Device, d: limits.MetalLaunch, comp
         const t = try @import("metal_spark25_attention.zig").limitsText(a, device, d.name);
         return .{ .decl = d, .function = fun, .here = t.here, .pre_m5 = t.pre_m5 };
     }
+    if (std.mem.startsWith(u8, d.name, "gemma4 ") and has(d.name, " vonly ")) {
+        if (!assemble) return undefined;
+        const t = try @import("metal_gemma4_vonly.zig").limitsText(a, device, d.name);
+        return .{ .decl = d, .function = fun, .here = t.here, .pre_m5 = t.pre_m5 };
+    }
     if (std.mem.startsWith(u8, d.name, "gemma4 ") and has(d.name, " attention ")) {
         if (!assemble) return undefined;
         const t = try @import("metal_gemma4_attention.zig").limitsText(a, device, d.name);
