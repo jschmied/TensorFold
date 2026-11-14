@@ -22,15 +22,17 @@ const cases = [_]Case{
 
 /// Positions past 2^16 at the 31B's frequencies: the angles' reduction at a 64K context.
 const far = 70000;
+const table_positions = 262164;
 
 /// k and v rows [n, hk, 512] as the served writer makes them (tf_qk_rows_round, v from k), positions p0 + i.
-fn written(b: *rows.Bufs, a: std.mem.Allocator, s: cuda.Stream, k: *const qk.QkRows, rng: std.Random, c: Case, p0: usize, n: usize, kn: u64, qn: u64, inv: u64) !struct { k: u64, v: u64, pos: u64 } {
+fn written(b: *rows.Bufs, a: std.mem.Allocator, s: cuda.Stream, k: *const qk.QkRows, rng: std.Random, c: Case, p0: usize, n: usize, kn: u64, qn: u64, inv: u64, edges: bool) !struct { k: u64, v: u64, pos: u64 } {
     const raw_q = try a.alloc(u16, n * c.h * d);
     const raw_k = try a.alloc(u16, n * c.hk * d);
     var i: usize = 0;
     while (i < raw_q.len) : (i += d) wc.row(rng, raw_q[i..][0..d], 1.0 + rng.float(f32));
     i = 0;
     while (i < raw_k.len) : (i += d) wc.row(rng, raw_k[i..][0..d], 0.5 + 4 * rng.float(f32));
+    if (edges) plantEdges(raw_k, c.hk);
     const pos = try a.alloc(i32, n);
     for (pos, 0..) |*p, j| p.* = @intCast(p0 + j);
     const dk = try b.up(std.mem.sliceAsBytes(raw_k));
@@ -42,6 +44,27 @@ fn written(b: *rows.Bufs, a: std.mem.Allocator, s: cuda.Stream, k: *const qk.QkR
     const dp = try b.up(std.mem.sliceAsBytes(pos));
     try k.rowsFrom(s, src, .{ .h = c.h, .hk = c.hk, .dim = d }, shape, dp, null, out, n);
     return .{ .k = out.k, .v = out.v, .pos = dp };
+}
+
+/// Edge values in raw k rows (one row each): +0s, -0s, a -0, subnormals, a subnormal V, NaN, +inf, -inf, min normal.
+fn plantEdges(raw: []u16, hk: usize) void {
+    const row = struct {
+        fn at(x: []u16, r: usize) []u16 {
+            return x[r * d ..][0..d];
+        }
+    }.at;
+    const rows_n = raw.len / d;
+    if (rows_n < 9 * hk) return;
+    @memset(row(raw, 0), 0x0000);
+    @memset(row(raw, 1), 0x8000);
+    row(raw, 2)[0] = 0x8000;
+    row(raw, 3)[5] = 0x0001;
+    row(raw, 3)[300] = 0x8001;
+    row(raw, 4)[1] = 0x000b; // ~1e-39: a subnormal V after the unit norm
+    row(raw, 5)[3] = 0x7fc0;
+    row(raw, 6)[9] = 0x7f80;
+    row(raw, 7)[9] = 0xff80;
+    row(raw, 8)[64] = 0x0080; // the smallest normal, on an unrotated pair
 }
 
 /// The recomputed keys against qk_round's (red with the planted flip); returns the values compared.
@@ -61,7 +84,7 @@ fn keysEqual(b: *rows.Bufs, s: cuda.Stream, g: *const wa.WindowAttention, c: Cas
     return counts[0];
 }
 
-fn case(gpu: check.Gpu, a: std.mem.Allocator, s: cuda.Stream, g: *const wa.WindowAttention, k: *const qk.QkRows, rng: std.Random, c: Case, inv: u64) !u64 {
+fn case(gpu: check.Gpu, a: std.mem.Allocator, s: cuda.Stream, g: *const wa.WindowAttention, k: *const qk.QkRows, rng: std.Random, c: Case, inv: u64, cs: u64) !u64 {
     var b: rows.Bufs = .{ .gpu = gpu };
     defer b.deinit();
     var kn_h: [d]u16 = undefined;
@@ -72,12 +95,17 @@ fn case(gpu: check.Gpu, a: std.mem.Allocator, s: cuda.Stream, g: *const wa.Windo
     }
     const kn = try b.up(std.mem.sliceAsBytes(&kn_h));
     const qn = try b.up(std.mem.sliceAsBytes(&qn_h));
-    const vk: wa.Vk = .{ .w = kn, .inv = inv };
+    const plain: wa.Vk = .{ .w = kn, .inv = inv };
+    const vk: wa.Vk = .{ .w = kn, .inv = inv, .cs = cs, .rot = 64 };
     var compared: u64 = 0;
-    // far positions: the bits at a 64K context's angles
-    const far_kv = try written(&b, a, s, k, rng, c, far, 512, kn, qn, inv);
+    // edge values and positions: the first, page edges, 2^16, a 64K context's angles, the 12B's 256K (cosf's slow path)
+    for ([_]usize{ 0, 250, 65530, far, 262100 }) |p0| {
+        const e = try written(&b, a, s, k, rng, c, p0, 64, kn, qn, inv, true);
+        for ([_]wa.Vk{ plain, vk }) |v| compared += try keysEqual(&b, s, g, c, e, 64, v, if (v.cs == 0) "edges, cosf in place" else "edges, the GPU table");
+    }
+    const far_kv = try written(&b, a, s, k, rng, c, far, 512, kn, qn, inv, false);
     compared += try keysEqual(&b, s, g, c, far_kv, 512, vk, "at positions 70000..70511");
-    const kv = try written(&b, a, s, k, rng, c, 0, c.top, kn, qn, inv);
+    const kv = try written(&b, a, s, k, rng, c, 0, c.top, kn, qn, inv, false);
     compared += try keysEqual(&b, s, g, c, kv, c.top, vk, "at positions 0..");
     try s.synchronize();
     const kc = try a.alloc(u16, c.top * c.hk * d);
@@ -169,11 +197,13 @@ pub fn run(gpu: check.Gpu) !void {
     var b: rows.Bufs = .{ .gpu = gpu };
     defer b.deinit();
     const inv = try b.up(std.mem.sliceAsBytes(&inv_h));
+    const cs = try b.out(s, table_positions * 2 * 64 * 4);
+    try g.ropeTable(s, inv, 64, table_positions, cs);
     var prng = std.Random.DefaultPrng.init(0x7e0f);
     var compared: u64 = 0;
     for (cases) |c| {
         _ = arena.reset(.retain_capacity);
-        compared += try case(gpu, arena.allocator(), s, &g, &k, prng.random(), c, inv);
+        compared += try case(gpu, arena.allocator(), s, &g, &k, prng.random(), c, inv, cs);
     }
-    check.pass("window vonly 512: {d} keys made from values equal qk_round's bit for bit (positions to 70511; the planted flip red), and decode (pages of 37, 256) and prompt rows (P as bf16 and P32, pages of 32, 256) over V-only pages with NaN keys give the K+V kernels' bits, float64 replays included", .{compared});
+    check.pass("window vonly 512: {d} keys made from values equal qk_round's bit for bit (edge values at positions 0 to 262163, cosf in place and the GPU table; the planted flip red), and decode (pages of 37, 256) and prompt rows (P as bf16 and P32, pages of 32, 256) over V-only pages with NaN keys give the K+V kernels' bits, float64 replays included", .{compared});
 }

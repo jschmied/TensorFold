@@ -7,6 +7,8 @@ namespace tf_wrows {
 struct Vk {
     const __nv_bfloat16* w;
     const float* inv;
+    const float* cs = nullptr; // tf_vonly_rope_table's [positions][2 rot]: pairs d < rot; inv is 0 past them
+    int rot = 0;
 };
 
 // Key dims d (e0), d + D / 2 (e1) at position p over their values in qk_round's op order; cosf(+0) = 1, sinf(+0) = +0.
@@ -15,9 +17,10 @@ __device__ __forceinline__ void vk_pair(__nv_bfloat16* e0, __nv_bfloat16* e1, in
     const float y0 = __bfloat162float(__float2bfloat16_rn(__fmul_rn(__bfloat162float(vk.w[d]), __bfloat162float(*e0))));
     const float y1 =
         __bfloat162float(__float2bfloat16_rn(__fmul_rn(__bfloat162float(vk.w[d + D / 2]), __bfloat162float(*e1))));
-    const float iv = vk.inv[d];
     float c = 1.0f, sn = 0.0f;
-    if (__float_as_uint(iv) != 0u) {
+    if (vk.cs != nullptr) {
+        if (d < vk.rot) c = vk.cs[static_cast<int64_t>(p) * 2 * vk.rot + d], sn = vk.cs[static_cast<int64_t>(p) * 2 * vk.rot + vk.rot + d];
+    } else if (const float iv = vk.inv[d]; __float_as_uint(iv) != 0u) {
         const float a = __fmul_rn(static_cast<float>(p), iv);
         c = cosf(a);
         sn = sinf(a);

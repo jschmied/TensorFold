@@ -72,6 +72,8 @@ pub const Model = struct {
     paged: bool = false,
     /// TF_GEMMA4_V_ONLY=1: global layers' pages hold V alone; their attention makes each key from its value.
     v_only: bool = false,
+    /// V-only: f32 [context, 2 rotated pairs], each position's cos then sin (window_attention.ropeTable), else 0.
+    rope_cs: u64 = 0,
     pages: usize = 0,
     table: u64 = 0,
     ids: []u32 = &.{},
@@ -196,6 +198,10 @@ pub const Model = struct {
         var gl: [cfg.global_dim / 2]f32 = undefined;
         inverseFrequencies(false, &sl);
         inverseFrequencies(true, &gl);
+        if (m.v_only) { // the table holds the rotated pairs; vk_pair takes cos 1, sin 0 for the rest, inv 0 there
+            for (gl, 0..) |v, i| if ((v != 0) != (i < cfg.global_rotated)) return error.GemmaVOnlyRotation;
+            m.rope_cs = try m.alloc(m.context * 2 * cfg.global_rotated * 4);
+        }
         m.inv_sliding = try m.alloc(sl.len * 4);
         m.inv_global = try m.alloc(gl.len * 4);
         if (m.planned == null) {
@@ -442,7 +448,7 @@ pub const Model = struct {
         const out: cuda.qk_rows.Out = .{ .q = x.qr, .k = x.kr, .v = x.vr, .kc = if (direct) m.kc[i] else null, .vc = if (direct) m.vc[i] else null, .len = len };
         try k.qk.rowsFrom(s, src, .{ .h = geo.query_heads, .hk = if (own) kvh else 0, .dim = dh }, shape, x.pos, x.slot, out, rows);
         // TF_GEMMA4_V_ONLY: a global layer's keys from its values; a shared layer's from its owner's k norm
-        const vk: ?cuda.window_attention.Vk = if (global and m.v_only) .{ .w = m.w.layers[cfg.cacheOwner(i, geo.cacheLayers()) orelse i].k_norm, .inv = m.inv_global } else null;
+        const vk: ?cuda.window_attention.Vk = if (global and m.v_only) .{ .w = m.w.layers[cfg.cacheOwner(i, geo.cacheLayers()) orelse i].k_norm, .inv = m.inv_global, .cs = m.rope_cs, .rot = cfg.global_rotated } else null;
         const w: Window = .{ .h = geo.query_heads, .hk = kvh, .d = dh, .win = if (global) 0 else geo.sliding_window, .ring = len, .scale = 1, .p32 = true, .pg = pg, .vk = vk };
         if (own and pg != null) {
             if (vk != null) {
