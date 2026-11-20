@@ -4,6 +4,7 @@ const slots = @import("core").tree_slots;
 const Seg = @import("cuda_cache.zig").Seg;
 const Rule = @import("cuda").sample.Rule;
 pub const Path = @import("cuda_cache.zig").Path;
+const E = @import("cuda_engine.zig");
 pub const max_rows = 8192; // a forward's rows at most: a solo prompt pass (TF_QWEN35_CHUNK_SOLO); verify, most_verify
 pub const grid_rows = 4096; // the cold pass's chunk: where cuts land, states are kept and passes resume
 pub const max_segs = 128;
@@ -32,6 +33,10 @@ comptime {
 pub fn tableBytes(entries: usize) usize {
     return states_at + max_segs * entries * 8;
 }
+/// A state table's entries (Engine.stateEntries): the engine's `tables` hold one for each forward segment.
+pub fn stateEntries(e: anytype) usize {
+    return @import("cuda_cache.zig").States.len(e.g);
+}
 /// Segment i's state table in the tables (qwen35.cuh forward_states): the stream's own, copied when it moved.
 pub fn forwardStates(e: anytype, i: usize, c: anytype) ![4]u64 {
     const States = @import("cuda_cache.zig").States;
@@ -49,6 +54,29 @@ pub fn forwardStates(e: anytype, i: usize, c: anytype) ![4]u64 {
 pub fn onTable(parts: anytype) bool {
     for (parts) |p| if (p.cache.on_table) return true;
     return false;
+}
+/// Refuse the whole frame before settling any prior window or launching work.
+pub fn admit(e: *const E.Engine, parts: []const E.Part, ids: []const u32, keep: E.Keep) !void {
+    const g = e.g;
+    if (!@import("cuda_geometry.zig").supported(g, ids.len, !keep.verifies(), most_verify)) return error.UnsupportedQwenGeometry;
+    var total: usize = 0;
+    if (parts.len == 0 or parts.len > max_segs) return error.InvalidQwenSegments;
+    for (parts, 0..) |p, index| {
+        for (parts[0..index]) |prior| if (prior.cache == p.cache) return error.InvalidQwenSegments;
+        if (p.rows == 0 or p.cache.len > p.cache.cap or p.rows > p.cache.cap - p.cache.len) return error.QwenContextFull;
+        if (p.rows > max_rows - total) return error.InvalidQwenSegments;
+        total += p.rows;
+    }
+    if (parts.len == 0 or parts.len > max_segs or total != ids.len or total > max_rows) return error.InvalidQwenSegments;
+    if (e.learning != null and total != 1) return error.BadLearningRows;
+    if (keep == .hidden and e.learning == null) return error.BadLearningRows;
+    const record = keep.verifies();
+    if (record and total > e.verify_rows) return error.InvalidQwenSegments;
+    if (!record and parts.len != 1) return error.InvalidQwenSegments;
+    if (keep == .draws and keep.draws.len != total) return error.InvalidQwenSegments;
+    for (ids) |id| if (id >= g.vocab) return error.InvalidQwenToken;
+    for (parts) |p| if (p.parents != null and !record) return error.InvalidQwenParents;
+    for (parts) |p| if (p.images != null and record) return error.InvalidQwenImages;
 }
 /// An image prompt's rows for its prompt chunks: device feature rows, each prompt row's feature row, its positions.
 pub const Images = struct {

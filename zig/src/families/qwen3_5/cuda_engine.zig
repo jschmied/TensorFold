@@ -441,29 +441,8 @@ pub const Engine = struct {
         try e.runPdl(if (e.g.bf16) e.fns.norm_shift else e.fns.norm, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ e.h, if (residual) e.r else @as(u64, 0), w, e.x, e.g.eps, @as(c_int, @intCast(e.g.hidden)), e.tables.ptr + params_at, e.xs });
     }
 
-    /// Refuse the whole frame before settling any prior window or launching work.
-    pub fn admit(e: *const Engine, parts: []const Part, ids: []const u32, keep: Keep) !void {
-        const g = e.g;
-        if (!geometry.supported(g, ids.len, !keep.verifies(), most_verify)) return error.UnsupportedQwenGeometry;
-        var total: usize = 0;
-        if (parts.len == 0 or parts.len > max_segs) return error.InvalidQwenSegments;
-        for (parts, 0..) |p, index| {
-            for (parts[0..index]) |prior| if (prior.cache == p.cache) return error.InvalidQwenSegments;
-            if (p.rows == 0 or p.cache.len > p.cache.cap or p.rows > p.cache.cap - p.cache.len) return error.QwenContextFull;
-            if (p.rows > max_rows - total) return error.InvalidQwenSegments;
-            total += p.rows;
-        }
-        if (parts.len == 0 or parts.len > max_segs or total != ids.len or total > max_rows) return error.InvalidQwenSegments;
-        if (e.learning != null and total != 1) return error.BadLearningRows;
-        if (keep == .hidden and e.learning == null) return error.BadLearningRows;
-        const record = keep.verifies();
-        if (record and total > e.verify_rows) return error.InvalidQwenSegments;
-        if (!record and parts.len != 1) return error.InvalidQwenSegments;
-        if (keep == .draws and keep.draws.len != total) return error.InvalidQwenSegments;
-        for (ids) |id| if (id >= g.vocab) return error.InvalidQwenToken;
-        for (parts) |p| if (p.parents != null and !record) return error.InvalidQwenParents;
-        for (parts) |p| if (p.images != null and record) return error.InvalidQwenImages;
-    }
+    /// Refuse the whole frame before settling any prior window or launching work (cuda_round.zig).
+    pub const admit = Round.admit;
 
     /// A window's staged segment: one-row windows that skip their rollback copy read no `before`.
     pub fn stagedSeg(c: *Cache, e: *const Engine, t: ?[4]u64, len: usize, row0: usize, rows: usize, undo: bool) !Seg {
@@ -492,8 +471,7 @@ pub const Engine = struct {
             if (!(record and keep != .hidden)) try p.cache.flush(e);
             try recurrent.prepare(e, p.cache, p.rows, record, p.undo);
         }
-        // a pool lane among the parts: every segment's scans read state tables; else each stream's blocks, as on main
-        const table = Round.onTable(parts);
+        const table = Round.onTable(parts); // a pool lane among the parts: every scan reads state tables, else main's
         var row0: usize = 0;
         for (parts, 0..) |p, i| {
             segs[i] = try stagedSeg(p.cache, e, if (table) try Round.forwardStates(e, i, p.cache) else null, p.cache.len, row0, p.rows, p.undo);
@@ -592,9 +570,7 @@ pub const Engine = struct {
     /// One shape's launches: uncaptured for a prompt chunk or the exact path, else its captured graph replayed.
     pub const launchShape = @import("cuda_shapes.zig").launch;
     /// A state table's entries (cuda_cache.zig States): `tables` holds one for each forward segment.
-    pub fn stateEntries(e: *const Engine) usize {
-        return @import("cuda_cache.zig").States.len(e.g);
-    }
+    pub const stateEntries = Round.stateEntries;
     /// The same scan selected by body, exposed for host launch-contract fixtures.
     pub const deltaScan = @import("cuda_forward.zig").deltaScan;
     /// The launches of a forward of `shape`, from the embedding to the kept rows' logits (captured once a shape).
