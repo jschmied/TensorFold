@@ -29,6 +29,15 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const run = b.step("tf-qwen3-asr-metal", "Build tf-qwen3-asr-metal, Qwen3-ASR's Metal tower and language model on a clip");
     run.dependOn(&b.addInstallArtifact(exe, .{}).step);
     if (no_compiler) |fail| run.dependOn(fail);
+    // teacher-forced on a case's greedy ids under #2239's tie rule, as tf-qwen3-asr-forced on CUDA
+    const forced = b.createModule(.{ .root_source_file = b.path("zig/tests/qwen3_asr_metal_forced.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "qwen3_asr", .module = family }, .{ .name = "qwen3_asr_metallib", .module = bytes } } });
+    const forced_exe = b.addExecutable(.{ .name = "tf-qwen3-asr-metal-forced", .root_module = forced });
+    const forced_step = b.step("tf-qwen3-asr-metal-forced", "Build tf-qwen3-asr-metal-forced, a clip teacher-forced on a case under the tie rule");
+    forced_step.dependOn(&b.addInstallArtifact(forced_exe, .{}).step);
+    if (no_compiler) |fail| forced_step.dependOn(fail);
     const check = b.addObject(.{ .name = "qwen3-asr-metal-host", .root_module = main });
-    b.step("compile-qwen3-asr-metal-host", "Compile Qwen3-ASR's Metal binding and driver without running shaders").dependOn(&check.step);
+    const check_forced = b.addObject(.{ .name = "qwen3-asr-metal-forced-host", .root_module = forced });
+    const compile = b.step("compile-qwen3-asr-metal-host", "Compile Qwen3-ASR's Metal binding and drivers without running shaders");
+    compile.dependOn(&check.step);
+    compile.dependOn(&check_forced.step);
 }
