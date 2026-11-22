@@ -174,6 +174,8 @@ pub const moss_image = @embedFile("prefill/attention_nax.metal") ++ @embedFile("
 /// Unlimited-OCR-2: its image encoder's and decoder's own steps (projections: core_qwen_vision).
 pub const uocr = @embedFile("uocr/vision.metal");
 pub const uocr_decoder = @embedFile("uocr/decoder.metal");
+/// Qwen3-ASR's own steps (the binding embeds them as a metallib; the contract compiles this text).
+pub const qwen3_asr = @embedFile("qwen3_asr/qwen3_asr.metal");
 /// MOSS-Image's image decoder: its own float32 steps, without a template.
 pub const moss_image_decoder = @embedFile("moss_image_decoder.metal");
 /// Idol's decoders' own steps and attention (families/idol/decoder_kernels.zig); projections, norms: the denoiser's.

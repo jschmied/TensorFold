@@ -576,6 +576,8 @@ pub fn main(init: std.process.Init) !u8 {
     defer glm_prompt.destroy();
     const idol_dino = try @import("metal_idol_dino.zig").Suite.create(a, device, queue, &kernels, o.only);
     defer idol_dino.destroy();
+    const qwen3_asr = try @import("metal_qwen3_asr.zig").Suite.create(a, device, queue, &kernels, o.only);
+    defer qwen3_asr.destroy();
     var t: g.Tally = .{};
     const t0 = std.Io.Clock.awake.now(init.io);
     if (o.gates) {

@@ -249,6 +249,11 @@ fn resolve(a: std.mem.Allocator, device: mtl.Device, d: limits.MetalLaunch, comp
         const t = try @import("metal_uocr.zig").limitsText(a, device, d.name);
         return .{ .decl = d, .function = fun, .here = t.here, .pre_m5 = t.pre_m5 };
     }
+    if (std.mem.startsWith(u8, d.name, "qwen3-asr ")) {
+        if (!assemble) return undefined;
+        const t = @import("metal_qwen3_asr.zig").limitsText(d.name) orelse return error.UnknownLaunch;
+        return .{ .decl = d, .function = fun, .here = t, .pre_m5 = t };
+    }
     if (std.mem.startsWith(u8, d.name, "ricursive ")) {
         if (!assemble) return undefined;
         const t = try @import("metal_ricursive_all.zig").limitsText(a, device, d.name);
