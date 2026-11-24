@@ -65,7 +65,8 @@ test "nvfp4 store: a stored row's error stays within half a step of its group's 
     for (&x) |*v| v.* = @floatCast(prng.random().floatNorm(f64) * 3);
     x[5] = 0;
     x[17] = -40; // one loud value: its group's scale grows, the others' do not
-    for ([_]Format{ .{}, .{ .global = 0.01 } }) |f| {
+    // the global scale puts the row's amax at e4m3's top (40 / 6 / global = 448)
+    for ([_]Format{ .{}, .{ .global = 40.0 / (6.0 * 448.0) } }) |f| {
         var codes: [64]u8 = undefined;
         var scales: [8]u8 = undefined;
         var back: [128]f64 = undefined;
@@ -82,4 +83,16 @@ test "nvfp4 store: a stored row's error stays within half a step of its group's 
         try std.testing.expectEqual(@as(f64, 0), back[5]);
         try std.testing.expect(@abs(back[17] + 40) <= 40.0 / 6.0);
     }
+}
+
+test "nvfp4 store: a global scale too small for a group saturates its e4m3 scale (planted: the bound breaks)" {
+    var x: [16]f32 = @splat(1);
+    x[0] = 40;
+    var codes: [8]u8 = undefined;
+    var scales: [1]u8 = undefined;
+    var back: [16]f64 = undefined;
+    const f: Format = .{ .global = 0.01 }; // 40 / 6 / 0.01 = 667 > 448: the scale clips
+    quantize(f, &x, &codes, &scales);
+    dequantize(f, &codes, &scales, &back);
+    try std.testing.expect(@abs(back[0] - 40) > 448 * 0.01); // far past half a step of the clipped scale
 }
