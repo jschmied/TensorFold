@@ -179,10 +179,6 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         problem.* = why;
         return null;
     }
-    if (nemotron.kv_pages.on() and try tf.kv_prompts.sharing() > 0) if (tf.kv_prompts.learnRefusal(o.learn != null, o.learn_conversations)) |why| {
-        problem.* = why; // TF_KV_SHARE's store keeps no learned states: refused before any load, store or imprint
-        return null;
-    };
     const native = modelContext(a, io, o.dir);
     const window: i64 = o.context orelse native;
     if (window < 0 or (native > 0 and window > native)) {
