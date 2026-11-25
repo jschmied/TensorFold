@@ -61,6 +61,7 @@ const Scratch = struct {
     pos: u64,
     seg_of: u64,
     segs: u64,
+    conv_segs: u64,
     tiles: u64,
     blocks: [ops.max_blocks]u64 = @splat(0),
     partial_a: u64,
@@ -99,16 +100,16 @@ const Scratch = struct {
     logits: u64,
 };
 
-/// A stream's state (every visit's K/V rows and conv states, its rewind sites, its window's backup and history).
-const Slot = struct { cache: cuda.DeviceBuffer, sites: cuda.DeviceBuffer, backup: cuda.DeviceBuffer, hist: cuda.DeviceBuffer };
+/// A stream's rewind sites, its window's backup and history; its cache (K/V rows, conv states) is in Model.caches.
+pub const Slot = struct { sites: cuda.DeviceBuffer, backup: cuda.DeviceBuffer, hist: cuda.DeviceBuffer };
 pub const max_slots = 16;
 
-/// A slot's allocation sizes: its cache layout, four rewind sites a visit, its window's backup and history.
+/// A slot's allocation sizes: its stride in Model.caches, four rewind sites a visit, its backup and history.
 pub fn slotAllocs(layout: *const loop.CacheLayout, w: *const weights_.Weights) [4]usize {
     const c = w.c.text;
     const kv: usize = @as(usize, c.local.kv) * c.local.dim;
     const visits: usize = w.p.n_visits;
-    const cache: usize = @intCast(layout.bytes);
+    const cache: usize = std.mem.alignForward(usize, @intCast(layout.bytes), 256);
     const backup: usize = @intCast(layout.bytes - layout.at(0).conv_offset);
     return .{ cache, visits * 4 * @sizeOf(ops.RewindSite), backup, visits * (2 * kv + 2 * c.hidden) * window_rows * 4 };
 }
@@ -119,6 +120,7 @@ pub const Model = struct {
     w: *const weights_.Weights,
     context: usize,
     layout: loop.CacheLayout,
+    caches: cuda.DeviceBuffer = undefined, // every slot's cache, slot i at i * slotAllocs()[0]: a slot is an offset
     slots: [max_slots]Slot = undefined,
     n_slots: usize = 0,
     slot: usize = 0, // the slot snapshots and rewinds use; forwards share the scratch
@@ -126,45 +128,80 @@ pub const Model = struct {
     s: Scratch = undefined,
     buffers: std.ArrayList(cuda.DeviceBuffer) = .empty,
 
-    pub fn slotBase(m: *const Model) u64 {
-        return m.slots[m.slot].cache.ptr;
+    /// Bytes between two slots' caches in `caches`.
+    pub fn stride(m: *const Model) usize {
+        return slotAllocs(&m.layout, m.w)[0];
     }
 
-    /// Allocates slots until `n` exist, each with zeroed conv states and its own rewind sites.
+    pub fn slotBase(m: *const Model) u64 {
+        return m.caches.ptr + m.slot * m.stride();
+    }
+
+    /// Grows to `n` slots as one transaction: caches, moved slots' site tables and new slots staged, fenced, then live.
     pub fn addSlots(m: *Model, s: cuda.Stream, n: usize) !void {
         if (n > max_slots) return error.TooManySlots;
-        const keep = m.slot;
-        defer m.slot = keep;
-        const kv: usize = @as(usize, m.w.c.text.local.kv) * m.w.c.text.local.dim;
-        var sites: [config.max_visits * 4]ops.RewindSite = undefined;
-        while (m.n_slots < n) {
-            var slot = try m.newSlot();
-            errdefer for ([4]*cuda.DeviceBuffer{ &slot.hist, &slot.backup, &slot.sites, &slot.cache }) |b| b.free();
-            m.slots[m.n_slots] = slot;
-            m.slot = m.n_slots;
-            for (0..m.w.p.n_visits) |v| for (0..4) |site| {
-                const c = if (site < 2) kv else m.w.c.text.hidden;
-                const hist = m.histOf(@intCast(v), site) - m.slots[m.slot].hist.ptr;
-                sites[v * 4 + site] = .{ .state = m.convOf(@intCast(v), site), .hist = @intCast(hist), .backup = @intCast(m.backupOf(@intCast(v), site)), .c = @intCast(c) };
-            };
-            try m.upload(s, slot.sites.ptr, std.mem.sliceAsBytes(sites[0 .. m.w.p.n_visits * 4]));
-            try m.reset(s);
-            try s.synchronize();
-            m.n_slots += 1;
+        if (n <= m.n_slots) return;
+        const old = m.n_slots;
+        const st = m.stride();
+        var fresh: [max_slots]Slot = undefined;
+        var made: usize = 0;
+        errdefer for (fresh[0..made]) |*x| freeSlot(x);
+        while (old + made < n) : (made += 1) fresh[made] = try m.newSlot();
+        var moved: [max_slots]cuda.DeviceBuffer = undefined; // the old slots' site tables, at their new addresses
+        var remade: usize = 0;
+        errdefer for (moved[0..remade]) |*b| b.free();
+        while (remade < old) : (remade += 1) moved[remade] = try cuda.DeviceBuffer.alloc(m.d, slotAllocs(&m.layout, m.w)[1]);
+        var caches = try cuda.DeviceBuffer.alloc(m.d, n * st);
+        errdefer caches.free();
+        errdefer cuda.completion.drain(m.d, s, "inkling2: a failed slot grow did not drain"); // before any staged free
+        if (old > 0) try m.copy(s, caches.ptr, m.caches.ptr, old * st);
+        const conv0 = m.layout.at(0).conv_offset;
+        for (0..n) |i| {
+            const base = caches.ptr + i * st;
+            if (i < old) {
+                try m.uploadSites(s, base, moved[i].ptr);
+            } else {
+                try m.uploadSites(s, base, fresh[i - old].sites.ptr);
+                try m.zeros(s, base + conv0, m.layout.bytes - conv0);
+            }
         }
+        try s.synchronize();
+        if (old > 0) m.caches.free(); // commit: nothing below can fail
+        m.caches = caches;
+        for (m.slots[0..old], moved[0..old]) |*slot, b| {
+            slot.sites.free();
+            slot.sites = b;
+        }
+        @memcpy(m.slots[old..n], fresh[0..made]);
+        m.n_slots = n;
     }
 
-    /// A slot's four allocations, sized by slotAllocs: its cache, rewind-site table, window backup and history.
+    /// A slot's rewind sites (its cache at `base`) into the table at `dst`.
+    fn uploadSites(m: *const Model, s: cuda.Stream, base: u64, dst: u64) !void {
+        const kv: usize = @as(usize, m.w.c.text.local.kv) * m.w.c.text.local.dim;
+        const conv0 = m.layout.at(0).conv_offset;
+        var sites: [config.max_visits * 4]ops.RewindSite = undefined;
+        for (0..m.w.p.n_visits) |v| for (0..4) |site| {
+            const c = if (site < 2) kv else m.w.c.text.hidden;
+            const state = m.convAt(base, @intCast(v), site);
+            sites[v * 4 + site] = .{ .state = state, .hist = @intCast(histOffset(m, @intCast(v), site)), .backup = @intCast(state - (base + conv0)), .c = @intCast(c) };
+        };
+        try m.upload(s, dst, std.mem.sliceAsBytes(sites[0 .. m.w.p.n_visits * 4]));
+    }
+
+    /// A slot's own allocations, sized by slotAllocs: its rewind-site table, window backup and history.
     pub fn newSlot(m: *const Model) !Slot {
         const sizes = slotAllocs(&m.layout, m.w);
-        var cache = try cuda.DeviceBuffer.alloc(m.d, sizes[0]);
-        errdefer cache.free();
         var sites = try cuda.DeviceBuffer.alloc(m.d, sizes[1]);
         errdefer sites.free();
         var backup = try cuda.DeviceBuffer.alloc(m.d, sizes[2]);
         errdefer backup.free();
         const hist = try cuda.DeviceBuffer.alloc(m.d, sizes[3]);
-        return .{ .cache = cache, .sites = sites, .backup = backup, .hist = hist };
+        return .{ .sites = sites, .backup = backup, .hist = hist };
+    }
+
+    pub fn freeSlot(slot: *Slot) void {
+        for ([3]*cuda.DeviceBuffer{ &slot.hist, &slot.backup, &slot.sites }) |b| b.free();
     }
 
     fn alloc(m: *Model, bytes: usize) !u64 {
@@ -200,31 +237,33 @@ pub const Model = struct {
     }
 
     pub fn convOf(m: *const Model, visit: u32, site: usize) u64 {
+        return m.convAt(m.slotBase(), visit, site);
+    }
+
+    /// A conv site's state in the slot cache at `base`.
+    fn convAt(m: *const Model, base: u64, visit: u32, site: usize) u64 {
         const c = m.w.c.text;
         const kv: usize = @as(usize, c.local.kv) * c.local.dim;
         const h: usize = c.hidden;
         const widths = [4]usize{ kv, kv, h, h };
-        var at = m.slotBase() + m.layout.at(visit).conv_offset;
+        var at = base + m.layout.at(visit).conv_offset;
         for (0..site) |i| at += 3 * widths[i] * 4;
         return at;
     }
 
-    fn histBytes(m: *const Model) usize {
-        return slotAllocs(&m.layout, m.w)[3];
+    pub fn histOf(m: *const Model, visit: u32, site: usize) u64 {
+        return m.slots[m.slot].hist.ptr + histOffset(m, visit, site);
     }
 
-    pub fn histOf(m: *const Model, visit: u32, site: usize) u64 {
+    /// A conv site's rows in a slot's history, bytes from its start.
+    fn histOffset(m: *const Model, visit: u32, site: usize) usize {
         const c = m.w.c.text;
         const kv: usize = @as(usize, c.local.kv) * c.local.dim;
         const h: usize = c.hidden;
         const widths = [4]usize{ kv, kv, h, h };
-        var at = m.slots[m.slot].hist.ptr + visit * window_rows * (2 * kv + 2 * h) * 4;
+        var at: usize = visit * window_rows * (2 * kv + 2 * h) * 4;
         for (0..site) |i| at += window_rows * widths[i] * 4;
         return at;
-    }
-
-    fn backupOf(m: *const Model, visit: u32, site: usize) usize {
-        return m.convOf(visit, site) - (m.slotBase() + m.layout.at(0).conv_offset);
     }
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, s: cuda.Stream, w: *const weights_.Weights, context: usize) !Model {
@@ -253,6 +292,7 @@ pub const Model = struct {
             .pos = try m.alloc(rows * 4),
             .seg_of = try m.alloc(rows * 4),
             .segs = try m.alloc(max_slots * @sizeOf(attention.Seg)),
+            .conv_segs = try m.alloc(max_slots * 16),
             .tiles = try m.alloc(max_slots * 2 * 128 * @sizeOf(attention.Tile)),
             .partial_a = try m.alloc(rows * h * 2),
             .partial_b = try m.alloc(rows * h * 2),
@@ -301,7 +341,8 @@ pub const Model = struct {
 
     pub fn deinit(m: *Model) void {
         m.deinitBuffers();
-        for (m.slots[0..m.n_slots]) |*slot| for ([4]*cuda.DeviceBuffer{ &slot.hist, &slot.backup, &slot.sites, &slot.cache }) |b| b.free();
+        for (m.slots[0..m.n_slots]) |*slot| freeSlot(slot);
+        if (m.n_slots > 0) m.caches.free();
         m.* = undefined;
     }
 

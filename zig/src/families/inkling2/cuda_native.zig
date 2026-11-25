@@ -212,7 +212,9 @@ test "stream_bytes is what an extra stream's slot and lane buffers allocate on M
     cuda.memory.setHook(.{ .ctx = &rec, .alloc = Record.alloc, .free = Record.free });
     defer cuda.memory.setHook(before);
     var slot = try m.newSlot();
-    defer for ([4]*cuda.DeviceBuffer{ &slot.cache, &slot.sites, &slot.backup, &slot.hist }) |x| x.free();
+    defer engine.Model.freeSlot(&slot);
+    var cache = try cuda.DeviceBuffer.alloc(m.d, m.stride()); // the stream's share of Model.caches
+    defer cache.free();
     try b.slotBuffers(2); // the second stream's lane buffers; the first already holds its own
     defer for (&b.slot[1]) |*x| x.free();
     try std.testing.expectEqual(@as(u64, rec.bytes), backend.streamBytes(&m));
@@ -220,7 +222,7 @@ test "stream_bytes is what an extra stream's slot and lane buffers allocate on M
     const kv: u64 = @as(u64, w.c.text.local.kv) * w.c.text.local.dim;
     const backup: u64 = m.layout.bytes - m.layout.at(0).conv_offset;
     const hist: u64 = 48 * (2 * kv + 2 * w.c.text.hidden) * engine.window_rows * 4;
-    const past = backend.streamBytes(&m) - m.layout.bytes;
+    const past = backend.streamBytes(&m) - m.stride();
     try std.testing.expectEqual(48 * 4 * 32 + backup + hist + 200_058 * 4 + 32, past);
 }
 
@@ -232,4 +234,57 @@ test "the forward refuses a token id at the vocabulary before any launch" {
     var m: engine.Model = .{ .gpa = std.testing.allocator, .d = undefined, .w = &w, .context = 64, .layout = undefined };
     const bad = [_]u32{ 1, w.c.text.vocab };
     try std.testing.expectError(error.InvalidToken, m.forward(undefined, undefined, &bad, 0, 0, 1, false));
+}
+
+test "addSlots: an allocation that fails at any step leaves the live slots, their arena and site tables as they were" {
+    const Count = struct { // a DeviceBuffer hook: addresses only, live buffers counted
+        live: i64 = 0,
+        next: u64 = 1 << 32,
+        fn alloc(ctx: *anyopaque, len: usize) ?u64 {
+            const r: *@This() = @ptrCast(@alignCast(ctx));
+            r.live += 1;
+            r.next += std.mem.alignForward(u64, len, 512);
+            return r.next;
+        }
+        fn free(ctx: *anyopaque, _: u64) bool {
+            const r: *@This() = @ptrCast(@alignCast(ctx));
+            r.live -= 1;
+            return true;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var why: config.Why = .{};
+    var w: @import("loop_weights.zig").Weights = undefined;
+    w.c = try config.parse(arena.allocator(), @import("config_test.zig").mini, &why);
+    var precisions: [24]plan_.Precision = @splat(.nvfp4);
+    w.p = try plan_.build(&w.c.text, &precisions);
+    var m: engine.Model = undefined;
+    m.d = @ptrFromInt(0x1000); // never called: every step before the first copy is an allocation
+    m.w = &w;
+    m.layout = try loop.CacheLayout.init(&w.c.text, &w.p, 8192);
+    var rec: Count = .{};
+    const before = cuda.memory.currentHook();
+    cuda.memory.setHook(.{ .ctx = &rec, .alloc = Count.alloc, .free = Count.free });
+    defer cuda.memory.setHook(before);
+    m.caches = try cuda.DeviceBuffer.alloc(m.d, m.stride()); // a live slot 0, as Model.init leaves it
+    m.slots[0] = try m.newSlot();
+    m.n_slots = 1;
+    defer engine.Model.freeSlot(&m.slots[0]);
+    defer m.caches.free();
+    const live = rec.live;
+    const sizes = engine.slotAllocs(&m.layout, m.w);
+    const steps = [_]usize{ sizes[1], sizes[2], sizes[3], sizes[1], 2 * m.stride() }; // new slot, moved table, caches
+    var budget: usize = 0;
+    for (steps) |bytes| { // the step whose allocation does not fit fails; nothing staged before it survives
+        const used = cuda.memory.usage(false);
+        const previous = try cuda.memory.setAllocationLimit(used.device + used.host + budget);
+        defer _ = cuda.memory.setAllocationLimit(previous) catch unreachable;
+        const keep = .{ m.caches.ptr, m.slots[0].sites.ptr };
+        try std.testing.expectError(error.OutOfDeviceMemory, m.addSlots(undefined, 2));
+        try std.testing.expectEqual(@as(usize, 1), m.n_slots);
+        try std.testing.expectEqual(keep, .{ m.caches.ptr, m.slots[0].sites.ptr });
+        try std.testing.expectEqual(live, rec.live);
+        budget += bytes;
+    }
 }
