@@ -42,7 +42,7 @@ pub fn scoresSpec(v: Variant) c.Spec {
         .out = .f32,
         .tiles = if (v == .gqa) .{ .{}, .{ .size = 64 }, .{} } else .{ .{}, .{ .size = 64 }, .{ .size = 32 } },
         .served = if (v == .gqa) gqa else flat,
-        .sums = .{ .why = "integer query halves mirrored over keys of ones: one head's dot is 8 after partials near 1M" },
+        .sums = .{ .why = "integer query halves mirrored over keys of ones: one head's dot is 8 after partials near 500K" },
     };
 }
 
@@ -130,15 +130,17 @@ pub const Scores = struct {
                 if (self.weighted() and shape.rows > 1 and H > 1) self.w[(shape.rows - 1) * H + 1] = std.math.nan(f32);
             },
             .stress => {
-                // head 0's query: mirrored integers (8 nudged by one) over keys of ones; other heads 0; weights 1
+                // head 0 over ones: odd v below 32, odd 64 v to 63, then -v (8 nudged): 14-bit partials in any order
                 @memset(self.q, 0);
                 @memset(self.k, c.toBf16(1));
                 @memset(self.w, 1);
-                const col = try a.alloc(f32, D);
-                defer a.free(col);
                 for (0..shape.rows) |r| {
-                    attn.mirrored(rng, col);
-                    for (self.q[r * H * D ..][0..D], col) |*e, y| e.* = c.toBf16(y);
+                    const row = self.q[r * H * D ..][0..D];
+                    for (0..D / 2) |d| {
+                        const v: f32 = @floatFromInt((1 + 2 * rng.uintLessThan(u32, 128)) * @as(u32, if (d >= 32) 64 else 1));
+                        row[d] = c.toBf16(v);
+                        row[D / 2 + d] = c.toBf16((if (d < 8) @as(f32, 1) else 0) - v);
+                    }
                 }
             },
         }
