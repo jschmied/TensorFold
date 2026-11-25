@@ -469,6 +469,7 @@ test {
     _ = @import("nvfp4_tile_pending.zig");
     _ = paging;
     _ = @import("minimax_records.zig");
+    _ = @import("topk_rows_records.zig");
     _ = @import("nemotron_ssd_records.zig");
 }
 const paging = @import("paging_pending.zig");
