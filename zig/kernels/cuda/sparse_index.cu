@@ -6,8 +6,7 @@ namespace tf_iscore {
 
 constexpr int D = 128, KEYS = 64;  // key width; keys a block (a thread each)
 
-// Query row r's heads q [H, D] and weights; each thread one key: per head an fma chain over d ascending, phi, the
-// weight's product, then heads in order (sum: acc + t; max: the larger, NaN kept). Keys at or past the row's count: -inf.
+// A thread a key of row r: per head an fma chain over d, phi, times w; heads in order (sum, or max keeping NaN).
 __device__ __forceinline__ void scores(const __nv_bfloat16* q, const __nv_bfloat16* k, int64_t ks, const float* w,
                                        const int* counts, float* out, int64_t ld, int n, int H, int hk, float scale,
                                        int relu, int max) {
@@ -22,7 +21,7 @@ __device__ __forceinline__ void scores(const __nv_bfloat16* q, const __nv_bfloat
   const int64_t key = (int64_t)blockIdx.x * KEYS + threadIdx.x;
   if (key >= n) return;
   const int64_t limit = counts ? counts[r] : n;
-  if (key >= limit) {
+  if (key >= limit) {  // past the row's count
     out[r * ld + key] = -INFINITY;
     return;
   }
@@ -51,8 +50,7 @@ __device__ __forceinline__ void scores(const __nv_bfloat16* q, const __nv_bfloat
   out[r * ld + key] = __fmul_rn(acc, scale);
 }
 
-// Block b's summary of keys [b B, min(b B + B, n)) (the last block open), a thread a dim: mean (fp32 sum in key order,
-// then / count), max (NaN kept), first or last; with `unit`, each key first times 1 / sqrt(its mean square), 0 when 0.
+// Block b's keys [b B, min(b B + B, n)), a thread a dim: mean (fp32 in key order), max (NaN kept), first or last.
 __device__ __forceinline__ void blocks(const __nv_bfloat16* k, int64_t ks, __nv_bfloat16* out, int64_t os, int64_t n,
                                        int B, int mode, int unit) {
   __shared__ float part[D / 32];
@@ -61,7 +59,7 @@ __device__ __forceinline__ void blocks(const __nv_bfloat16* k, int64_t ks, __nv_
   float acc = 0.0f;
   for (int64_t i = lo; i < hi; ++i) {
     float x = __bfloat162float(k[i * ks + d]);
-    if (unit) {
+    if (unit) {  // the key times 1 / sqrt(its mean square), 0 when that is 0
       float sq = __fmul_rn(x, x);
       for (int o = 16; o > 0; o >>= 1) sq = __fadd_rn(sq, __shfl_xor_sync(0xffffffffu, sq, o));
       __syncthreads();

@@ -51,8 +51,7 @@ pub const SparseIndex = struct {
         x.mod.unload();
     }
 
-    /// q bf16 [rows, h, 128], 16-byte aligned; k bf16 key rows; w f32 [rows, h] or 0 (each 1); counts i32 [rows]
-    /// or 0 (all n); out f32 [rows, ld]: keys at or past a row's count get -inf.
+    /// q bf16 [rows, h, 128]; w f32 [rows, h] or 0; counts i32 [rows] or 0; out f32 [rows, ld], -inf past a count.
     pub fn runScores(x: *const SparseIndex, s: Stream, q: u64, k: u64, w: u64, counts: u64, out: u64, sh: Scores) !void {
         try checkScores(sh);
         if (sh.rows == 0 or sh.n == 0) return;
