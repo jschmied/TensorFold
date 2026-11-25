@@ -332,6 +332,7 @@ pub const Blocks = struct {
                     const m = @min(shape.n, self.keys - lo);
                     for (0..D) |d| {
                         attn.mirrored(rng, col[0..m]);
+                        std.mem.reverse(f32, col[m / 2 .. m]); // a full block: i and i + 32 must not cancel (strided)
                         for (col[0..m], lo..) |y, i| self.k[i * ks + d] = c.toBf16(y);
                     }
                 }
