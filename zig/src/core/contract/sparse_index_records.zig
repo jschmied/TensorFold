@@ -18,6 +18,7 @@ fn with(regs: [5]u32, static: u32, bound: u32) [5]U {
 pub const cuda = [_]R{
     .{ .launch = .{ .name = scores_name, .symbol = "tf_index_scores", .image = "sparse_index", .threads = 64, .dynamic = 64 * 128 * 2 + 64 * 4 }, .usage = with(.{ 40, 64, 48, 46, 46 }, 0, 64) },
     .{ .launch = .{ .name = "sparse index tf_index_blocks", .symbol = "tf_index_blocks", .image = "sparse_index", .threads = 128 }, .usage = with(.{ 30, 34, 34, 26, 26 }, 16, 128) },
+    .{ .launch = .{ .name = "sparse index tf_index_open_blocks", .symbol = "tf_index_open_blocks", .image = "sparse_index", .threads = 128 }, .usage = with(.{ 24, 37, 37, 35, 35 }, 16, 128) },
     .{ .launch = .{ .name = narrow_name, .symbol = "tf_topk_rows", .image = "topk_rows", .threads = 128 }, .usage = with(.{ 56, 54, 54, 40, 40 }, 1064, 128) },
     .{ .launch = .{ .name = wide_name, .symbol = "tf_topk_rows_wide", .image = "topk_rows", .threads = 1024 }, .usage = with(.{ 32, 57, 57, 60, 64 }, 1288, 1024) },
 };

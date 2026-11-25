@@ -59,6 +59,7 @@ pub const contract = @import("contract.zig");
 pub const nvfp4 = @import("nvfp4.zig");
 /// A sparse-attention indexer's selection in float64 (any model's policy) and NVFP4 row storage on the host.
 pub const sparse_index = @import("sparse_index.zig");
+pub const sparse_topology = @import("sparse_topology.zig");
 pub const nvfp4_store = @import("nvfp4_store.zig");
 pub const nvfp4_csf32 = @import("nvfp4_csf32.zig");
 pub const modelopt = @import("modelopt.zig");
@@ -85,6 +86,7 @@ pub const state_walk = @import("state_walk.zig");
 
 test {
     _ = sparse_index;
+    _ = sparse_topology;
     _ = nvfp4_store;
     _ = torch_pth;
     _ = wav;

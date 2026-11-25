@@ -35,7 +35,7 @@ pub fn blocks(p: Policy, t: usize) usize {
 }
 
 /// One query position's index heads [heads, dim] and optional per-head weights.
-pub const Query = struct { q: []const f64, heads: usize, weights: ?[]const f64 = null };
+pub const Query = struct { q: []const f64, heads: usize, weights: ?[]const f64 = null, layer: u32 = 0 };
 
 /// Index keys [n, dim], position i at row i.
 pub const Keys = struct { k: []const f64, dim: usize };
@@ -77,10 +77,12 @@ fn before(_: void, a: Scored, b: Scored) bool {
     return above(a.s, b.s) or (same(a.s, b.s) and a.pos < b.pos);
 }
 
-/// The positions a query attends and the candidates its first stage kept (for pool reuse), both ascending.
+/// The positions query t of layer `owner` attends and its first stage's kept candidates (for reuse), both ascending.
 pub const Selection = struct {
     keys: []u32,
     pool: []u32,
+    t: usize = 0,
+    owner: u32 = 0,
 
     pub fn deinit(s: Selection, gpa: std.mem.Allocator) void {
         gpa.free(s.keys);
@@ -150,13 +152,16 @@ fn rounded(gpa: std.mem.Allocator, f: nvfp4_store.Format, x: []const f64, width:
     return out;
 }
 
+/// Another layer's selection a follower rescores: its pool, which must be for the same t and from `owner`.
+pub const From = struct { sel: *const Selection, owner: u32 };
+
 /// The query at position t (keys 0..t) under `p`; `pool_from`: rescore that pool instead of searching.
-pub fn select(gpa: std.mem.Allocator, p: Policy, q: Query, keys: Keys, t: usize, pool_from: ?[]const u32) !Selection {
+pub fn select(gpa: std.mem.Allocator, p: Policy, q: Query, keys: Keys, t: usize, pool_from: ?From) !Selection {
     return run(gpa, p, q, keys, t, pool_from, true);
 }
 
 /// select without its shortcuts (dense, pool): every stage scored, the path the shortcuts must equal.
-pub fn selectStaged(gpa: std.mem.Allocator, p: Policy, q: Query, keys: Keys, t: usize, pool_from: ?[]const u32) !Selection {
+pub fn selectStaged(gpa: std.mem.Allocator, p: Policy, q: Query, keys: Keys, t: usize, pool_from: ?From) !Selection {
     return run(gpa, p, q, keys, t, pool_from, false);
 }
 
@@ -171,7 +176,9 @@ pub fn flips(a: []const u32, b: []const u32) usize {
     return n;
 }
 
-fn run(gpa: std.mem.Allocator, p: Policy, q_in: Query, keys_in: Keys, t: usize, pool_from: ?[]const u32, shortcuts: bool) !Selection {
+fn run(gpa: std.mem.Allocator, p: Policy, q_in: Query, keys_in: Keys, t: usize, pool_from: ?From, shortcuts: bool) !Selection {
+    // a foreign pool (another position's, or not the owner's this layer follows) is refused, not read
+    if (pool_from) |f| if (f.sel.t != t or f.sel.owner != f.owner) return error.ForeignPool;
     if (p.topk == 0 or p.block == 0 or p.key_heads == 0 or keys_in.k.len < (t + 1) * keys_in.dim) return error.BadPolicy;
     if (q_in.heads % p.key_heads != 0 or keys_in.dim % p.key_heads != 0) return error.BadPolicy;
     // dense: when every causal key fits the final budget, all are attended, without scoring
@@ -179,7 +186,7 @@ fn run(gpa: std.mem.Allocator, p: Policy, q_in: Query, keys_in: Keys, t: usize, 
         const all = try gpa.alloc(u32, t + 1);
         errdefer gpa.free(all);
         for (all, 0..) |*x, i| x.* = @intCast(i);
-        return .{ .keys = all, .pool = try gpa.dupe(u32, all) };
+        return .{ .keys = all, .pool = try gpa.dupe(u32, all), .t = t, .owner = q_in.layer };
     }
     // scores from NVFP4-stored keys or queries when the policy asks (the rounding's effect on the boundary)
     const kq = if (p.keys_nvfp4) |f| try rounded(gpa, f, keys_in.k[0 .. (t + 1) * keys_in.dim], keys_in.dim / p.key_heads) else null;
@@ -192,8 +199,8 @@ fn run(gpa: std.mem.Allocator, p: Policy, q_in: Query, keys_in: Keys, t: usize, 
     // the candidates: every causal key, the first stage's blocks, or the pool handed down
     var cands: std.ArrayList(u32) = .empty;
     defer cands.deinit(gpa);
-    if (pool_from) |pool| {
-        for (pool) |i| if (i <= t) try cands.append(gpa, i);
+    if (pool_from) |f| {
+        for (f.sel.pool) |i| if (i <= t) try cands.append(gpa, i);
     } else if (p.block == 1 or (shortcuts and fitsPool(p, t))) {
         // one stage, or every block would be kept: tokens scored directly
         for (0..t + 1) |i| try cands.append(gpa, @intCast(i));
@@ -244,7 +251,7 @@ fn run(gpa: std.mem.Allocator, p: Policy, q_in: Query, keys_in: Keys, t: usize, 
         out[j] = @intCast(i);
         j += 1;
     };
-    return .{ .keys = out, .pool = pool };
+    return .{ .keys = out, .pool = pool, .t = t, .owner = q_in.layer };
 }
 
 /// What a selection must be: ascending, no repeats, never past t, every mandatory key in, at most the budget.

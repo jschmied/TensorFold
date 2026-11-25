@@ -99,7 +99,7 @@ pub const Scores = struct {
     }
 
     fn sh(self: *const Scores) !gpu.Scores {
-        return gpu.scoresFor(self.policy(), D, self.shape.k, self.shape.rows, self.shape.n, self.ks(), self.ld());
+        return gpu.scoresFor(self.policy(), .{}, D, self.shape.k, self.shape.rows, self.shape.n, self.ks(), self.ld());
     }
 
     /// Score rows 37 wider than the keys: [n, ld) must come back -inf, not stale.
@@ -344,7 +344,7 @@ pub const Blocks = struct {
     }
 
     pub fn run(self: *Blocks) !void {
-        try self.x.runBlocks(self.rig.s, self.dev, self.out, try gpu.blocksFor(self.policy(), D, self.told(), ks, D));
+        try self.x.runBlocks(self.rig.s, self.dev, self.out, try gpu.blocksFor(self.policy(), .{}, D, self.told(), ks, D));
         try self.rig.s.synchronize();
     }
 
@@ -401,12 +401,148 @@ pub const Blocks = struct {
     }
 };
 
+/// Shape: query rows (rows), keys a block (n), key width (k, 128). Each row's open block from its own end (t + 1).
+pub fn openSpec(ahead: bool) c.Spec {
+    const served = &[_]c.Shape{ .{ .rows = 64, .n = 64, .k = D }, .{ .rows = 17, .n = 16, .k = D }, .{ .rows = 300, .n = 128, .k = D } };
+    return .{
+        .name = if (ahead) "control: sparse index open blocks told each row's end one key later" else "cuda sparse index tf_index_open_blocks (a prompt chunk's rows, mean)",
+        .accum = .f32,
+        .depth = blockDepth,
+        .ops = 1,
+        .out = .bf16,
+        .tiles = .{ .{}, .{ .size = 64 }, .{} },
+        .served = served,
+        .sums = .{ .f16 = 0, .bf16 = 0, .exact = false, .why = "the mean's sums are tf_index_blocks' (gate 4 there); here: each row's own range" },
+    };
+}
+
+/// Rows of a prompt chunk or a verify chain: each summarises only its own keys, never a later row's.
+pub const Open = struct {
+    rig: rig_.Rig,
+    x: *const gpu.SparseIndex,
+    ahead: bool = false, // the control: every end one past the row's own
+    shape: c.Shape = undefined,
+    keys: usize = 0,
+    k: []u16 = &.{},
+    ends: []i32 = &.{},
+    dev: [2]u64 = @splat(0),
+    out: u64 = 0,
+
+    const ks = D + 8;
+
+    pub fn deinit(self: *Open) void {
+        self.rig.gpu.gpa.free(self.k);
+        self.rig.gpu.gpa.free(self.ends);
+        self.rig.deinit();
+    }
+
+    pub fn kernel(self: *Open) g.Kernel {
+        return .{ .spec = openSpec(self.ahead), .ctx = self, .vt = &vt, .control = if (self.ahead) .shapes else null };
+    }
+
+    const vt = g.hooks(Open);
+
+    fn policy(self: *const Open) si.Policy {
+        return .{ .topk = 1, .block = self.shape.n };
+    }
+
+    /// Ends spread over the keys: the full length, a block's end (no open block), one key, and many in between.
+    pub fn prepare(self: *Open, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
+        if (shape.rows == 0 or shape.n == 0 or shape.k != D) return false;
+        self.rig.reset();
+        const a = self.rig.gpu.gpa;
+        self.shape = shape;
+        self.keys = 4 * shape.n + 3;
+        a.free(self.k);
+        a.free(self.ends);
+        self.k = &.{};
+        self.ends = &.{};
+        self.k = try a.alloc(u16, self.keys * ks);
+        self.ends = try a.alloc(i32, shape.rows);
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rng = prng.random();
+        for (self.k) |*e| e.* = attn.normal(rng);
+        if (fill == .nonfinite) {
+            self.k[(self.keys - 1) * ks + 3] = c.toBf16(std.math.nan(f32)); // only the full-length row sees it
+            self.k[(self.keys - 2) * ks + 5] = c.toBf16(std.math.inf(f32));
+        }
+        for (self.ends, 0..) |*e, r| e.* = @intCast(switch (r) {
+            0 => self.keys,
+            1 => shape.n,
+            2 => 1,
+            else => 1 + (r * 7919 + 13) % self.keys,
+        });
+        const told = try a.dupe(i32, self.ends);
+        defer a.free(told);
+        if (self.ahead) for (told) |*e| {
+            e.* = @min(e.* + 1, @as(i32, @intCast(self.keys)));
+        };
+        self.dev = .{ try self.rig.input(std.mem.sliceAsBytes(self.k)), try self.rig.input(std.mem.sliceAsBytes(told)) };
+        self.out = try self.rig.output(shape.rows * D * 2);
+        return true;
+    }
+
+    pub fn run(self: *Open) !void {
+        const b = try gpu.blocksFor(self.policy(), .{}, D, self.keys, ks, D);
+        try self.x.runOpenBlocks(self.rig.s, self.dev[0], self.dev[1], self.out, self.shape.rows, b);
+        try self.rig.s.synchronize();
+    }
+
+    pub fn count(self: *Open) usize {
+        return self.shape.rows * D;
+    }
+
+    /// sparse_index.summarise of block end / B at t = end - 1 (0 when end is a block's end).
+    fn each(self: *Open, acc: ?struct { a: c.Accum, o: g.Order }, want: []f64, mag: ?[]f64) !void {
+        const a = self.rig.gpu.gpa;
+        const kf = try a.alloc(f64, self.keys * D);
+        defer a.free(kf);
+        for (0..self.keys) |i| for (0..D) |d| {
+            kf[i * D + d] = c.fromBf16(self.k[i * ks + d]);
+        };
+        const kabs = try a.dupe(f64, kf);
+        defer a.free(kabs);
+        for (kabs) |*v| v.* = @abs(v.*);
+        const B = self.shape.n;
+        const t = try a.alloc(f64, B);
+        defer a.free(t);
+        for (self.ends, 0..) |e, r| {
+            const end: usize = @intCast(e);
+            const row = want[r * D ..][0..D];
+            if (end % B == 0) {
+                @memset(row, 0);
+                if (mag) |m| @memset(m[r * D ..][0..D], 0);
+                continue;
+            }
+            if (acc) |how| {
+                const lo = end - end % B;
+                for (0..D) |d| {
+                    for (t[0 .. end - lo], lo..) |*y, i| y.* = kf[i * D + d];
+                    row[d] = contract.rows.sumIn(how.a, how.o, t[0 .. end - lo]) / @as(f64, @floatFromInt(end - lo));
+                }
+                continue;
+            }
+            si.summarise(self.policy(), .{ .k = kf, .dim = D }, end / B, end - 1, row);
+            if (mag) |m| si.summarise(self.policy(), .{ .k = kabs, .dim = D }, end / B, end - 1, m[r * D ..][0..D]);
+        }
+    }
+
+    pub fn reference(self: *Open, want: []f64, mag: []f64) !void {
+        return self.each(null, want, mag);
+    }
+
+    pub fn simulate(self: *Open, acc: c.Accum, order: g.Order, out: []f64) !void {
+        return self.each(.{ .a = acc, .o = order }, out, null);
+    }
+};
+
 /// The kernels and their planted controls, on the heap: the gates hold pointers to them.
 pub const Set = struct {
     gpa: std.mem.Allocator,
     x: gpu.SparseIndex,
     scores: [3]Scores,
     blocks: [7]Blocks,
+    open: [2]Open,
 
     pub fn init(dev: tc.Gpu, s: cuda.Stream, a: std.mem.Allocator, list: *std.ArrayList(g.Kernel)) !*Set {
         const set = try dev.gpa.create(Set);
@@ -419,12 +555,15 @@ pub const Set = struct {
         for (&set.blocks, kinds) |*t, kd| t.* = .{ .rig = .{ .gpu = dev, .s = s }, .x = &set.x, .summary = kd[0], .unit = kd[1], .short = kd[2], .open = kd[3] };
         for (&set.scores) |*t| try list.append(a, t.kernel());
         for (&set.blocks) |*t| try list.append(a, t.kernel());
+        for (&set.open, [_]bool{ false, true }) |*t, ahead| t.* = .{ .rig = .{ .gpu = dev, .s = s }, .x = &set.x, .ahead = ahead };
+        for (&set.open) |*t| try list.append(a, t.kernel());
         return set;
     }
 
     pub fn deinit(set: *Set) void {
         for (&set.scores) |*t| t.deinit();
         for (&set.blocks) |*t| t.deinit();
+        for (&set.open) |*t| t.deinit();
         set.x.unload();
         set.gpa.destroy(set);
     }

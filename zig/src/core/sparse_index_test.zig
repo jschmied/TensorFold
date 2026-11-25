@@ -93,7 +93,7 @@ test "sparse index: blocks with every block kept, or one key a block, are the fl
         defer b.deinit(gpa);
         try testing.expectEqualSlices(u32, a.keys, b.keys);
         // the flat search rescoring a pool of every key agrees too
-        const c = try si.select(gpa, flat, .{ .q = r.q, .heads = heads }, .{ .k = r.keys, .dim = dim }, t, b.pool);
+        const c = try si.select(gpa, flat, .{ .q = r.q, .heads = heads }, .{ .k = r.keys, .dim = dim }, t, .{ .sel = &b, .owner = 0 });
         defer c.deinit(gpa);
         try testing.expectEqualSlices(u32, a.keys, c.keys);
     }
@@ -140,15 +140,31 @@ test "sparse index: reuse: final selection is the owner's positions; a pool resc
     // final reuse takes the owner's keys as they are; pool reuse rescores the owner's candidates with its own query
     const other = try randoms(99, heads * dim);
     defer gpa.free(other);
-    const follower = try si.select(gpa, two, .{ .q = other, .heads = heads }, .{ .k = r.keys, .dim = dim }, t, owner.pool);
+    const follower = try si.select(gpa, two, .{ .q = other, .heads = heads }, .{ .k = r.keys, .dim = dim }, t, .{ .sel = &owner, .owner = 0 });
     defer follower.deinit(gpa);
     try si.check(two, t, follower.keys);
     for (follower.keys) |k| try testing.expect(std.mem.indexOfScalar(u32, owner.pool, k) != null or k < two.sink or k + two.local > t);
     try testing.expect(!std.mem.eql(u32, follower.keys, owner.keys)); // a different query picks other tokens of the pool
     // the owner's own query over its own pool gives back its final selection
-    const same = try si.select(gpa, two, .{ .q = r.q, .heads = heads }, .{ .k = r.keys, .dim = dim }, t, owner.pool);
+    const same = try si.select(gpa, two, .{ .q = r.q, .heads = heads }, .{ .k = r.keys, .dim = dim }, t, .{ .sel = &owner, .owner = 0 });
     defer same.deinit(gpa);
     try testing.expectEqualSlices(u32, owner.keys, same.keys);
+}
+
+test "sparse index: a follower refuses a pool from another position or another owner (planted: both were accepted)" {
+    const r = try Rig.init(8, 200);
+    defer r.deinit();
+    const at19 = try si.select(gpa, two, .{ .q = r.q, .heads = heads, .layer = 19 }, .{ .k = r.keys, .dim = dim }, 150, null);
+    defer at19.deinit(gpa);
+    try testing.expectEqual(@as(u32, 19), at19.owner);
+    try testing.expectEqual(@as(usize, 150), at19.t);
+    const q: si.Query = .{ .q = r.q, .heads = heads, .layer = 24 };
+    const k: si.Keys = .{ .k = r.keys, .dim = dim };
+    try testing.expectError(error.ForeignPool, si.select(gpa, two, q, k, 151, .{ .sel = &at19, .owner = 19 })); // another t
+    try testing.expectError(error.ForeignPool, si.select(gpa, two, q, k, 150, .{ .sel = &at19, .owner = 29 })); // another owner
+    const ok = try si.select(gpa, two, q, k, 150, .{ .sel = &at19, .owner = 19 });
+    defer ok.deinit(gpa);
+    try testing.expectEqual(@as(u32, 24), ok.owner);
 }
 
 test "sparse index: scores: ReLU drops negative heads, max takes the strongest, ties go to the lower position" {

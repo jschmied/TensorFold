@@ -50,12 +50,11 @@ __device__ __forceinline__ void scores(const __nv_bfloat16* q, const __nv_bfloat
   out[r * ld + key] = __fmul_rn(acc, scale);
 }
 
-// Block b's keys [b B, min(b B + B, n)), a thread a dim: mean (fp32 in key order), max (NaN kept), first or last.
-__device__ __forceinline__ void blocks(const __nv_bfloat16* k, int64_t ks, __nv_bfloat16* out, int64_t os, int64_t n,
-                                       int B, int mode, int unit) {
+// Keys [lo, hi) (hi > lo) summarised, a thread a dim: mean (fp32 in key order), max (NaN kept), first or last.
+__device__ __forceinline__ float summary(const __nv_bfloat16* k, int64_t ks, int64_t lo, int64_t hi, int mode,
+                                         int unit) {
   __shared__ float part[D / 32];
   const int d = threadIdx.x, lane = d & 31, warp = d >> 5;
-  const int64_t lo = (int64_t)blockIdx.x * B, hi = lo + B < n ? lo + B : n;
   float acc = 0.0f;
   for (int64_t i = lo; i < hi; ++i) {
     float x = __bfloat162float(k[i * ks + d]);
@@ -75,7 +74,7 @@ __device__ __forceinline__ void blocks(const __nv_bfloat16* k, int64_t ks, __nv_
     else if (mode == 3) acc = x;
   }
   if (mode == 0) acc = __fdiv_rn(acc, (float)(hi - lo));
-  out[(int64_t)blockIdx.x * os + d] = __float2bfloat16_rn(acc);
+  return acc;
 }
 
 }  // namespace tf_iscore
@@ -91,5 +90,15 @@ extern "C" __global__ void __launch_bounds__(64)
 extern "C" __global__ void __launch_bounds__(128)
     tf_index_blocks(const __nv_bfloat16* k, int64_t ks, __nv_bfloat16* out, int64_t os, int64_t n, int B, int mode,
                     int unit) {
-  tf_iscore::blocks(k, ks, out, os, n, B, mode, unit);
+  const int64_t lo = (int64_t)blockIdx.x * B, hi = lo + B < n ? lo + B : n;
+  out[(int64_t)blockIdx.x * os + threadIdx.x] = __float2bfloat16_rn(tf_iscore::summary(k, ks, lo, hi, mode, unit));
+}
+
+// Row r's open block, keys [end - end % B, end) of end = ends[r] = t + 1 (no later key); 0 if none. A row a block.
+extern "C" __global__ void __launch_bounds__(128)
+    tf_index_open_blocks(const __nv_bfloat16* k, int64_t ks, __nv_bfloat16* out, int64_t os, const int* ends, int B,
+                         int mode, int unit) {
+  const int64_t end = ends[blockIdx.x] > 0 ? ends[blockIdx.x] : 0, lo = end - end % B;
+  const float v = lo < end ? tf_iscore::summary(k, ks, lo, end, mode, unit) : 0.0f;
+  out[(int64_t)blockIdx.x * os + threadIdx.x] = __float2bfloat16_rn(v);
 }

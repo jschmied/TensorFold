@@ -31,10 +31,19 @@ pub fn summaries(b: Blocks) usize {
 }
 
 /// What these kernels refuse of a core sparse_index.Policy, by name.
-pub const Unsupported = error{ IndexHeadDim, IndexHeads, IndexKeyHeads, IndexPhi, IndexReduce, IndexSummary };
+pub const Unsupported = error{ IndexHeadDim, IndexHeads, IndexKeyHeads, IndexPhi, IndexReduce, IndexSummary, IndexStreams, IndexPagedKeys };
+
+/// Where the keys sit: one linear run of key rows is all these kernels read (no stream slots, no page table yet).
+pub const KeyLayout = struct { streams: usize = 1, paged: bool = false };
+
+fn linear(l: KeyLayout) Unsupported!void {
+    if (l.streams != 1) return error.IndexStreams;
+    if (l.paged) return error.IndexPagedKeys;
+}
 
 /// The scores launch core policy `p` (a sparse_index.Policy) asks for: its phi, head reduction, key heads and scale.
-pub fn scoresFor(p: anytype, head_dim: usize, heads: usize, rows: usize, n: usize, ks: usize, ld: usize) Unsupported!Scores {
+pub fn scoresFor(p: anytype, l: KeyLayout, head_dim: usize, heads: usize, rows: usize, n: usize, ks: usize, ld: usize) Unsupported!Scores {
+    try linear(l);
     if (head_dim != dim) return error.IndexHeadDim;
     if (heads == 0 or heads > max_heads) return error.IndexHeads;
     if (p.key_heads == 0 or heads % p.key_heads != 0) return error.IndexKeyHeads;
@@ -44,7 +53,8 @@ pub fn scoresFor(p: anytype, head_dim: usize, heads: usize, rows: usize, n: usiz
 }
 
 /// The block summaries `p` asks for: its block, summary, unit keys and open block; one key head of 128 only.
-pub fn blocksFor(p: anytype, head_dim: usize, n: usize, ks: usize, os: usize) Unsupported!Blocks {
+pub fn blocksFor(p: anytype, l: KeyLayout, head_dim: usize, n: usize, ks: usize, os: usize) Unsupported!Blocks {
+    try linear(l);
     if (head_dim != dim) return error.IndexHeadDim;
     if (p.key_heads != 1) return error.IndexKeyHeads;
     const summary = std.meta.stringToEnum(Summary, @tagName(p.summary)) orelse return error.IndexSummary;
@@ -65,12 +75,13 @@ pub const SparseIndex = struct {
     mod: Module,
     scores: Function,
     blocks: Function,
+    open_blocks: Function,
 
     pub fn load(d: *const Driver) !SparseIndex {
         if (!kernels.available) return error.BuiltWithoutKernels;
         var mod = try Module.load(d, kernels.sparse_index);
         errdefer mod.unload();
-        return .{ .mod = mod, .scores = try mod.function("tf_index_scores"), .blocks = try mod.function("tf_index_blocks") };
+        return .{ .mod = mod, .scores = try mod.function("tf_index_scores"), .blocks = try mod.function("tf_index_blocks"), .open_blocks = try mod.function("tf_index_open_blocks") };
     }
 
     pub fn unload(x: *SparseIndex) void {
@@ -111,6 +122,23 @@ pub const SparseIndex = struct {
         const grid: launch_.Dim3 = .{ .x = @intCast(summaries(b)), .y = 1, .z = 1 };
         try launch_.launch(x.blocks, .{ .grid = grid, .block = .{ .x = dim } }, s, &a);
     }
+
+    /// Each row's open block (ends i32 [rows] = t + 1) into out bf16 [rows, os], 0 if none; full blocks: runBlocks.
+    pub fn runOpenBlocks(x: *const SparseIndex, s: Stream, k: u64, ends: u64, out: u64, rows: usize, b: Blocks) !void {
+        try checkBlocks(b);
+        if (rows == 0) return;
+        if (rows > std.math.maxInt(i32)) return error.IndexShape;
+        var a: launch_.Args = .{};
+        a.add(k);
+        a.add(@as(i64, @intCast(b.ks)));
+        a.add(out);
+        a.add(@as(i64, @intCast(b.os)));
+        a.add(ends);
+        a.add(@as(i32, @intCast(b.block)));
+        a.add(@backingInt(b.summary));
+        a.add(@as(i32, @intFromBool(b.unit)));
+        try launch_.launch(x.open_blocks, .{ .grid = .{ .x = @intCast(rows), .y = 1, .z = 1 }, .block = .{ .x = dim } }, s, &a);
+    }
 };
 
 test "checks take Kolibri-sized indexers and refuse heads past 64, partial groups and overlapping key heads" {
@@ -135,19 +163,23 @@ test "checks take Kolibri-sized indexers and refuse heads past 64, partial group
 
 test "a policy maps onto the launches, and what the kernels lack is refused by name" {
     const P = struct { phi: enum { relu, identity, softplus } = .relu, reduce: enum { sum, max, mean } = .sum, summary: enum { mean, max, first, last, median } = .mean, key_heads: usize = 1, scale: f64 = 0.5, block: usize = 16, norm_first: bool = true, open_block: bool = false };
-    const s = try scoresFor(P{}, dim, 48, 2, 100, dim, 100);
+    const s = try scoresFor(P{}, .{}, dim, 48, 2, 100, dim, 100);
     try std.testing.expectEqual(Phi.relu, s.phi);
     try std.testing.expectEqual(@as(f32, 0.5), s.scale);
-    try std.testing.expectError(error.IndexPhi, scoresFor(P{ .phi = .softplus }, dim, 48, 2, 100, dim, 100));
-    try std.testing.expectError(error.IndexReduce, scoresFor(P{ .reduce = .mean }, dim, 48, 2, 100, dim, 100));
-    try std.testing.expectError(error.IndexKeyHeads, scoresFor(P{ .key_heads = 5 }, dim, 48, 2, 100, dim, 100));
-    try std.testing.expectError(error.IndexHeadDim, scoresFor(P{}, 64, 48, 2, 100, dim, 100));
-    try std.testing.expectError(error.IndexHeads, scoresFor(P{}, dim, 65, 2, 100, dim, 100));
-    const b = try blocksFor(P{}, dim, 40, dim, dim);
+    try std.testing.expectError(error.IndexPhi, scoresFor(P{ .phi = .softplus }, .{}, dim, 48, 2, 100, dim, 100));
+    try std.testing.expectError(error.IndexReduce, scoresFor(P{ .reduce = .mean }, .{}, dim, 48, 2, 100, dim, 100));
+    try std.testing.expectError(error.IndexKeyHeads, scoresFor(P{ .key_heads = 5 }, .{}, dim, 48, 2, 100, dim, 100));
+    try std.testing.expectError(error.IndexHeadDim, scoresFor(P{}, .{}, 64, 48, 2, 100, dim, 100));
+    try std.testing.expectError(error.IndexHeads, scoresFor(P{}, .{}, dim, 65, 2, 100, dim, 100));
+    const b = try blocksFor(P{}, .{}, dim, 40, dim, dim);
     try std.testing.expectEqual(@as(usize, 2), summaries(b)); // the open block of 8 left out
     var o = b;
     o.open = true;
     try std.testing.expectEqual(@as(usize, 3), summaries(o));
-    try std.testing.expectError(error.IndexSummary, blocksFor(P{ .summary = .median }, dim, 40, dim, dim));
-    try std.testing.expectError(error.IndexKeyHeads, blocksFor(P{ .key_heads = 2 }, dim, 40, dim, dim));
+    try std.testing.expectError(error.IndexSummary, blocksFor(P{ .summary = .median }, .{}, dim, 40, dim, dim));
+    try std.testing.expectError(error.IndexKeyHeads, blocksFor(P{ .key_heads = 2 }, .{}, dim, 40, dim, dim));
+    // keys of several streams or behind a page table: refused until the kernels address them
+    try std.testing.expectError(error.IndexStreams, scoresFor(P{}, .{ .streams = 4 }, dim, 48, 2, 100, dim, 100));
+    try std.testing.expectError(error.IndexPagedKeys, scoresFor(P{}, .{ .paged = true }, dim, 48, 2, 100, dim, 100));
+    try std.testing.expectError(error.IndexPagedKeys, blocksFor(P{}, .{ .paged = true }, dim, 40, dim, dim));
 }
