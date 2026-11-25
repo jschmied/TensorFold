@@ -1,5 +1,6 @@
 //! A sparse-attention indexer's key selection in float64, for any model's policy: the reference its kernels follow.
 const std = @import("std");
+const nvfp4_store = @import("nvfp4_store.zig");
 
 /// The activation on each head's dot product before heads are combined.
 pub const Phi = enum { relu, identity };
@@ -22,7 +23,16 @@ pub const Policy = struct {
     summary: Summary = .mean,
     norm_first: bool = false, // summaries average unit-RMS keys
     open_block: bool = true, // the last, incomplete block is summarised from the keys it has (else left out)
+    key_heads: usize = 1, // index key heads a key row holds; query head h reads key head h / (heads / key_heads)
+    scale: f64 = 1, // times every score
+    keys_nvfp4: ?nvfp4_store.Format = null, // score from keys stored as NVFP4 and read back (null: full precision)
+    queries_nvfp4: ?nvfp4_store.Format = null, // the same for the queries
 };
+
+/// The first stage's blocks for keys 0..t: the open (incomplete) last one only when `open_block`.
+pub fn blocks(p: Policy, t: usize) usize {
+    return if (p.open_block) (t + p.block) / p.block else (t + 1) / p.block;
+}
 
 /// One query position's index heads [heads, dim] and optional per-head weights.
 pub const Query = struct { q: []const f64, heads: usize, weights: ?[]const f64 = null };
@@ -35,25 +45,36 @@ fn larger(a: f64, b: f64) f64 {
     return if (b > a or std.math.isNan(b)) b else a;
 }
 
-/// sum (or max) over heads of w_h * phi(q_h . key); NaN propagates through phi and max.
+/// scale * sum (or max) over heads of w_h * phi(q_h . its key head); NaN propagates through phi and max.
 pub fn score(p: Policy, q: Query, key: []const f64) f64 {
-    const dim = key.len;
+    const dim = key.len / p.key_heads;
+    const group = q.heads / p.key_heads;
     var acc: f64 = if (p.reduce == .max) -std.math.inf(f64) else 0;
     for (0..q.heads) |h| {
         var dot: f64 = 0;
-        for (q.q[h * dim ..][0..dim], key) |a, b| dot += a * b;
+        for (q.q[h * dim ..][0..dim], key[h / group * dim ..][0..dim]) |a, b| dot += a * b;
         if (p.phi == .relu and dot < 0) dot = 0;
         const w = if (q.weights) |ws| ws[h] else 1;
         acc = if (p.reduce == .max) larger(acc, w * dot) else acc + w * dot;
     }
-    return acc;
+    return acc * p.scale;
+}
+
+/// The scores' one order, core's and the kernels': any NaN above +inf, -0 equal to +0.
+pub fn above(a: f64, b: f64) bool {
+    if (std.math.isNan(a)) return !std.math.isNan(b);
+    return !std.math.isNan(b) and a > b;
+}
+
+fn same(a: f64, b: f64) bool {
+    return a == b or (std.math.isNan(a) and std.math.isNan(b));
 }
 
 const Scored = struct { pos: u32, s: f64 };
 
-/// Higher score first; on equal scores the lower position.
+/// Higher score first (in `above`'s order); on equal scores the lower position.
 fn before(_: void, a: Scored, b: Scored) bool {
-    return a.s > b.s or (a.s == b.s and a.pos < b.pos);
+    return above(a.s, b.s) or (same(a.s, b.s) and a.pos < b.pos);
 }
 
 /// The positions a query attends and the candidates its first stage kept (for pool reuse), both ascending.
@@ -98,29 +119,96 @@ pub fn summarise(p: Policy, keys: Keys, b: usize, t: usize, out: []f64) void {
     };
 }
 
+/// The most keys a selection at t may hold: topk, with the mandatory keys inside it or on top.
+pub fn budget(p: Policy, t: usize) usize {
+    var m: usize = 0;
+    for (0..t + 1) |i| m += @intFromBool(mandatory(p, t, i));
+    return if (p.mandatory_in_topk) @max(p.topk, m) else p.topk + m;
+}
+
+/// Every block fits the first stage's pool, the open one included (or there is none): the stage keeps every key.
+fn fitsPool(p: Policy, t: usize) bool {
+    return (p.pool_blocks == 0 or blocks(p, t) <= p.pool_blocks) and (p.open_block or (t + 1) % p.block == 0);
+}
+
+/// Rows of x (`width` wide) stored as NVFP4 under f and read back.
+fn rounded(gpa: std.mem.Allocator, f: nvfp4_store.Format, x: []const f64, width: usize) ![]f64 {
+    if (width % nvfp4_store.group != 0) return error.BadPolicy;
+    const out = try gpa.alloc(f64, x.len);
+    errdefer gpa.free(out);
+    const row = try gpa.alloc(f32, width);
+    defer gpa.free(row);
+    const codes = try gpa.alloc(u8, width / 2);
+    defer gpa.free(codes);
+    const scales = try gpa.alloc(u8, width / nvfp4_store.group);
+    defer gpa.free(scales);
+    for (0..x.len / width) |i| {
+        for (row, x[i * width ..][0..width]) |*y, v| y.* = @floatCast(v);
+        try nvfp4_store.quantize(f, row, codes, scales);
+        nvfp4_store.dequantize(f, codes, scales, out[i * width ..][0..width]);
+    }
+    return out;
+}
+
 /// The query at position t (keys 0..t) under `p`; `pool_from`: rescore that pool instead of searching.
 pub fn select(gpa: std.mem.Allocator, p: Policy, q: Query, keys: Keys, t: usize, pool_from: ?[]const u32) !Selection {
-    if (p.topk == 0 or p.block == 0 or keys.k.len < (t + 1) * keys.dim) return error.BadPolicy;
+    return run(gpa, p, q, keys, t, pool_from, true);
+}
+
+/// select without its shortcuts (dense, pool): every stage scored, the path the shortcuts must equal.
+pub fn selectStaged(gpa: std.mem.Allocator, p: Policy, q: Query, keys: Keys, t: usize, pool_from: ?[]const u32) !Selection {
+    return run(gpa, p, q, keys, t, pool_from, false);
+}
+
+/// Keys of `a` (ascending) not in `b`: how many picks a change of scores moved across the top-k boundary.
+pub fn flips(a: []const u32, b: []const u32) usize {
+    var n: usize = 0;
+    var j: usize = 0;
+    for (a) |x| {
+        while (j < b.len and b[j] < x) j += 1;
+        if (j == b.len or b[j] != x) n += 1;
+    }
+    return n;
+}
+
+fn run(gpa: std.mem.Allocator, p: Policy, q_in: Query, keys_in: Keys, t: usize, pool_from: ?[]const u32, shortcuts: bool) !Selection {
+    if (p.topk == 0 or p.block == 0 or p.key_heads == 0 or keys_in.k.len < (t + 1) * keys_in.dim) return error.BadPolicy;
+    if (q_in.heads % p.key_heads != 0 or keys_in.dim % p.key_heads != 0) return error.BadPolicy;
+    // dense: when every causal key fits the final budget, all are attended, without scoring
+    if (shortcuts and pool_from == null and t + 1 <= budget(p, t)) {
+        const all = try gpa.alloc(u32, t + 1);
+        errdefer gpa.free(all);
+        for (all, 0..) |*x, i| x.* = @intCast(i);
+        return .{ .keys = all, .pool = try gpa.dupe(u32, all) };
+    }
+    // scores from NVFP4-stored keys or queries when the policy asks (the rounding's effect on the boundary)
+    const kq = if (p.keys_nvfp4) |f| try rounded(gpa, f, keys_in.k[0 .. (t + 1) * keys_in.dim], keys_in.dim / p.key_heads) else null;
+    defer if (kq) |x| gpa.free(x);
+    const qq = if (p.queries_nvfp4) |f| try rounded(gpa, f, q_in.q, q_in.q.len / q_in.heads) else null;
+    defer if (qq) |x| gpa.free(x);
+    const keys: Keys = .{ .k = kq orelse keys_in.k, .dim = keys_in.dim };
+    var q = q_in;
+    if (qq) |x| q.q = x;
     // the candidates: every causal key, the first stage's blocks, or the pool handed down
     var cands: std.ArrayList(u32) = .empty;
     defer cands.deinit(gpa);
     if (pool_from) |pool| {
         for (pool) |i| if (i <= t) try cands.append(gpa, i);
-    } else if (p.block == 1) {
+    } else if (p.block == 1 or (shortcuts and fitsPool(p, t))) {
+        // one stage, or every block would be kept: tokens scored directly
         for (0..t + 1) |i| try cands.append(gpa, @intCast(i));
     } else {
-        const full = (t + 1) / p.block;
-        const blocks = if (p.open_block) (t + p.block) / p.block else full;
+        const n_blocks = blocks(p, t);
         const sum = try gpa.alloc(f64, keys.dim);
         defer gpa.free(sum);
-        var scored = try gpa.alloc(Scored, blocks);
+        var scored = try gpa.alloc(Scored, n_blocks);
         defer gpa.free(scored);
-        for (0..blocks) |b| {
+        for (0..n_blocks) |b| {
             summarise(p, keys, b, t, sum);
             scored[b] = .{ .pos = @intCast(b), .s = score(p, q, sum) };
         }
         std.mem.sort(Scored, scored, {}, before);
-        const keep = if (p.pool_blocks == 0) blocks else @min(blocks, p.pool_blocks);
+        const keep = if (p.pool_blocks == 0) n_blocks else @min(n_blocks, p.pool_blocks);
         for (scored[0..keep]) |s| for (s.pos * p.block..@min((s.pos + 1) * p.block, t + 1)) |i| try cands.append(gpa, @intCast(i));
         // keys of a block left out (the open one) are only reachable as mandatory keys
     }
@@ -136,16 +224,16 @@ pub fn select(gpa: std.mem.Allocator, p: Policy, q: Query, keys: Keys, t: usize,
     std.mem.sort(Scored, scored.items, {}, before);
     const in = try gpa.alloc(bool, t + 1);
     defer gpa.free(in);
-    var budget = p.topk;
+    var left = p.topk;
     var count: usize = 0;
     for (in, 0..) |*x, i| {
         x.* = mandatory(p, t, i);
         if (x.*) count += 1;
-        if (x.* and p.mandatory_in_topk) budget -|= 1;
+        if (x.* and p.mandatory_in_topk) left -|= 1;
     }
     var taken: usize = 0;
     for (scored.items) |s| {
-        if (taken == budget) break;
+        if (taken == left) break;
         if (in[s.pos]) continue;
         in[s.pos] = true;
         taken += 1;
@@ -165,17 +253,14 @@ pub fn check(p: Policy, t: usize, keys: []const u32) error{ Unsorted, Future, Mi
         if (j > 0 and keys[j - 1] >= k) return error.Unsorted;
         if (k > t) return error.Future;
     }
-    var mand: usize = 0;
     for (0..t + 1) |i| if (mandatory(p, t, i)) {
-        mand += 1;
         if (std.sort.binarySearch(u32, keys, @as(u32, @intCast(i)), struct {
             fn cmp(a: u32, b: u32) std.math.Order {
                 return std.math.order(a, b);
             }
         }.cmp) == null) return error.MissingMandatory;
     };
-    const most = if (p.mandatory_in_topk) @max(p.topk, mand) else p.topk + mand;
-    if (keys.len > most) return error.OverBudget;
+    if (keys.len > budget(p, t)) return error.OverBudget;
 }
 
 test {

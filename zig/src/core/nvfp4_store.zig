@@ -11,6 +11,7 @@ pub const max_code = 6.0; // e2m1's largest magnitude
 pub fn e2m1Code(x: f64) u8 {
     const mags = [8]f64{ 0, 0.5, 1, 1.5, 2, 3, 4, 6 };
     const a = @abs(x);
+    if (a >= max_code) return 7 | @as(u8, if (x < 0) 8 else 0); // infinities too
     var best: u8 = 0;
     for (mags, 0..) |m, i| {
         const d = @abs(a - m);
@@ -20,18 +21,29 @@ pub fn e2m1Code(x: f64) u8 {
     return best | @as(u8, if (x < 0 and best != 0) 8 else 0);
 }
 
-/// How a group's scale is formed: amax / 6 (over the global scale when there is one), then rounded to e4m3.
-pub const Format = struct { global: ?f32 = null };
+/// What a NaN in a row does: refuse the row, or store 0 in its place.
+pub const NanRule = enum { reject, zero };
+
+/// e4m3's largest scale: a value past 6 * this * global saturates there (infinities included).
+pub const max_scale = 448.0;
+
+/// A group's scale: max(amax / 6 / global, min_scale) rounded to e4m3; values clamp to +-6 * 448 * global first.
+pub const Format = struct { global: ?f32 = null, min_scale: f32 = 0, nan: NanRule = .reject };
 
 /// One row of `x` (a multiple of 16 long) into codes (two a byte, even index low) and e4m3 scales.
-pub fn quantize(f: Format, x: []const f32, codes: []u8, scales: []u8) void {
+pub fn quantize(f: Format, x: []const f32, codes: []u8, scales: []u8) error{NaN}!void {
     std.debug.assert(x.len % group == 0 and codes.len == x.len / 2 and scales.len == x.len / group);
     const g: f64 = if (f.global) |v| v else 1;
+    const top = max_code * max_scale * g;
     for (0..x.len / group) |b| {
-        const v = x[b * group ..][0..group];
+        var v: [group]f64 = undefined;
+        for (&v, x[b * group ..][0..group]) |*o, e| {
+            if (std.math.isNan(e) and f.nan == .reject) return error.NaN;
+            o.* = if (std.math.isNan(e)) 0 else std.math.clamp(@as(f64, e), -top, top);
+        }
         var amax: f64 = 0;
-        for (v) |e| amax = @max(amax, @abs(@as(f64, e)));
-        const code = e4m3FromF32(@floatCast(amax / max_code / g));
+        for (v) |e| amax = @max(amax, @abs(e));
+        const code = e4m3FromF32(@floatCast(@max(amax / max_code / g, f.min_scale)));
         scales[b] = code;
         const s = fp8.e4m3(code) * g;
         for (v, 0..) |e, j| {
@@ -70,7 +82,7 @@ test "nvfp4 store: a stored row's error stays within half a step of its group's 
         var codes: [64]u8 = undefined;
         var scales: [8]u8 = undefined;
         var back: [128]f64 = undefined;
-        quantize(f, &x, &codes, &scales);
+        try quantize(f, &x, &codes, &scales);
         dequantize(f, &codes, &scales, &back);
         for (0..8) |b| {
             const s = fp8.e4m3(scales[b]) * (if (f.global) |g| g else 1);
@@ -92,7 +104,50 @@ test "nvfp4 store: a global scale too small for a group saturates its e4m3 scale
     var scales: [1]u8 = undefined;
     var back: [16]f64 = undefined;
     const f: Format = .{ .global = 0.01 }; // 40 / 6 / 0.01 = 667 > 448: the scale clips
-    quantize(f, &x, &codes, &scales);
+    try quantize(f, &x, &codes, &scales);
     dequantize(f, &codes, &scales, &back);
     try std.testing.expect(@abs(back[0] - 40) > 448 * 0.01); // far past half a step of the clipped scale
+}
+
+test "nvfp4 store: infinities saturate at 6 * 448 (planted: before, inf / scale encoded as 0)" {
+    var x: [16]f32 = @splat(1);
+    x[0] = std.math.inf(f32);
+    x[1] = -std.math.inf(f32);
+    var codes: [8]u8 = undefined;
+    var scales: [1]u8 = undefined;
+    var back: [16]f64 = undefined;
+    try quantize(.{}, &x, &codes, &scales);
+    dequantize(.{}, &codes, &scales, &back);
+    try std.testing.expectEqual(@as(f64, 6 * 448), back[0]);
+    try std.testing.expectEqual(@as(f64, -6 * 448), back[1]);
+    try std.testing.expectEqual(@as(f64, 0), back[2]); // 1 is under half a step of the saturated scale
+    try std.testing.expectEqual(@as(u8, 7), e2m1Code(std.math.inf(f64)));
+    try std.testing.expectEqual(@as(u8, 15), e2m1Code(-std.math.inf(f64)));
+}
+
+test "nvfp4 store: a NaN refuses the row, or stores 0 when the format says so" {
+    var x: [16]f32 = @splat(2);
+    x[3] = std.math.nan(f32);
+    var codes: [8]u8 = undefined;
+    var scales: [1]u8 = undefined;
+    var back: [16]f64 = undefined;
+    try std.testing.expectError(error.NaN, quantize(.{}, &x, &codes, &scales));
+    try quantize(.{ .nan = .zero }, &x, &codes, &scales);
+    dequantize(.{}, &codes, &scales, &back);
+    try std.testing.expectEqual(@as(f64, 0), back[3]);
+    try std.testing.expect(@abs(back[4] - 2) <= 0.125); // 2 at its group's e4m3 scale
+}
+
+test "nvfp4 store: a scale floor keeps a quiet group's scale at the floor (its values round to 0)" {
+    var x: [16]f32 = @splat(0.01);
+    var codes: [8]u8 = undefined;
+    var scales: [1]u8 = undefined;
+    var back: [16]f64 = undefined;
+    try quantize(.{}, &x, &codes, &scales);
+    dequantize(.{}, &codes, &scales, &back);
+    try std.testing.expect(back[0] > 0); // no floor: the scale follows the group down
+    try quantize(.{ .min_scale = 0.1 }, &x, &codes, &scales);
+    dequantize(.{}, &codes, &scales, &back);
+    try std.testing.expectEqual(e4m3FromF32(0.1), scales[0]);
+    try std.testing.expectEqual(@as(f64, 0), back[0]);
 }

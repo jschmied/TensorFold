@@ -15,7 +15,7 @@ fn noSums(_: c.Shape) usize {
     return 0;
 }
 
-const rule = "sparse_index.select's positions on NaN-free rows, and on every row the order keys descending " ++
+const rule = "sparse_index.select's positions on every row (NaN above +inf, -0 as +0), and the order keys descending " ++
     "(-0 as +0, any NaN above +inf), ties to the lower index, the picks ascending and -1 after them";
 
 /// How a test deviates from what it tells the kernel; `short` (the planted control) cuts each row's last score.
@@ -44,11 +44,6 @@ fn orderKey(s: f32) u32 {
     return @bitCast(b ^ ((b >> 31) | std.math.minInt(i32)));
 }
 
-fn hasNan(xs: []const f32) bool {
-    for (xs) |x| if (std.math.isNan(x)) return true;
-    return false;
-}
-
 fn before(keys: []const u32, x: u32, y: u32) bool {
     return keys[x] > keys[y] or (keys[x] == keys[y] and x < y);
 }
@@ -60,6 +55,7 @@ pub const Rows = struct {
     shape: c.Shape = undefined,
     host: []f32 = &.{},
     counts: []i32 = &.{},
+    told: []i32 = &.{}, // what the kernel reads: counts, cut by the control, a negative and an oversized one planted
     dev: [2]u64 = @splat(0), // scores, counts (0: every row has n)
     out: u64 = 0,
     picked: u64 = 0,
@@ -71,6 +67,7 @@ pub const Rows = struct {
         const a = self.rig.gpu.gpa;
         a.free(self.host);
         a.free(self.counts);
+        a.free(self.told);
         self.rig.deinit();
     }
 
@@ -92,8 +89,10 @@ pub const Rows = struct {
         self.shape = shape;
         a.free(self.host);
         a.free(self.counts);
+        a.free(self.told);
         self.host = &.{};
         self.counts = &.{};
+        self.told = &.{};
         self.host = try a.alloc(f32, shape.rows * shape.n);
         self.counts = try a.alloc(i32, shape.rows);
         var prng = std.Random.DefaultPrng.init(seed);
@@ -122,11 +121,14 @@ pub const Rows = struct {
                 };
             };
         }
-        const told = try a.dupe(i32, self.counts);
-        defer a.free(told);
-        if (self.plant_ == .short) for (told) |*n| {
-            n.* = @max(1, n.* - 1);
-        };
+        self.told = try a.dupe(i32, self.counts);
+        const told = self.told;
+        if (self.plant_ == .short) {
+            for (told) |*n| n.* = @max(1, n.* - 1);
+        } else if (shape.rows >= 4) {
+            told[1] = -3; // the kernel clamps to [0, n]: no picks
+            told[2] = @intCast(shape.n + 7); // all n scores, none past the row
+        }
         self.dev[0] = try self.rig.input(std.mem.sliceAsBytes(self.host));
         self.dev[1] = if (shape.rows == 1 and self.plant_ == .none) 0 else try self.rig.input(std.mem.sliceAsBytes(told));
         self.out = try self.rig.output(shape.rows * shape.k * 4);
@@ -153,7 +155,7 @@ pub const Rows = struct {
         return try std.fmt.bufPrint(&self.msg, fmt, args);
     }
 
-    /// The other form's bytes, then each row against sparse_index.select (NaN-free rows) and the order-key rule.
+    /// The other form's bytes, then every row against sparse_index.select (the kernel's NaN order) and the key rule.
     pub fn check(self: *Rows, _: g.Gate) !?[]const u8 {
         const a = self.rig.gpu.gpa;
         const x = self.shape;
@@ -172,7 +174,8 @@ pub const Rows = struct {
         defer a.free(wide64);
         self.with_select = 0;
         for (0..x.rows) |r| {
-            const n: usize = @intCast(self.counts[r]);
+            // the true count for the control (it must miss), else the told count clamped to [0, n] as the kernel does
+            const n: usize = if (self.plant_ == .short) @intCast(self.counts[r]) else @intCast(std.math.clamp(self.told[r], 0, @as(i32, @intCast(x.n))));
             const scores = self.host[r * x.n ..][0..n];
             const take = @min(n, x.k);
             const have = std.mem.bytesAsSlice(i32, got[r * x.k * 4 ..][0 .. x.k * 4]);
@@ -185,7 +188,7 @@ pub const Rows = struct {
             std.mem.sort(u32, want, {}, std.sort.asc(u32));
             for (want, 0..) |w, i| if (have[i] != w) return self.fail("row {d} pick {d}: index {d}, the order-key rule gives {d}", .{ r, i, have[i], w });
             for (have[take..], take..) |v, i| if (v != -1) return self.fail("row {d} slot {d} past its picks holds {d}, not -1", .{ r, i, v });
-            if (!hasNan(scores)) {
+            if (n > 0) {
                 for (wide64[0..n], scores) |*y, s| y.* = s;
                 const one = [_]f64{1};
                 var sel = try si.select(a, .{ .topk = x.k, .phi = .identity }, .{ .q = &one, .heads = 1 }, .{ .k = wide64[0..n], .dim = 1 }, n - 1, null);
@@ -195,7 +198,7 @@ pub const Rows = struct {
                 self.with_select += 1;
             }
         }
-        if (self.with_select == 0) return self.fail("no row was NaN-free: nothing compared with sparse_index", .{});
+        if (self.with_select == 0) return self.fail("no row had scores: nothing compared with sparse_index", .{});
         return null;
     }
 };

@@ -22,8 +22,34 @@ pub const Summary = enum(i32) { mean = 0, max = 1, first = 2, last = 3 };
 /// rows of h query heads over n keys of hk key heads, `ks` elements apart; scores `ld` apart (ld >= n).
 pub const Scores = struct { rows: usize, n: usize, h: usize, hk: usize, ks: usize, ld: usize, scale: f32, phi: Phi = .relu, reduce: Reduce = .sum };
 
-/// n keys `ks` elements apart into ceil(n / block) summaries `os` apart.
-pub const Blocks = struct { n: usize, block: usize, ks: usize, os: usize, summary: Summary = .mean, unit: bool = false };
+/// n keys `ks` elements apart into summaries `os` apart; `open`: the incomplete last block too (core's open_block).
+pub const Blocks = struct { n: usize, block: usize, ks: usize, os: usize, summary: Summary = .mean, unit: bool = false, open: bool = true };
+
+/// The summaries a launch writes: core sparse_index.blocks' count for n keys.
+pub fn summaries(b: Blocks) usize {
+    return if (b.open) (b.n + b.block - 1) / b.block else b.n / b.block;
+}
+
+/// What these kernels refuse of a core sparse_index.Policy, by name.
+pub const Unsupported = error{ IndexHeadDim, IndexHeads, IndexKeyHeads, IndexPhi, IndexReduce, IndexSummary };
+
+/// The scores launch core policy `p` (a sparse_index.Policy) asks for: its phi, head reduction, key heads and scale.
+pub fn scoresFor(p: anytype, head_dim: usize, heads: usize, rows: usize, n: usize, ks: usize, ld: usize) Unsupported!Scores {
+    if (head_dim != dim) return error.IndexHeadDim;
+    if (heads == 0 or heads > max_heads) return error.IndexHeads;
+    if (p.key_heads == 0 or heads % p.key_heads != 0) return error.IndexKeyHeads;
+    const phi = std.meta.stringToEnum(Phi, @tagName(p.phi)) orelse return error.IndexPhi;
+    const reduce = std.meta.stringToEnum(Reduce, @tagName(p.reduce)) orelse return error.IndexReduce;
+    return .{ .rows = rows, .n = n, .h = heads, .hk = p.key_heads, .ks = ks, .ld = ld, .scale = @floatCast(p.scale), .phi = phi, .reduce = reduce };
+}
+
+/// The block summaries `p` asks for: its block, summary, unit keys and open block; one key head of 128 only.
+pub fn blocksFor(p: anytype, head_dim: usize, n: usize, ks: usize, os: usize) Unsupported!Blocks {
+    if (head_dim != dim) return error.IndexHeadDim;
+    if (p.key_heads != 1) return error.IndexKeyHeads;
+    const summary = std.meta.stringToEnum(Summary, @tagName(p.summary)) orelse return error.IndexSummary;
+    return .{ .n = n, .block = p.block, .ks = ks, .os = os, .summary = summary, .unit = p.norm_first, .open = p.open_block };
+}
 
 pub fn checkScores(s: Scores) error{IndexShape}!void {
     if (s.h == 0 or s.h > max_heads or s.hk == 0 or s.h % s.hk != 0 or s.ks < s.hk * dim or s.ks % 8 != 0) return error.IndexShape;
@@ -69,10 +95,10 @@ pub const SparseIndex = struct {
         try launch_.launch(x.scores, .{ .grid = grid, .block = .{ .x = keys_a_block }, .shared = smem }, s, &a);
     }
 
-    /// k bf16 key rows; out bf16 [ceil(n / block), os] (the last block summarises the keys it has).
+    /// k bf16 key rows; out bf16 [summaries(b), os] (an open last block summarises the keys it has).
     pub fn runBlocks(x: *const SparseIndex, s: Stream, k: u64, out: u64, b: Blocks) !void {
         try checkBlocks(b);
-        if (b.n == 0) return;
+        if (summaries(b) == 0) return;
         var a: launch_.Args = .{};
         a.add(k);
         a.add(@as(i64, @intCast(b.ks)));
@@ -82,7 +108,7 @@ pub const SparseIndex = struct {
         a.add(@as(i32, @intCast(b.block)));
         a.add(@backingInt(b.summary));
         a.add(@as(i32, @intFromBool(b.unit)));
-        const grid: launch_.Dim3 = .{ .x = @intCast((b.n + b.block - 1) / b.block), .y = 1, .z = 1 };
+        const grid: launch_.Dim3 = .{ .x = @intCast(summaries(b)), .y = 1, .z = 1 };
         try launch_.launch(x.blocks, .{ .grid = grid, .block = .{ .x = dim } }, s, &a);
     }
 };
@@ -105,4 +131,23 @@ test "checks take Kolibri-sized indexers and refuse heads past 64, partial group
     try std.testing.expectError(error.IndexShape, checkScores(x));
     try checkBlocks(.{ .n = 16384, .block = 64, .ks = dim, .os = dim });
     try std.testing.expectError(error.IndexShape, checkBlocks(.{ .n = 16, .block = 0, .ks = dim, .os = dim }));
+}
+
+test "a policy maps onto the launches, and what the kernels lack is refused by name" {
+    const P = struct { phi: enum { relu, identity, softplus } = .relu, reduce: enum { sum, max, mean } = .sum, summary: enum { mean, max, first, last, median } = .mean, key_heads: usize = 1, scale: f64 = 0.5, block: usize = 16, norm_first: bool = true, open_block: bool = false };
+    const s = try scoresFor(P{}, dim, 48, 2, 100, dim, 100);
+    try std.testing.expectEqual(Phi.relu, s.phi);
+    try std.testing.expectEqual(@as(f32, 0.5), s.scale);
+    try std.testing.expectError(error.IndexPhi, scoresFor(P{ .phi = .softplus }, dim, 48, 2, 100, dim, 100));
+    try std.testing.expectError(error.IndexReduce, scoresFor(P{ .reduce = .mean }, dim, 48, 2, 100, dim, 100));
+    try std.testing.expectError(error.IndexKeyHeads, scoresFor(P{ .key_heads = 5 }, dim, 48, 2, 100, dim, 100));
+    try std.testing.expectError(error.IndexHeadDim, scoresFor(P{}, 64, 48, 2, 100, dim, 100));
+    try std.testing.expectError(error.IndexHeads, scoresFor(P{}, dim, 65, 2, 100, dim, 100));
+    const b = try blocksFor(P{}, dim, 40, dim, dim);
+    try std.testing.expectEqual(@as(usize, 2), summaries(b)); // the open block of 8 left out
+    var o = b;
+    o.open = true;
+    try std.testing.expectEqual(@as(usize, 3), summaries(o));
+    try std.testing.expectError(error.IndexSummary, blocksFor(P{ .summary = .median }, dim, 40, dim, dim));
+    try std.testing.expectError(error.IndexKeyHeads, blocksFor(P{ .key_heads = 2 }, dim, 40, dim, dim));
 }

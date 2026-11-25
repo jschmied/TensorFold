@@ -82,7 +82,7 @@ pub const Scores = struct {
     const vt = g.hooks(Scores);
 
     fn hk(self: *const Scores) usize {
-        return if (self.v == .gqa) 4 else 1;
+        return self.policy().key_heads;
     }
 
     fn ks(self: *const Scores) usize {
@@ -93,13 +93,13 @@ pub const Scores = struct {
         return self.v != .gqa;
     }
 
+    /// The one semantic policy: core's; the launch below is built from it.
     fn policy(self: *const Scores) si.Policy {
-        return if (self.v == .gqa) .{ .topk = 1, .phi = .identity, .reduce = .max } else .{ .topk = 1 };
+        return if (self.v == .gqa) .{ .topk = 1, .phi = .identity, .reduce = .max, .key_heads = 4, .scale = 0.0625 } else .{ .topk = 1, .scale = 0.0625 };
     }
 
-    fn sh(self: *const Scores) gpu.Scores {
-        const p = self.policy();
-        return .{ .rows = self.shape.rows, .n = self.shape.n, .h = self.shape.k, .hk = self.hk(), .ks = self.ks(), .ld = self.shape.n, .scale = 0.0625, .phi = if (p.phi == .relu) .relu else .identity, .reduce = if (p.reduce == .max) .max else .sum };
+    fn sh(self: *const Scores) !gpu.Scores {
+        return gpu.scoresFor(self.policy(), D, self.shape.k, self.shape.rows, self.shape.n, self.ks(), self.shape.n);
     }
 
     pub fn prepare(self: *Scores, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
@@ -158,7 +158,7 @@ pub const Scores = struct {
     }
 
     pub fn run(self: *Scores) !void {
-        try self.x.runScores(self.rig.s, self.dev[0], self.dev[1], self.dev[2], self.dev[3], self.out, self.sh());
+        try self.x.runScores(self.rig.s, self.dev[0], self.dev[1], self.dev[2], self.dev[3], self.out, try self.sh());
         try self.rig.s.synchronize();
     }
 
@@ -191,29 +191,29 @@ pub const Scores = struct {
                     continue;
                 }
                 for (kf, self.k[key * self.ks() ..][0 .. self.hk() * D]) |*y, e| y.* = c.fromBf16(e);
+                if (acc == null) {
+                    // core's score over the whole key row (its key heads) and the summed terms' magnitude
+                    want[i] = si.score(p, .{ .q = qf[r * H * D ..][0 .. H * D], .heads = H, .weights = wf }, kf);
+                    var m: f64 = 0;
+                    for (0..H) |h| for (qf[(r * H + h) * D ..][0..D], kf[h / G * D ..][0..D]) |u, z| {
+                        m += @abs(wf[h] * u * z);
+                    };
+                    if (mag) |mm| mm[i] = m * p.scale;
+                    continue;
+                }
                 var s: f64 = if (p.reduce == .max) -std.math.inf(f64) else 0;
-                var m: f64 = 0;
                 for (0..self.hk()) |kh| {
                     const key_h = kf[kh * D ..][0..D];
                     const qg = qf[(r * H + kh * G) * D ..][0 .. G * D];
                     const wg = wf[kh * G ..][0..G];
-                    if (acc) |how| {
-                        for (0..G) |h| {
-                            for (t, qg[h * D ..][0..D], key_h) |*y, u, z| y.* = u * z;
-                            var dot = contract.rows.sumIn(how.a, how.o, t);
-                            if (p.phi == .relu and dot < 0) dot = 0;
-                            s = if (p.reduce == .max) larger(s, wg[h] * dot) else s + wg[h] * dot;
-                        }
-                    } else {
-                        const part = si.score(p, .{ .q = qg, .heads = G, .weights = wg }, key_h);
-                        s = if (p.reduce == .max) larger(s, part) else s + part;
-                        for (0..G) |h| for (qg[h * D ..][0..D], key_h) |u, z| {
-                            m += @abs(wg[h] * u * z);
-                        };
+                    for (0..G) |h| {
+                        for (t, qg[h * D ..][0..D], key_h) |*y, u, z| y.* = u * z;
+                        var dot = contract.rows.sumIn(acc.?.a, acc.?.o, t);
+                        if (p.phi == .relu and dot < 0) dot = 0;
+                        s = if (p.reduce == .max) larger(s, wg[h] * dot) else s + wg[h] * dot;
                     }
                 }
-                want[i] = s * 0.0625;
-                if (mag) |mm| mm[i] = m * 0.0625;
+                want[i] = s * p.scale;
             }
         }
     }
@@ -227,17 +227,17 @@ pub const Scores = struct {
     }
 };
 
-/// Shape: summaries (rows), keys a block (n) and the key width (k, 128); the last block holds half its keys.
+/// Shape: blocks (rows), keys a block (n) and the key width (k, 128); the last block holds half its keys (open).
 fn blockDepth(s: c.Shape) usize {
     return s.n + 8;
 }
 
-pub fn blocksSpec(s: si.Summary, unit: bool, short: bool) c.Spec {
+pub fn blocksSpec(s: si.Summary, unit: bool, short: bool, open: bool) c.Spec {
     const served = &[_]c.Shape{ .{ .rows = 256, .n = 64, .k = D }, .{ .rows = 40, .n = 128, .k = D }, .{ .rows = 9, .n = 16, .k = D } };
     const sums = s == .mean;
     return .{
         .name = if (short) "control: sparse index block means told one key fewer" else switch (s) {
-            .mean => if (unit) "cuda sparse index tf_index_blocks (mean of unit-RMS keys)" else "cuda sparse index tf_index_blocks (mean)",
+            .mean => if (unit) "cuda sparse index tf_index_blocks (mean of unit-RMS keys)" else if (open) "cuda sparse index tf_index_blocks (mean)" else "cuda sparse index tf_index_blocks (mean, open block left out)",
             .max => "cuda sparse index tf_index_blocks (max)",
             .first => "cuda sparse index tf_index_blocks (first)",
             .last => "cuda sparse index tf_index_blocks (last)",
@@ -258,6 +258,7 @@ pub const Blocks = struct {
     summary: si.Summary = .mean,
     unit: bool = false,
     short: bool = false,
+    open: bool = true,
     shape: c.Shape = undefined,
     keys: usize = 0,
     k: []u16 = &.{},
@@ -272,13 +273,23 @@ pub const Blocks = struct {
     }
 
     pub fn kernel(self: *Blocks) g.Kernel {
-        return .{ .spec = blocksSpec(self.summary, self.unit, self.short), .ctx = self, .vt = &vt, .control = if (self.short) .shapes else null };
+        return .{ .spec = blocksSpec(self.summary, self.unit, self.short, self.open), .ctx = self, .vt = &vt, .control = if (self.short) .shapes else null };
     }
 
     const vt = g.hooks(Blocks);
 
     fn told(self: *const Blocks) usize {
         return if (self.short) self.keys - 1 else self.keys;
+    }
+
+    /// The one semantic policy: core's; the launch is built from it.
+    fn policy(self: *const Blocks) si.Policy {
+        return .{ .topk = 1, .block = self.shape.n, .summary = self.summary, .norm_first = self.unit, .open_block = self.open };
+    }
+
+    /// Summaries due for the keys: core's count, open block or not.
+    fn summaries(self: *const Blocks) usize {
+        return si.blocks(self.policy(), self.keys - 1);
     }
 
     pub fn prepare(self: *Blocks, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
@@ -317,23 +328,18 @@ pub const Blocks = struct {
             },
         }
         self.dev = try self.rig.input(std.mem.sliceAsBytes(self.k));
-        self.out = try self.rig.output(shape.rows * D * 2);
+        if (self.summaries() == 0) return false;
+        self.out = try self.rig.output(self.summaries() * D * 2);
         return true;
     }
 
     pub fn run(self: *Blocks) !void {
-        const s: gpu.Summary = switch (self.summary) {
-            .mean => .mean,
-            .max => .max,
-            .first => .first,
-            .last => .last,
-        };
-        try self.x.runBlocks(self.rig.s, self.dev, self.out, .{ .n = self.told(), .block = self.shape.n, .ks = ks, .os = D, .summary = s, .unit = self.unit });
+        try self.x.runBlocks(self.rig.s, self.dev, self.out, try gpu.blocksFor(self.policy(), D, self.told(), ks, D));
         try self.rig.s.synchronize();
     }
 
     pub fn count(self: *Blocks) usize {
-        return self.shape.rows * D;
+        return self.summaries() * D;
     }
 
     fn keysF64(self: *Blocks) ![]f64 {
@@ -349,11 +355,11 @@ pub const Blocks = struct {
         const a = self.rig.gpu.gpa;
         const kf = try self.keysF64();
         defer a.free(kf);
-        const p: si.Policy = .{ .topk = 1, .block = self.shape.n, .summary = self.summary, .norm_first = self.unit };
+        const p = self.policy();
         const kabs = try a.dupe(f64, kf);
         defer a.free(kabs);
         for (kabs) |*v| v.* = @abs(v.*);
-        for (0..self.shape.rows) |b| {
+        for (0..self.summaries()) |b| {
             si.summarise(p, .{ .k = kf, .dim = D }, b, self.keys - 1, want[b * D ..][0..D]);
             si.summarise(p, .{ .k = kabs, .dim = D }, b, self.keys - 1, mag[b * D ..][0..D]);
         }
@@ -366,7 +372,7 @@ pub const Blocks = struct {
         defer a.free(kf);
         const t = try a.alloc(f64, self.shape.n);
         defer a.free(t);
-        for (0..self.shape.rows) |b| {
+        for (0..self.summaries()) |b| {
             const lo = b * self.shape.n;
             const m = @min(self.shape.n, self.keys - lo);
             for (0..D) |d| {
@@ -390,7 +396,7 @@ pub const Set = struct {
     gpa: std.mem.Allocator,
     x: gpu.SparseIndex,
     scores: [3]Scores,
-    blocks: [6]Blocks,
+    blocks: [7]Blocks,
 
     pub fn init(dev: tc.Gpu, s: cuda.Stream, a: std.mem.Allocator, list: *std.ArrayList(g.Kernel)) !*Set {
         const set = try dev.gpa.create(Set);
@@ -399,8 +405,8 @@ pub const Set = struct {
         set.x = try gpu.SparseIndex.load(dev.d);
         errdefer set.x.unload();
         for (&set.scores, [_]Variant{ .flat, .gqa, .short }) |*t, v| t.* = .{ .rig = .{ .gpu = dev, .s = s }, .x = &set.x, .v = v };
-        const kinds = [_]struct { si.Summary, bool, bool }{ .{ .mean, false, false }, .{ .mean, true, false }, .{ .max, false, false }, .{ .first, false, false }, .{ .last, false, false }, .{ .mean, false, true } };
-        for (&set.blocks, kinds) |*t, kd| t.* = .{ .rig = .{ .gpu = dev, .s = s }, .x = &set.x, .summary = kd[0], .unit = kd[1], .short = kd[2] };
+        const kinds = [_]struct { si.Summary, bool, bool, bool }{ .{ .mean, false, false, true }, .{ .mean, false, false, false }, .{ .mean, true, false, true }, .{ .max, false, false, true }, .{ .first, false, false, true }, .{ .last, false, false, true }, .{ .mean, false, true, true } };
+        for (&set.blocks, kinds) |*t, kd| t.* = .{ .rig = .{ .gpu = dev, .s = s }, .x = &set.x, .summary = kd[0], .unit = kd[1], .short = kd[2], .open = kd[3] };
         for (&set.scores) |*t| try list.append(a, t.kernel());
         for (&set.blocks) |*t| try list.append(a, t.kernel());
         return set;

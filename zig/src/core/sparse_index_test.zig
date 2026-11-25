@@ -195,3 +195,119 @@ test "sparse index: NaN propagates through relu, a max over heads and blocks, an
         try testing.expect(std.math.isNan(out[1]) == unit); // a plain summary keeps the other dim's 2 and 3
     };
 }
+
+test "sparse index: dense: ten keys under a budget of sixteen are all attended, the open block left out, no locals" {
+    // the review's counter-case: block 4 over 10 keys keeps blocks 0-1 only, so keys 8 and 9 would drop out
+    const keys = try randoms(41, 10 * dim);
+    defer gpa.free(keys);
+    const q = try randoms(42, heads * dim);
+    defer gpa.free(q);
+    const p: si.Policy = .{ .topk = 16, .block = 4, .open_block = false };
+    const s = try si.select(gpa, p, .{ .q = q, .heads = heads }, .{ .k = keys, .dim = dim }, 9, null);
+    defer s.deinit(gpa);
+    try testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 }, s.keys);
+    // one key past the budget: the stages decide again, and the open block's keys are gone
+    const big = try randoms(43, 20 * dim);
+    defer gpa.free(big);
+    const t = try si.select(gpa, .{ .topk = 16, .block = 4, .open_block = false }, .{ .q = q, .heads = heads }, .{ .k = big, .dim = dim }, 16, null);
+    defer t.deinit(gpa);
+    try testing.expect(std.mem.indexOfScalar(u32, t.keys, 16) == null);
+}
+
+test "sparse index: blocks at their boundaries: the open block counts only when the policy keeps it" {
+    const open: si.Policy = .{ .topk = 1, .block = 4 };
+    const closed: si.Policy = .{ .topk = 1, .block = 4, .open_block = false };
+    // keys 0..t: 7 keys (one open block of 3), 8 (two full), 9 (two full, one open of 1)
+    try testing.expectEqual(@as(usize, 2), si.blocks(open, 6));
+    try testing.expectEqual(@as(usize, 1), si.blocks(closed, 6));
+    try testing.expectEqual(@as(usize, 2), si.blocks(open, 7));
+    try testing.expectEqual(@as(usize, 2), si.blocks(closed, 7));
+    try testing.expectEqual(@as(usize, 3), si.blocks(open, 8));
+    try testing.expectEqual(@as(usize, 2), si.blocks(closed, 8));
+    try testing.expectEqual(@as(usize, 0), si.blocks(closed, 2));
+}
+
+test "sparse index: one order for scores: NaN above +inf, -0 equal to +0 (ties to the lower position)" {
+    const nan = std.math.nan(f64);
+    const inf = std.math.inf(f64);
+    // one head, one dim, identity: each key's score is its value
+    const vals = [_]f64{ 1, -0.0, inf, nan, 0, -nan, 2, -inf };
+    const one = [_]f64{1};
+    const p: si.Policy = .{ .topk = 4, .phi = .identity };
+    const s = try si.select(gpa, p, .{ .q = &one, .heads = 1 }, .{ .k = &vals, .dim = 1 }, vals.len - 1, null);
+    defer s.deinit(gpa);
+    try testing.expectEqualSlices(u32, &.{ 2, 3, 5, 6 }, s.keys); // both NaNs, +inf, then 2
+    const z = [_]f64{ -0.0, 0, -1 };
+    const t = try si.select(gpa, .{ .topk = 1, .phi = .identity }, .{ .q = &one, .heads = 1 }, .{ .k = &z, .dim = 1 }, 2, null);
+    defer t.deinit(gpa);
+    try testing.expectEqualSlices(u32, &.{0}, t.keys); // -0 ties +0: the lower position
+    try testing.expect(si.above(nan, inf) and !si.above(inf, nan) and !si.above(0.0, -0.0) and !si.above(-0.0, 0.0));
+}
+
+test "sparse index: key heads and scale: query head h reads key head h / group, every score times scale" {
+    // two key heads of one dim; four query heads, two a key head
+    const key = [_]f64{ 2, -3 };
+    const q = [_]f64{ 1, 1, 1, 1 };
+    const p: si.Policy = .{ .topk = 1, .phi = .identity, .key_heads = 2, .scale = 0.5 };
+    try testing.expectEqual(@as(f64, (2 + 2 - 3 - 3) * 0.5), si.score(p, .{ .q = &q, .heads = 4 }, &key));
+    var relu = p;
+    relu.phi = .relu;
+    try testing.expectEqual(@as(f64, 2), si.score(relu, .{ .q = &q, .heads = 4 }, &key));
+}
+
+test "sparse index: shortcuts: dense and pool bypasses equal every stage scored, open block included" {
+    const n = 70;
+    const keys = try randoms(51, n * dim);
+    defer gpa.free(keys);
+    const q = try randoms(52, heads * dim);
+    defer gpa.free(q);
+    // block 8: up to 9 blocks; pool 9 keeps them all (bypass), topk 12 (dense up to 12 keys, with 2 sinks 14)
+    for ([_]si.Policy{ .{ .topk = 12, .block = 8, .pool_blocks = 9 }, .{ .topk = 12, .block = 8, .pool_blocks = 9, .sink = 2 }, .{ .topk = 12, .block = 8 } }) |p| {
+        for (0..n) |t| {
+            const a = try si.select(gpa, p, .{ .q = q, .heads = heads }, .{ .k = keys, .dim = dim }, t, null);
+            defer a.deinit(gpa);
+            const b = try si.selectStaged(gpa, p, .{ .q = q, .heads = heads }, .{ .k = keys, .dim = dim }, t, null);
+            defer b.deinit(gpa);
+            try testing.expectEqualSlices(u32, b.keys, a.keys);
+            if (t + 1 > si.budget(p, t)) try testing.expectEqualSlices(u32, b.pool, a.pool);
+        }
+    }
+    // planted: a pool of 3 blocks keeps fewer than all, so the shortcut must not apply there (staged differs from flat)
+    const small: si.Policy = .{ .topk = 12, .block = 8, .pool_blocks = 3 };
+    var differ = false;
+    for (24..n) |t| {
+        const a = try si.select(gpa, small, .{ .q = q, .heads = heads }, .{ .k = keys, .dim = dim }, t, null);
+        defer a.deinit(gpa);
+        const f = try si.select(gpa, .{ .topk = 12 }, .{ .q = q, .heads = heads }, .{ .k = keys, .dim = dim }, t, null);
+        defer f.deinit(gpa);
+        if (!std.mem.eql(u32, a.keys, f.keys)) differ = true;
+    }
+    try testing.expect(differ);
+}
+
+test "sparse index: NVFP4-stored keys move picks across the top-k boundary; flips counts them" {
+    const n = 512;
+    const w = 16; // NVFP4 groups of 16
+    const keys = try randoms(61, n * w);
+    defer gpa.free(keys);
+    var flipped: usize = 0;
+    var picks: usize = 0;
+    for (0..8) |i| {
+        const q = try randoms(70 + i, heads * w);
+        defer gpa.free(q);
+        const p: si.Policy = .{ .topk = 64 };
+        var fp = p;
+        fp.keys_nvfp4 = .{};
+        const a = try si.select(gpa, p, .{ .q = q, .heads = heads }, .{ .k = keys, .dim = w }, n - 1, null);
+        defer a.deinit(gpa);
+        const b = try si.select(gpa, fp, .{ .q = q, .heads = heads }, .{ .k = keys, .dim = w }, n - 1, null);
+        defer b.deinit(gpa);
+        try testing.expectEqual(a.keys.len, b.keys.len);
+        flipped += si.flips(a.keys, b.keys);
+        picks += a.keys.len;
+    }
+    // close scores near the boundary trade places, far ones never: some flips, most picks kept
+    try testing.expect(flipped > 0 and flipped * 4 < picks);
+    try testing.expectEqual(@as(usize, 0), si.flips(&.{ 1, 4, 9 }, &.{ 1, 4, 9 }));
+    try testing.expectEqual(@as(usize, 2), si.flips(&.{ 1, 4, 9 }, &.{ 1, 5, 8 }));
+}
