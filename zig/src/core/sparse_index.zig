@@ -30,16 +30,21 @@ pub const Query = struct { q: []const f64, heads: usize, weights: ?[]const f64 =
 /// Index keys [n, dim], position i at row i.
 pub const Keys = struct { k: []const f64, dim: usize };
 
-/// sum (or max) over heads of w_h * phi(q_h . key).
+/// The larger of a and b, NaN kept (as the kernels' (b > a || b != b) ? b : a).
+fn larger(a: f64, b: f64) f64 {
+    return if (b > a or std.math.isNan(b)) b else a;
+}
+
+/// sum (or max) over heads of w_h * phi(q_h . key); NaN propagates through phi and max.
 pub fn score(p: Policy, q: Query, key: []const f64) f64 {
     const dim = key.len;
     var acc: f64 = if (p.reduce == .max) -std.math.inf(f64) else 0;
     for (0..q.heads) |h| {
         var dot: f64 = 0;
         for (q.q[h * dim ..][0..dim], key) |a, b| dot += a * b;
-        if (p.phi == .relu) dot = @max(dot, 0);
+        if (p.phi == .relu and dot < 0) dot = 0;
         const w = if (q.weights) |ws| ws[h] else 1;
-        acc = if (p.reduce == .max) @max(acc, w * dot) else acc + w * dot;
+        acc = if (p.reduce == .max) larger(acc, w * dot) else acc + w * dot;
     }
     return acc;
 }
@@ -66,8 +71,8 @@ fn mandatory(p: Policy, t: usize, i: usize) bool {
     return i < p.sink or i + p.local > t;
 }
 
-/// Block b's summary over positions [b * block, min((b + 1) * block, t + 1)) into `out`.
-fn summarise(p: Policy, keys: Keys, b: usize, t: usize, out: []f64) void {
+/// Block b's summary over positions [b * block, min((b + 1) * block, t + 1)) into `out`; NaN propagates.
+pub fn summarise(p: Policy, keys: Keys, b: usize, t: usize, out: []f64) void {
     const lo = b * p.block;
     const hi = @min(lo + p.block, t + 1);
     @memset(out, if (p.summary == .max) -std.math.inf(f64) else 0);
@@ -77,7 +82,7 @@ fn summarise(p: Policy, keys: Keys, b: usize, t: usize, out: []f64) void {
         if (p.norm_first) {
             var ss: f64 = 0;
             for (k) |v| ss += v * v;
-            r = if (ss > 0) 1 / @sqrt(ss / @as(f64, @floatFromInt(keys.dim))) else 0;
+            r = if (ss > 0) 1 / @sqrt(ss / @as(f64, @floatFromInt(keys.dim))) else if (ss == 0) 0 else ss;
         }
         const take = switch (p.summary) {
             .first => i == lo,
@@ -85,7 +90,7 @@ fn summarise(p: Policy, keys: Keys, b: usize, t: usize, out: []f64) void {
             else => true,
         };
         if (take) for (out, k) |*o, v| {
-            o.* = if (p.summary == .max) @max(o.*, v * r) else o.* + v * r;
+            o.* = if (p.summary == .max) larger(o.*, v * r) else o.* + v * r;
         };
     }
     if (p.summary == .mean) for (out) |*o| {

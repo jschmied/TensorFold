@@ -180,3 +180,18 @@ test "sparse index: summaries: mean of unit keys and mean then compare differ on
     try testing.expectEqualSlices(u32, &.{ 4, 5, 6, 7 }, a.pool); // plain mean: block 1 (0.075 against 0.7)
     try testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3 }, b.pool); // unit keys: block 0 (1.06 against 1.0)
 }
+
+test "sparse index: NaN propagates through relu, a max over heads and blocks, and unit summaries (as the kernels)" {
+    const nan = std.math.nan(f64);
+    const q = [_]f64{ 1, -1 };
+    const key = [_]f64{nan};
+    try testing.expect(std.math.isNan(si.score(.{ .topk = 1 }, .{ .q = &q, .heads = 2 }, &key)));
+    try testing.expect(std.math.isNan(si.score(.{ .topk = 1, .reduce = .max }, .{ .q = &q, .heads = 2 }, &key)));
+    const keys = [_]f64{ 1, 2, nan, 3 };
+    var out: [2]f64 = undefined;
+    for ([_]si.Summary{ .max, .mean }) |s| for ([_]bool{ false, true }) |unit| {
+        si.summarise(.{ .topk = 1, .block = 2, .summary = s, .norm_first = unit }, .{ .k = &keys, .dim = 2 }, 0, 1, &out);
+        try testing.expect(std.math.isNan(out[0]));
+        try testing.expect(std.math.isNan(out[1]) == unit); // a plain summary keeps the other dim's 2 and 3
+    };
+}

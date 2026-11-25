@@ -31,6 +31,7 @@ pub const Sets = struct {
     idol_decoder: *@import("contract_idol_decoder.zig").Set,
     glm_moe: *@import("contract_glm_moe_direct.zig").Set,
     topk_rows: *@import("contract_topk_rows.zig").Set,
+    sparse_index: *@import("contract_sparse_index.zig").Set,
 
     /// Each set's kernels appended to `list`, in this order.
     pub fn init(gpu: check.Gpu, s: cuda.Stream, a: std.mem.Allocator, list: *std.ArrayList(g.Kernel), affine4: *cuda.qlinear.Affine4Kernels, cap: u32) !Sets {
@@ -84,6 +85,7 @@ pub const Sets = struct {
         const idol_decoder = try @import("contract_idol_decoder.zig").Set.init(gpu, s, a, list);
         const glm_moe = try @import("contract_glm_moe_direct.zig").Set.init(gpu, s, a, list);
         const topk_rows = try @import("contract_topk_rows.zig").Set.init(gpu, s, a, list);
+        const sparse_index = try @import("contract_sparse_index.zig").Set.init(gpu, s, a, list);
         return .{
             .gpa = gpu.gpa,
             .bf16_experts = bf16_experts,
@@ -107,10 +109,12 @@ pub const Sets = struct {
             .idol_decoder = idol_decoder,
             .glm_moe = glm_moe,
             .topk_rows = topk_rows,
+            .sparse_index = sparse_index,
         };
     }
 
     pub fn deinit(sets: Sets) void {
+        sets.sparse_index.deinit();
         sets.topk_rows.deinit();
         sets.glm_moe.deinit();
         sets.idol_decoder.deinit();
