@@ -77,10 +77,10 @@ pub const SparseIndex = struct {
         x.mod.unload();
     }
 
-    /// q bf16 [rows, h, 128]; w f32 [rows, h] or 0; counts i32 [rows] or 0; out f32 [rows, ld], -inf past a count.
+    /// q bf16 [rows, h, 128]; w f32 [rows, h] or 0; counts i32 [rows] or 0; out f32 [rows, ld], -inf from count to ld.
     pub fn runScores(x: *const SparseIndex, s: Stream, q: u64, k: u64, w: u64, counts: u64, out: u64, sh: Scores) !void {
         try checkScores(sh);
-        if (sh.rows == 0 or sh.n == 0) return;
+        if (sh.rows == 0 or sh.ld == 0) return;
         var a: launch_.Args = .{};
         for ([_]u64{ q, k }) |v| a.add(v);
         a.add(@as(i64, @intCast(sh.ks)));
@@ -90,7 +90,7 @@ pub const SparseIndex = struct {
         a.add(sh.scale);
         a.add(@backingInt(sh.phi));
         a.add(@backingInt(sh.reduce));
-        const grid: launch_.Dim3 = .{ .x = @intCast((sh.n + keys_a_block - 1) / keys_a_block), .y = @intCast(sh.rows), .z = 1 };
+        const grid: launch_.Dim3 = .{ .x = @intCast((sh.ld + keys_a_block - 1) / keys_a_block), .y = @intCast(sh.rows), .z = 1 };
         const smem: u32 = @intCast(sh.h * dim * 2 + sh.h * 4);
         try launch_.launch(x.scores, .{ .grid = grid, .block = .{ .x = keys_a_block }, .shared = smem }, s, &a);
     }

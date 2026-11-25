@@ -10,8 +10,14 @@ const Module = module.Module;
 const Function = module.Function;
 const Stream = stream_.Stream;
 
-/// Rows whose scores the 1,024-thread form takes (a decode step's few rows over many scores).
-pub const wide_rows = 8;
+/// The 1,024-thread form: at most one wave of rows (48 SMs) over 4,096 scores or more, GLM's select rule.
+pub const wide_rows = 48;
+pub const wide_scores = 4096;
+
+/// Whether run launches the 1,024-thread form.
+pub fn wide(sh: Shape) bool {
+    return sh.rows <= wide_rows and sh.ld >= wide_scores;
+}
 
 /// rows of scores `ld` apart; row r takes its first counts[r] (all `ld` when counts is 0); k picks a row at most.
 pub const Shape = struct { rows: usize, ld: usize, k: usize };
@@ -40,7 +46,7 @@ pub const TopkRows = struct {
     pub fn run(t: *const TopkRows, s: Stream, scores: u64, counts: u64, out: u64, picked: u64, sh: Shape) !void {
         try check(sh);
         if (sh.rows == 0) return;
-        try t.launchWith(if (sh.rows <= wide_rows) t.wide else t.narrow, if (sh.rows <= wide_rows) 1024 else 128, s, scores, counts, out, picked, sh);
+        try t.launchWith(if (wide(sh)) t.wide else t.narrow, if (wide(sh)) 1024 else 128, s, scores, counts, out, picked, sh);
     }
 
     /// One form for every row count (the contract runs both on the same rows).

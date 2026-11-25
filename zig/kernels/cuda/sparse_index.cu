@@ -19,9 +19,9 @@ __device__ __forceinline__ void scores(const __nv_bfloat16* q, const __nv_bfloat
   for (int i = threadIdx.x; i < H; i += KEYS) ws[i] = w ? w[r * H + i] : 1.0f;
   __syncthreads();
   const int64_t key = (int64_t)blockIdx.x * KEYS + threadIdx.x;
-  if (key >= n) return;
-  const int64_t limit = counts ? counts[r] : n;
-  if (key >= limit) {  // past the row's count
+  if (key >= ld) return;
+  const int64_t c = counts ? (int64_t)counts[r] : n, limit = c < 0 ? 0 : (c > n ? n : c);
+  if (key >= limit) {  // past the row's count (clamped to [0, n]), up to ld: no stale score is left
     out[r * ld + key] = -INFINITY;
     return;
   }
@@ -80,7 +80,7 @@ __device__ __forceinline__ void blocks(const __nv_bfloat16* k, int64_t ks, __nv_
 
 }  // namespace tf_iscore
 
-// grid (ceil(n / 64), rows), 64 threads, H * D * 2 + H * 4 bytes of dynamic shared memory.
+// grid (ceil(ld / 64), rows), 64 threads, H * D * 2 + H * 4 bytes of dynamic shared memory.
 extern "C" __global__ void __launch_bounds__(64)
     tf_index_scores(const __nv_bfloat16* q, const __nv_bfloat16* k, int64_t ks, const float* w, const int* counts,
                     float* out, int64_t ld, int n, int H, int hk, float scale, int relu, int max) {

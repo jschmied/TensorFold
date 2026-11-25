@@ -99,7 +99,12 @@ pub const Scores = struct {
     }
 
     fn sh(self: *const Scores) !gpu.Scores {
-        return gpu.scoresFor(self.policy(), D, self.shape.k, self.shape.rows, self.shape.n, self.ks(), self.shape.n);
+        return gpu.scoresFor(self.policy(), D, self.shape.k, self.shape.rows, self.shape.n, self.ks(), self.ld());
+    }
+
+    /// Score rows 37 wider than the keys: [n, ld) must come back -inf, not stale.
+    fn ld(self: *const Scores) usize {
+        return self.shape.n + 37;
     }
 
     pub fn prepare(self: *Scores, shape: c.Shape, fill: g.Fill, seed: u64) !bool {
@@ -144,6 +149,10 @@ pub const Scores = struct {
                 }
             },
         }
+        if (self.v != .short and shape.rows >= 3) {
+            self.counts[1] = 0; // planted: a row with no keys, all -inf
+            self.counts[2] = @intCast(shape.n + 5); // planted: past n, read as n (the stored count stays as told)
+        }
         const told = try a.dupe(i32, self.counts);
         defer a.free(told);
         if (self.v == .short) for (told) |*n| {
@@ -153,7 +162,7 @@ pub const Scores = struct {
         self.dev[1] = try self.rig.input(std.mem.sliceAsBytes(self.k));
         self.dev[2] = if (self.weighted()) try self.rig.input(std.mem.sliceAsBytes(self.w)) else 0;
         self.dev[3] = if (shape.rows == 1 and self.v != .short) 0 else try self.rig.input(std.mem.sliceAsBytes(told));
-        self.out = try self.rig.output(shape.rows * shape.n * 4);
+        self.out = try self.rig.output(shape.rows * self.ld() * 4);
         return true;
     }
 
@@ -163,7 +172,7 @@ pub const Scores = struct {
     }
 
     pub fn count(self: *Scores) usize {
-        return self.shape.rows * self.shape.n;
+        return self.shape.rows * self.ld();
     }
 
     /// Output (r, key) as sparse_index.score does it, a key head's group at a time; or the simulated sums of `acc`.
@@ -183,9 +192,10 @@ pub const Scores = struct {
         const p = self.policy();
         for (0..self.shape.rows) |r| {
             for (wf, 0..) |*y, h| y.* = if (self.weighted()) self.w[r * H + h] else 1;
-            for (0..self.shape.n) |key| {
-                const i = r * self.shape.n + key;
-                if (key >= @as(usize, @intCast(self.counts[r]))) {
+            const limit: usize = @intCast(std.math.clamp(self.counts[r], 0, @as(i32, @intCast(self.shape.n))));
+            for (0..self.ld()) |key| {
+                const i = r * self.ld() + key;
+                if (key >= limit) {
                     want[i] = -std.math.inf(f64);
                     if (mag) |m| m[i] = 0;
                     continue;

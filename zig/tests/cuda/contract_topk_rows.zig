@@ -18,15 +18,17 @@ fn noSums(_: c.Shape) usize {
 const rule = "sparse_index.select's positions on every row (NaN above +inf, -0 as +0), and the order keys descending " ++
     "(-0 as +0, any NaN above +inf), ties to the lower index, the picks ascending and -1 after them";
 
-/// How a test deviates from what it tells the kernel; `short` (the planted control) cuts each row's last score.
-pub const Plant = enum { none, short };
+/// Inputs: random levels, all tied, or subnormal (lost under flush-to-zero); `short`, the control: one score fewer.
+pub const Plant = enum { none, tied, subnormal, short };
 
 /// Shape: rows, scores a row (n) and picks (k). Kolibri 1.1's 2,048 of 16,384; GLM's and DeepSeek's widths.
 pub fn spec(plant: Plant) c.Spec {
-    const served = &[_]c.Shape{ .{ .rows = 1, .n = 16384, .k = 2048 }, .{ .rows = 4, .n = 16384, .k = 2048 }, .{ .rows = 24, .n = 4096, .k = 2048 }, .{ .rows = 6, .n = 65536, .k = 512 }, .{ .rows = 40, .n = 2048, .k = 1024 } };
+    const served = &[_]c.Shape{ .{ .rows = 1, .n = 16384, .k = 2048 }, .{ .rows = 4, .n = 16384, .k = 2048 }, .{ .rows = 16, .n = 16384, .k = 2048 }, .{ .rows = 24, .n = 4096, .k = 2048 }, .{ .rows = 6, .n = 65536, .k = 512 }, .{ .rows = 2, .n = 131072, .k = 2048 }, .{ .rows = 40, .n = 2048, .k = 1024 }, .{ .rows = 60, .n = 8192, .k = 2048 } };
     return .{
         .name = switch (plant) {
             .none => "cuda topk rows tf_topk_rows tf_topk_rows_wide",
+            .tied => "cuda topk rows tf_topk_rows tf_topk_rows_wide (every score tied)",
+            .subnormal => "cuda topk rows tf_topk_rows tf_topk_rows_wide (subnormal scores)",
             .short => "control: topk rows told each row one score fewer than it has",
         },
         .accum = .none,
@@ -106,9 +108,20 @@ pub const Rows = struct {
         for (0..shape.rows) |r| {
             for (self.host[r * shape.n ..][0..shape.n]) |*v| {
                 const level: f32 = @floatFromInt(@as(i32, @intCast(rng.uintLessThan(u32, 256))) - 128);
-                v.* = if (level == 0 and rng.boolean()) -0.0 else level * 0.125;
+                v.* = switch (self.plant_) {
+                    .tied => 0.5,
+                    // 256 subnormal levels either sign (bits below 2^23): all 0 under flush-to-zero
+                    .subnormal => @bitCast(@as(u32, @intCast(rng.uintLessThan(u32, 256))) * 4099 | (if (rng.boolean()) @as(u32, 0x80000000) else 0)),
+                    else => if (level == 0 and rng.boolean()) -0.0 else level * 0.125,
+                };
             }
-            self.host[r * shape.n + @as(usize, @intCast(self.counts[r])) - 1] = 100;
+            // each row's last score its best (tied rows stay tied; a subnormal row's best is subnormal too)
+            const best: f32 = switch (self.plant_) {
+                .tied => 0.5,
+                .subnormal => @bitCast(@as(u32, 0x7fffff)),
+                else => 100,
+            };
+            self.host[r * shape.n + @as(usize, @intCast(self.counts[r])) - 1] = best;
         }
         if (fill == .nonfinite) {
             const neg_nan: f32 = @bitCast(@as(u32, 0xffc00000));
@@ -130,7 +143,7 @@ pub const Rows = struct {
             told[2] = @intCast(shape.n + 7); // all n scores, none past the row
         }
         self.dev[0] = try self.rig.input(std.mem.sliceAsBytes(self.host));
-        self.dev[1] = if (shape.rows == 1 and self.plant_ == .none) 0 else try self.rig.input(std.mem.sliceAsBytes(told));
+        self.dev[1] = if (shape.rows == 1 and self.plant_ != .short) 0 else try self.rig.input(std.mem.sliceAsBytes(told));
         self.out = try self.rig.output(shape.rows * shape.k * 4);
         self.picked = try self.rig.output(shape.rows * 4);
         self.other = .{ try self.rig.scratch(shape.rows * shape.k * 4), try self.rig.scratch(shape.rows * 4) };
@@ -161,7 +174,7 @@ pub const Rows = struct {
         const x = self.shape;
         const got = try a.dupe(u8, try self.rig.outputBytes());
         defer a.free(got);
-        const wide = x.rows > topk.wide_rows;
+        const wide = !topk.wide(self.sh());
         try self.t.launchWith(if (wide) self.t.wide else self.t.narrow, if (wide) 1024 else 128, self.rig.s, self.dev[0], self.dev[1], self.other[0], self.other[1], self.sh());
         const outs = x.rows * x.k * 4;
         if (std.mem.indexOfDiff(u8, got[0..outs], try self.rig.bytes(self.other[0], outs))) |at| return self.fail("byte {d} of the picks differs between the 128- and 1,024-thread forms", .{at});
@@ -207,7 +220,7 @@ pub const Rows = struct {
 pub const Set = struct {
     gpa: std.mem.Allocator,
     t: topk.TopkRows,
-    tests: [2]Rows,
+    tests: [4]Rows,
 
     pub fn init(gpu: tc.Gpu, s: cuda.Stream, a: std.mem.Allocator, list: *std.ArrayList(g.Kernel)) !*Set {
         const set = try gpu.gpa.create(Set);
@@ -215,7 +228,7 @@ pub const Set = struct {
         set.gpa = gpu.gpa;
         set.t = try topk.TopkRows.load(gpu.d);
         errdefer set.t.unload();
-        for (&set.tests, [_]Plant{ .none, .short }) |*t, p| t.* = .{ .rig = .{ .gpu = gpu, .s = s }, .t = &set.t, .plant_ = p };
+        for (&set.tests, [_]Plant{ .none, .tied, .subnormal, .short }) |*t, p| t.* = .{ .rig = .{ .gpu = gpu, .s = s }, .t = &set.t, .plant_ = p };
         for (&set.tests) |*t| try list.append(a, t.kernel());
         return set;
     }
