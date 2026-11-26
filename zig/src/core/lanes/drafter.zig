@@ -26,7 +26,12 @@ pub const Facts = struct {
     slack: u32 = 0, // with chances: drafts a hold offers past the stream's last grant (0: the depth rule's own)
     copy_first: bool = false, // a hold costs a pass of its own: none is asked for a stream with a copy ahead
     hold_costs: []const @import("hold_price.zig").HoldCost = &.{}, // that pass's ms by blocks and depth (timed at load)
+    lazy_rows: u32 = 0, // kept rows a depth-0 stream may owe before the wrapper absorbs them (0: every round; at most owed_max)
+    absorb_ms: f64 = 0, // one absorb pass's ms (timed at load): with lazy_rows, a round pays it only when it holds drafts
 };
+
+/// Kept rows a stream may owe the drafter at most: one target feature view covers them.
+pub const owed_max = 64;
 
 /// Target rows [start, start + features.rows) and the token after each; `rows`, when given, picks which to absorb.
 pub const Absorb = struct {
@@ -46,6 +51,7 @@ pub const Hold = struct { stream: *Stream, pending: u32, position: u64, depth: u
 pub const Drafter = struct {
     kind: []const u8 = "draft model", // descriptive only; the loader identifies the implementation it attached
     proposal_head: ?*const @import("proposal_head.zig").Service = null,
+    lazy: bool = false, // it owes rows (Facts.lazy_rows): the wrapper hands out the first token before a draft
     ptr: *anyopaque,
     vtable: *const VTable,
 

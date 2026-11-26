@@ -11,8 +11,13 @@ const win = @import("windows.zig");
 
 /// Four drafting streams, three drafts each at 0.8 a depth; `holds` the drafter's pass. Each stream's reserved depth.
 fn round(holds: []const HoldCost) ![4]i64 {
+    return roundAbsorbing(holds, 0);
+}
+
+/// `round`, a lazy drafter's absorb pass of `absorb_ms` paid by a round that holds drafts.
+fn roundAbsorbing(holds: []const HoldCost, absorb_ms: f64) ![4]i64 {
     // forward 12 ms a row plus about 1 ms a row more; plain 4 rows ~15 ms, 16 drafted rows ~27.5 ms, fixed 8 ms
-    const model: @import("config.zig").Model = .{ .exact_width = 32, .mtp = true, .drafts = 3, .draft_prior = &.{0.8}, .plain_guard = true, .hidden_rows = true, .allocate_shared_drafts = true, .limit_shared_drafts = true, .hold_costs = holds, .window_costs = &.{ .{ .width = 1, .ms = 12 }, .{ .width = 32, .ms = 44 } } };
+    const model: @import("config.zig").Model = .{ .exact_width = 32, .mtp = true, .drafts = 3, .draft_prior = &.{0.8}, .plain_guard = true, .hidden_rows = true, .allocate_shared_drafts = true, .limit_shared_drafts = true, .hold_costs = holds, .absorb_ms = absorb_ms, .window_costs = &.{ .{ .width = 1, .ms = 12 }, .{ .width = 32, .ms = 44 } } };
     var cfg = try Config.init(a, model, 32, 3);
     defer cfg.deinit(a);
     var target: fake.Fake = .{ .gpa = a };
@@ -48,4 +53,9 @@ test "hold pass: a pass dearer than the drafts it buys falls back to copies (no 
 
 test "hold pass: no timed pass leaves the legacy cap as it was (the dear case's control)" {
     try t.expectEqualSlices(i64, &.{ 3, 3, 3, 3 }, &try round(&.{}));
+}
+
+test "hold pass: a lazy drafter's absorb pass joins the cheap pass's price, and past break-even the round takes copies" {
+    try t.expectEqualSlices(i64, &.{ 3, 3, 3, 3 }, &try roundAbsorbing(&cheap, 1));
+    try t.expectEqualSlices(i64, &.{ 0, 0, 0, 0 }, &try roundAbsorbing(&cheap, 35));
 }

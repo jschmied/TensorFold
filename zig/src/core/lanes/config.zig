@@ -53,6 +53,7 @@ pub const Model = struct {
     plain_streams: u32 = 0, // a shared round with this many streams or more drafts none (0: off)
     copy_first: bool = false, // a copy ahead takes the round: the head holds no drafts for it (a drafter's own pass)
     hold_costs: []const @import("hold_price.zig").HoldCost = &.{}, // a drafter's own hold pass, timed at load
+    absorb_ms: f64 = 0, // a lazy drafter's absorb pass (Facts.absorb_ms): paid by rounds that hold drafts
     head_trees: bool = false, // the head drafts trees of lanes (DraftRequest.lanes) and holds them
     join_tail: bool = false, // a prompt in pieces leaves its last token for the next shared round's window (Backend.join)
     piece_runs: bool = false, // a round's pieces go to the backend in one call (Backend.pieces: one forward over them)
@@ -199,6 +200,7 @@ pub const Config = struct {
                 .copy_first = m.copy_first and !m.context_copies,
                 .floor_rates = m.floor_rates,
                 .hold_costs = m.hold_costs,
+                .absorb_ms = m.absorb_ms,
             },
             .draft_step_ms = m.draft_step_ms,
             .shared_drafts = m.shared_drafts,

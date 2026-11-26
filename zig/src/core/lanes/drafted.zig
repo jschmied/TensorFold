@@ -14,6 +14,10 @@ const Lane = struct {
     tree_first: ?u32 = null, // the first token of the grown tree read back this round, until a verify carries it
     offered: u32 = 0, // the grown tree's nodes the last verify carried, told to the drafter with its kept rows
     stepped: ?u64 = null, // a prompt pass going a step at a time: the prompt rows the drafter has been given
+    owed_from: u64 = 0, // the first kept row the drafter has not absorbed (owed_n of them, depth-0 rounds')
+    owed_n: u32 = 0,
+    owed_follow: [dr.owed_max]u32 = undefined, // the token after each owed row, as its round gave it
+    prompt_from: ?u64 = null, // a lazy drafter's last prompt chunk from here, absorbed at the first draft
 };
 
 pub const Drafted = struct {
@@ -72,7 +76,7 @@ pub const Drafted = struct {
     };
     pub fn backend(x: *Drafted) be.Backend {
         const planned = if (x.drafter.proposal_head) |service| service.mode != .legacy and x.drafter.vtable.hold_planned != null and x.drafter.vtable.clear_proposals != null else false;
-        return .{ .proposal_head = x.drafter.proposal_head, .ptr = x, .round_observer = x.target.round_observer, .first_before_draft = x.target.first_before_draft, .keep_full_lone = x.target.keep_full_lone, .penalties = x.target.penalties, .chunk_invariant = x.target.chunk_invariant, .warm_images = x.target.warm_images, .vtable = vtableFor(planned, x.target.vtable.prefill_step != null and x.target.vtable.reports_fill and x.target.vtable.features != null, x.target.vtable.cancel_prefill != null, x.first_rows) };
+        return .{ .proposal_head = x.drafter.proposal_head, .ptr = x, .round_observer = x.target.round_observer, .first_before_draft = x.target.first_before_draft or x.drafter.lazy, .keep_full_lone = x.target.keep_full_lone, .penalties = x.target.penalties, .chunk_invariant = x.target.chunk_invariant, .warm_images = x.target.warm_images, .vtable = vtableFor(planned, x.target.vtable.prefill_step != null and x.target.vtable.reports_fill and x.target.vtable.features != null, x.target.vtable.cancel_prefill != null, x.first_rows) };
     }
 
     const cancellable: [4]be.Backend.VTable = blk: {
@@ -117,6 +121,7 @@ pub const Drafted = struct {
         m.head_trees = d.trees;
         m.copy_first = d.copy_first;
         m.hold_costs = d.hold_costs;
+        m.absorb_ms = if (d.lazy_rows > 0) d.absorb_ms else 0;
         if (d.chances and x.drafter.vtable.chances != null) {
             // a chain's drafts priced by the drafter's own chances; the next hold as deep as the grant and its slack
             m.draft_probabilities = d.confidence_floor == null;
@@ -176,6 +181,10 @@ pub const Drafted = struct {
         const from: usize = s.cached;
         if (ids.len < from + 2) return;
         const n: u32 = @intCast(ids.len - 1 - from);
+        if (x.drafter.facts().lazy_rows > 0) { // after the first token is out (first_before_draft): not in its latency
+            x.lanes.getPtr(s).?.prompt_from = from;
+            return;
+        }
         const f = try x.target.features(s, x.drafter.taps(), from, n);
         try x.drafter.absorb(&.{.{ .stream = s, .features = f, .start = from, .follow = ids[from + 1 ..] }});
     }
@@ -196,7 +205,9 @@ pub const Drafted = struct {
         const from = lane.stepped orelse s.cached; // a resumed pass starts at its kept state
         const to: u64 = if (done) s.prompt().len else s.fill_at.load(.monotonic);
         lane.stepped = if (done) null else to;
-        if (to > from) try take(x, s, try x.target.features(s, x.drafter.taps(), from, @intCast(to - from)), from);
+        if (to > from and done and x.drafter.facts().lazy_rows > 0) {
+            lane.prompt_from = from; // the last chunk's rows stay on the target until the next forward: the first draft's
+        } else if (to > from) try take(x, s, try x.target.features(s, x.drafter.taps(), from, @intCast(to - from)), from);
         return done;
     }
 
@@ -300,8 +311,10 @@ pub const Drafted = struct {
         x.absorbs.clearRetainingCapacity();
         x.holds.clearRetainingCapacity();
         try x.firsts.resize(x.gpa, requests.len);
+        const d = x.drafter.facts();
+        const lazy = @min(d.lazy_rows, dr.owed_max);
         for (requests, x.firsts.items) |r, *tok| {
-            if (r.lanes != null and !x.drafter.facts().trees) return error.TreesNotBuilt;
+            if (r.lanes != null and !d.trees) return error.TreesNotBuilt;
             const lane = x.lanes.getPtr(r.stream) orelse return error.NotDrafting;
             lane.filler = 0; // a new request supersedes fillers a copy round left unused
             var pending: u32 = undefined;
@@ -309,6 +322,16 @@ pub const Drafted = struct {
                 // a tree's kept path names the window's rows out of order: the features of all up to its last
                 var prefix = true;
                 for (rows, 0..) |row, i| prefix = prefix and row == i;
+                const next = lane.owed_from + lane.owed_n == r.start; // owed rows end where this verify began
+                const defer_ = prefix and r.depth == 0 and lane.offered == 0 and lane.owed_n + rows.len <= lazy and (lane.owed_n == 0 or next);
+                if (lane.owed_n > 0 and !defer_) try x.payDebt(r.stream, lane, next);
+                if (defer_) { // absorbed before the stream's next hold, with the rows of that round
+                    if (lane.owed_n == 0) lane.owed_from = r.start;
+                    @memcpy(lane.owed_follow[lane.owed_n..][0..rows.len], r.follow[0..rows.len]);
+                    lane.owed_n += @intCast(rows.len);
+                    lane.rows = true;
+                    continue;
+                }
                 const n: u32 = @intCast(if (prefix) rows.len else rows[rows.len - 1] + 1);
                 const f = try x.target.features(r.stream, x.drafter.taps(), r.start, n);
                 try x.absorbs.append(x.gpa, .{ .stream = r.stream, .features = f, .start = r.start, .follow = r.follow[0..rows.len], .rows = if (prefix) null else rows, .prompt = false, .propose = r.depth > 0, .offered = lane.offered });
@@ -316,6 +339,7 @@ pub const Drafted = struct {
                 pending = r.follow[rows.len - 1];
                 lane.rows = true;
             } else {
+                if (lane.owed_n > 0) try x.payDebt(r.stream, lane, true);
                 const feed = r.first orelse return error.NoFirstToken;
                 tok.* = switch (feed) {
                     .handle => |h| try x.target.read(h),
@@ -323,6 +347,12 @@ pub const Drafted = struct {
                 };
                 pending = tok.*;
                 const last = r.stream.prompt_len - 1;
+                if (lane.prompt_from) |from| if (from < last) { // a lazy drafter's prompt rows before its last
+                    const ids = r.stream.prompt();
+                    const f = try x.target.features(r.stream, x.drafter.taps(), from, @intCast(last - from));
+                    try x.absorbs.append(x.gpa, .{ .stream = r.stream, .features = f, .start = from, .follow = ids[@intCast(from + 1)..][0..@intCast(last - from)], .propose = r.depth > 0 });
+                };
+                lane.prompt_from = null;
                 if (r.stream.cached <= last) { // the pass computed the prompt's last row (not restored whole)
                     // right after this stream's own prompt pass: a target keeping one pass's taps refuses another's
                     const f = try x.target.features(r.stream, x.drafter.taps(), last, 1);
@@ -346,6 +376,14 @@ pub const Drafted = struct {
         }
         if (x.absorbs.items.len > 0) try x.drafter.absorb(x.absorbs.items);
         if (x.holds.items.len > 0) try x.drafter.hold(x.holds.items);
+    }
+
+    /// The owed rows, oldest first, ahead of this round's: one view of the target's features (at most owed_max rows).
+    fn payDebt(x: *Drafted, s: *Stream, lane: *Lane, contiguous: bool) !void {
+        if (!contiguous) return error.OwedRowsNotContiguous;
+        const f = try x.target.features(s, x.drafter.taps(), lane.owed_from, lane.owed_n);
+        try x.absorbs.append(x.gpa, .{ .stream = s, .features = f, .start = lane.owed_from, .follow = lane.owed_follow[0..lane.owed_n], .prompt = false, .propose = true });
+        lane.owed_n = 0; // the slice above stays valid: no other request of this round names this stream
     }
 
     /// A drafter-grown tree's node chances (false: none, so the rule's per-depth rates price it).

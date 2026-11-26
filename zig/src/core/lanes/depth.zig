@@ -326,7 +326,7 @@ pub const Rule = struct {
         var rows: f64 = @floatFromInt(streams);
         var tokens = rows;
         const plain = r.shared_costs.get(@intCast(streams)) orelse return;
-        const probe_ms = if (probes > 0) holdMs(r.k.hold_costs, probes, deepest) else 0;
+        const probe_ms = if (probes > 0) holdMs(r.k.hold_costs, probes, deepest) + r.k.absorb_ms else 0;
         var best = tokens / (plain + (if (paired) |p| p.plain else fixed) + probe_ms);
         var keep: usize = 0;
         for (order[0..m], 1..) |i, k| {
@@ -335,7 +335,7 @@ pub const Rule = struct {
             deepest = @max(deepest, out[i]);
             const verify = r.shared_costs.get(@intFromFloat(@ceil(rows))) orelse break;
             const extra = (if (paired) |p| p.row else r.row_cost.extraMs(streams, sampled)) * (rows - @as(f64, @floatFromInt(streams)));
-            const now = tokens / (verify + (if (extra < 0) @max(extra, plain - verify) else extra) + fixed + holdMs(r.k.hold_costs, k + probes, deepest));
+            const now = tokens / (verify + (if (extra < 0) @max(extra, plain - verify) else extra) + fixed + holdMs(r.k.hold_costs, k + probes, deepest) + r.k.absorb_ms);
             if (now > best) {
                 best = now;
                 keep = k;

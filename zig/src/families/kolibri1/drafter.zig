@@ -7,6 +7,7 @@ const be = @import("backend.zig");
 const kern = @import("kernels.zig");
 const wts = @import("weights.zig");
 const row_costs = @import("row_costs.zig");
+const tap = @import("taps.zig");
 
 const dr = lanes.drafter;
 const Stream = lanes.Stream;
@@ -46,6 +47,7 @@ pub const Drafter = struct {
     n_costs: usize = 0, // the widths the served streams' slots hold
     holds: [2 * hold_streams.len]lanes.hold_price.HoldCost = undefined, // a hold pass's ms by streams and depth
     n_holds: usize = 0,
+    absorb_ms: f64 = 0, // one absorb pass of a round's rows (timed at reserve): rounds that hold pay it
     timed: bool = false,
     lanes: std.AutoHashMapUnmanaged(*Stream, Lane) = .empty,
     free: []bool = &.{}, // drafter slot i is free (the last slot times a step and is never a stream's)
@@ -237,6 +239,7 @@ pub const Drafter = struct {
         x.free[streams] = false;
         x.step_ms = try x.time(streams);
         x.n_holds = try x.timeHolds(streams); // on the streams' slots: zeroed after, before any stream opens
+        x.absorb_ms = try x.timeAbsorb(streams);
         try x.clearCaches();
         x.n_costs = try row_costs.time(x.kb, x.io, &x.costs); // the depth rule trades drafts against rows by them
         x.timed = true;
@@ -291,8 +294,26 @@ pub const Drafter = struct {
         return n;
     }
 
+    /// An absorb pass of two rows a stream over up to 8 streams' slots, best of three: its weights read once.
+    fn timeAbsorb(x: *Drafter, streams: u32) !f64 {
+        const k: usize = @max(1, @min(streams, 8)); // usize: @min with 8 alone is a u4, and 2 * 8 overflows it
+        var rows: [16]E.Row = undefined;
+        for (rows[0 .. 2 * k], 0..) |*r, i| r.* = .{ .slot = @intCast(i / 2), .pos = @intCast(64 + i % 2), .token = 0 };
+        const part: E.Eagle3.Part = .{ .rows = rows[0 .. 2 * k], .taps = x.kb.m.tap_rows };
+        var best = std.math.inf(f64);
+        for (0..4) |round| {
+            const t0 = std.Io.Clock.awake.now(x.io);
+            try x.e.absorbMany(&.{part});
+            try x.kb.s.synchronize();
+            const ms = @as(f64, @floatFromInt(t0.durationTo(std.Io.Clock.awake.now(x.io)).toNanoseconds())) / 1e6;
+            if (round > 0) best = @min(best, ms);
+        }
+        std.log.info("Kolibri drafter absorb pass: {d} rows over {d} slots {d:.2} ms", .{ 2 * k, k, best });
+        return best;
+    }
+
     pub fn drafter(x: *Drafter) dr.Drafter {
-        return .{ .kind = "EAGLE-3", .ptr = x, .vtable = &.{ .taps = tapsFn, .facts = factsFn, .open = openFn, .absorb = absorbFn, .hold = holdFn, .held = heldFn, .release = releaseFn } };
+        return .{ .kind = "EAGLE-3", .lazy = true, .ptr = x, .vtable = &.{ .taps = tapsFn, .facts = factsFn, .open = openFn, .absorb = absorbFn, .hold = holdFn, .held = heldFn, .release = releaseFn } };
     }
 
     fn cast(ptr: *anyopaque) *Drafter {
@@ -309,7 +330,7 @@ pub const Drafter = struct {
         const x = cast(ptr);
         const costs: []const lanes.config.Cost = if (x.timed) x.costs[0..x.n_costs] else &.{};
         const holds: []const lanes.hold_price.HoldCost = if (x.timed) x.holds[0..x.n_holds] else &.{};
-        return .{ .limit_shared_drafts = true, .depth = x.depth, .step_ms = x.step_ms, .batched = true, .stream_bytes = x.e.dims.streamBytes(), .window_costs = costs, .lane_costs = costs, .hold_costs = holds };
+        return .{ .limit_shared_drafts = true, .depth = x.depth, .step_ms = x.step_ms, .batched = true, .stream_bytes = x.e.dims.streamBytes(), .window_costs = costs, .lane_costs = costs, .hold_costs = holds, .lazy_rows = tap.mirror, .absorb_ms = if (x.timed) x.absorb_ms else 0 };
     }
 
     fn openFn(ptr: *anyopaque, s: *Stream) anyerror!void {

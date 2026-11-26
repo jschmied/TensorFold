@@ -16,4 +16,5 @@ pub const Constants = struct {
     copy_first: bool = false, // a copy ahead takes the next round whole: the head drafts none for it (else one)
     floor_rates: bool = false, // under a confidence floor a greedy stream keeps its rates' depth too (else it drafts the most)
     hold_costs: []const @import("hold_price.zig").HoldCost = &.{}, // a drafter's own hold pass by blocks and depth: granted holds must pay for it
+    absorb_ms: f64 = 0, // a lazy drafter's absorb pass: a round holding drafts pays it, a round of copies not
 };

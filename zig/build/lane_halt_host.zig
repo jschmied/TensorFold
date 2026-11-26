@@ -29,6 +29,7 @@ pub fn steps(b: *std.Build) void {
     b.step("test-lane-api-host", "Shared lane host and engine API CPU regressions").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api })).step);
     b.step("test-shared-price-learning-host", "Independent plain prices and signed row learning together without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lanes, .filters = &.{ "shared combined prices:", "shared price modes:" } })).step);
     b.step("test-hold-pass-host", "A drafter's timed hold pass priced against copy rounds under a legacy cap, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lanes, .filters = &.{"hold pass:"} })).step);
+    b.step("test-lazy-absorb-host", "Depth-0 rows owed to a drafter and absorbed before its next hold, as eager absorbing, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lanes, .filters = &.{"lazy absorb:"} })).step);
     b.step("test-wait-reasons-host", "Stored wait reasons in the load ledger with a fake backend and planner").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api, .filters = &.{"wait reason ledger:"} })).step);
     const spares = b.step("test-cache-spares-host", "Fallback and guarded keeps preserve cache retention");
     for ([_][]const u8{ "lane_cache_promise_test.zig", "prompt_cache_promised_test.zig" }) |file| {

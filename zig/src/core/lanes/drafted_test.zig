@@ -50,7 +50,7 @@ pub const FakeDrafter = struct {
     }
 
     pub fn drafter(x: *FakeDrafter) dr.Drafter {
-        return .{ .ptr = x, .vtable = &.{ .taps = taps, .facts = facts, .open = open, .absorb = absorb, .hold = hold, .held = held, .release = release } };
+        return .{ .ptr = x, .lazy = x.facts_.lazy_rows > 0, .vtable = &.{ .taps = taps, .facts = facts, .open = open, .absorb = absorb, .hold = hold, .held = held, .release = release } };
     }
 
     fn self(ptr: *anyopaque) *FakeDrafter {
@@ -274,10 +274,11 @@ pub fn base() Model {
     return .{ .exact_width = 16, .gpu_tokens = true, .window_costs = &costs, .hidden_rows = true, .batch_rows = 32, .max_streams = 8 };
 }
 
+pub var lazy_rows: u32 = 0; // Facts.lazy_rows of run's drafter (drafted_lazy_test sets it)
 pub fn run(cases: []const Case, mode: Mode, batched: bool) !Out {
     var target: fake.Fake = .{ .gpa = gpa };
     defer target.deinit();
-    var head: FakeDrafter = .{ .facts_ = .{ .depth = 6, .step_ms = 0.5, .batched = batched } };
+    var head: FakeDrafter = .{ .facts_ = .{ .depth = 6, .step_ms = 0.5, .batched = batched, .lazy_rows = lazy_rows } };
     var strict: Strict = .{ .inner = target.backend() };
     defer strict.deinit();
     var target_backend = strict.backend();
@@ -285,7 +286,7 @@ pub fn run(cases: []const Case, mode: Mode, batched: bool) !Out {
     target_backend.penalties = mode == .wrapped_early;
     var wrapped = try Drafted.init(gpa, target_backend, head.drafter());
     defer wrapped.deinit();
-    try std.testing.expectEqual(mode == .wrapped_early, wrapped.backend().first_before_draft);
+    try std.testing.expectEqual(mode == .wrapped_early or lazy_rows > 0, wrapped.backend().first_before_draft);
     try std.testing.expectEqual(mode == .wrapped_early, wrapped.backend().penalties);
     var m = base();
     m.root_copies = cases[0].root_copies;
