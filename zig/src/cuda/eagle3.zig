@@ -15,6 +15,8 @@ const wa = @import("window_attention.zig");
 
 /// Rows one pass takes: an absorb goes in parts of this many, a hold's step takes one row a stream.
 pub const pass_rows = 256;
+/// A pass of more rows packs its outputs' rows past the last layer's keys (a prompt's); fewer run every row.
+pub const pack_rows = 64;
 
 pub const Dims = struct {
     hidden: usize,
@@ -40,6 +42,11 @@ pub const Dims = struct {
     /// Device bytes one stream's keys and values take (every layer's) and its last output.
     pub fn streamBytes(d: Dims) usize {
         return 2 * d.layers * d.ring() * d.att() * 2 + d.hidden * 2;
+    }
+
+    /// The first position a part ending at `end` computes: the rows its last output and later rows still read.
+    pub fn firstNeeded(d: Dims, end: u64) u64 {
+        return end -| (1 + d.layers * (d.window - 1));
     }
 
     fn attention(d: Dims) wa.Window {
@@ -175,6 +182,20 @@ pub const Eagle3 = struct {
         try x.toBf16(x.x.f, out, m * n);
     }
 
+    /// Rows `keep` of the staged pass (their queries, residuals, positions, slots) to the front, in order.
+    fn pack(x: *Eagle3, keep: []const usize) !void {
+        const dm = x.dims;
+        const q = dm.att() * 2;
+        const z = dm.hidden * 4;
+        for (keep, 0..) |r, j| {
+            if (r == j) continue;
+            for ([_][2]u64{ .{ x.x.q, q }, .{ x.x.z, z } }) |b| try x.d.check(x.d.api.cuMemcpyDtoDAsync_v2(b[0] + j * b[1], b[0] + r * b[1], b[1], x.s.handle), "cuMemcpyDtoDAsync");
+            x.host[pass_rows + j] = x.host[pass_rows + r];
+            x.host[2 * pass_rows + j] = x.host[2 * pass_rows + r];
+        }
+        for ([_]u64{ x.x.pos, x.x.slot }, 1..) |dst, at| try x.d.check(x.d.api.cuMemcpyHtoDAsync_v2(dst, &x.host[at * pass_rows], keep.len * 4, x.s.handle), "cuMemcpyHtoDAsync");
+    }
+
     /// The rows' tokens, positions and slots on the device (ids: the token embedded beside each row's state).
     fn stage(x: *Eagle3, rows: []const Row) !void {
         const n = rows.len;
@@ -186,8 +207,9 @@ pub const Eagle3 = struct {
         for ([_]u64{ x.x.ids, x.x.pos, x.x.slot }, 0..) |dst, j| try x.d.check(x.d.api.cuMemcpyHtoDAsync_v2(dst, &x.host[j * pass_rows], n * 4, x.s.handle), "cuMemcpyHtoDAsync");
     }
 
-    /// Staged rows: fc(cat(embed(token), state)) through every layer into `a`; `fused`: state is taps, fused first.
-    fn pass(x: *Eagle3, n: usize, state: u64, state_ld: usize, fused: bool) !void {
+    /// Staged rows through every layer into `a` (`fused`: taps fused first); `outs` (null: all) packed past the keys.
+    fn pass(x: *Eagle3, rows_in: usize, state: u64, state_ld: usize, fused: bool, outs: ?[]const usize) !void {
+        var n = rows_in;
         const dm = x.dims;
         const h = dm.hidden;
         const sx = x.x;
@@ -207,6 +229,10 @@ pub const Eagle3 = struct {
             const kv_at = i * x.slots * dm.ring() * att * 2;
             const out: @import("qk_rows.zig").Out = .{ .q = sx.q, .k = sx.k, .v = sx.v, .kc = x.kc + kv_at, .vc = x.vc + kv_at, .len = dm.ring() };
             try x.ops.qk.rows(x.s, sx.qkv, .{ .h = dm.heads, .hk = dm.heads, .dim = dm.head_dim }, shape, sx.pos, sx.slot, out, n);
+            if (i + 1 == x.w.layers.len) if (outs) |keep| if (keep.len < n) {
+                try x.pack(keep);
+                n = keep.len;
+            };
             try x.ops.win.decode(x.s, sx.q, x.kc + kv_at, x.vc + kv_at, sx.att, sx.pos, sx.slot, win, sx.part, n);
             try x.ops.dense.rows(x.s, sx.att, att, l.o, sx.f, h, n, h, att);
             try x.ops.norms.addRms(x.s, sx.f, .f32, sx.z, null, l.n2, sx.a, .bf16, n, h, dm.eps);
@@ -218,24 +244,27 @@ pub const Eagle3 = struct {
         }
     }
 
-    /// One stream's kept rows and its tapped rows [rows.len, taps * hidden] bf16 (a target's buffer).
-    pub const Part = struct { rows: []const Row, taps: u64 };
+    /// A stream's kept rows (positions rising) and their taps [rows.len, taps * hidden] bf16 (a target's buffer).
+    pub const Part = struct { rows: []const Row, taps: u64, end: u64 = 0 }; // end: later rows read on to here (a prompt's)
 
-    /// Every part's rows in as few passes as fit (weights read once a pass), taps staged; each slot's last output kept.
+    /// Every part's rows read (Dims.firstNeeded on) in as few passes as fit; each slot's last output kept.
     pub fn absorbMany(x: *Eagle3, parts: []const Part) !void {
         const dm = x.dims;
         if (x.slots == 0) return error.NoCaches;
         const row = dm.taps * dm.hidden * 2;
         var batch: [pass_rows]Row = undefined;
         var n: usize = 0;
-        for (parts) |p| {
+        for (parts) |whole| {
+            if (whole.rows.len == 0) continue;
+            for (whole.rows) |r| if (r.slot >= x.slots) return error.NoSuchDraftSlot;
+            const cut = dm.firstNeeded(@max(whole.end, @as(u64, whole.rows[whole.rows.len - 1].pos) + 1));
+            var skip: usize = 0;
+            while (skip < whole.rows.len and whole.rows[skip].pos < cut) skip += 1;
+            const p: Part = .{ .rows = whole.rows[skip..], .taps = whole.taps + skip * row };
             var at: usize = 0;
             while (at < p.rows.len) {
                 const take = @min(pass_rows - n, p.rows.len - at);
-                for (p.rows[at..][0..take], batch[n..][0..take]) |r, *b| {
-                    if (r.slot >= x.slots) return error.NoSuchDraftSlot;
-                    b.* = r;
-                }
+                @memcpy(batch[n..][0..take], p.rows[at..][0..take]);
                 try x.d.check(x.d.api.cuMemcpyDtoDAsync_v2(x.x.tin + n * row, p.taps + at * row, take * row, x.s.handle), "cuMemcpyDtoDAsync");
                 n += take;
                 at += take;
@@ -251,10 +280,19 @@ pub const Eagle3 = struct {
     fn absorbPass(x: *Eagle3, rows: []const Row) !void {
         const dm = x.dims;
         const n = rows.len;
+        var outs: [pass_rows]usize = undefined;
+        var k: usize = 0;
+        for (rows, 0..) |r, i| if (i + 1 == n or rows[i + 1].slot != r.slot) {
+            outs[k] = i;
+            k += 1;
+        };
         try x.stage(rows);
-        try x.pass(n, x.x.tin, dm.taps * dm.hidden, true);
-        for (rows, 0..) |r, i| if (i + 1 == n or rows[i + 1].slot != r.slot)
-            try x.d.check(x.d.api.cuMemcpyDtoDAsync_v2(x.out + r.slot * dm.hidden * 2, x.x.a + i * dm.hidden * 2, dm.hidden * 2, x.s.handle), "cuMemcpyDtoDAsync");
+        const packs = n > pack_rows; // a round's few rows: the weights cost the same, packing would only add copies
+        try x.pass(n, x.x.tin, dm.taps * dm.hidden, true, if (packs) outs[0..k] else null);
+        for (outs[0..k], 0..) |i, j| { // each slot's last row: row j of `a` when packed, else row i
+            const at = if (packs) j else i;
+            try x.d.check(x.d.api.cuMemcpyDtoDAsync_v2(x.out + rows[i].slot * dm.hidden * 2, x.x.a + at * dm.hidden * 2, dm.hidden * 2, x.s.handle), "cuMemcpyDtoDAsync");
+        }
     }
 
     /// `steps` draft-vocabulary indices for each item (slot, last absorbed position) into out[item]; a sync a step.
@@ -274,7 +312,7 @@ pub const Eagle3 = struct {
                 for (items, rows[0..n], 0..) |it, *r, i| r.* = .{ .slot = it.slot, .pos = it.pos + @as(u32, @intCast(j)), .token = map[out[i][j - 1]] };
                 try x.stage(rows[0..n]);
                 try x.d.check(x.d.api.cuMemcpyDtoDAsync_v2(x.x.st, x.x.a, n * h * 2, x.s.handle), "cuMemcpyDtoDAsync");
-                try x.pass(n, x.x.st, h, false);
+                try x.pass(n, x.x.st, h, false, null);
             }
             try x.ops.dense.rows(x.s, x.x.a, h, x.w.head, x.x.logits, dm.vocab, n, dm.vocab, h);
             var a: launch_.Args = .{};
@@ -298,4 +336,15 @@ test "a stream's ring holds the window, a pass and a chain in whole key tiles" {
     try std.testing.expectEqual(@as(usize, 2368), d.ring());
     try std.testing.expect(d.ring() >= d.window + pass_rows + d.chain and d.ring() % 64 == 0);
     try std.testing.expectEqual(@as(usize, 2 * 2368 * 2560 * 2 + 2560 * 2), d.streamBytes());
+}
+
+test "an absorb computes only the rows its last output and later rows read: a window back for one layer" {
+    const d: Dims = .{ .hidden = 2560, .heads = 20, .head_dim = 128, .ffn = 4096, .layers = 1, .taps = 3, .vocab = 32768, .window = 2048, .chain = 8, .eps = 1e-6 };
+    // a 7,900-row prompt part [0, 7899): its last row (7898) reads keys 5851..7898, the next row 5852..7899
+    try std.testing.expectEqual(@as(u64, 7899 - 2048), d.firstNeeded(7899));
+    try std.testing.expectEqual(@as(u64, 0), d.firstNeeded(2048));
+    try std.testing.expectEqual(@as(u64, 0), d.firstNeeded(5));
+    var two = d;
+    two.layers = 2; // a second layer's keys read the first layer's outputs a window further back
+    try std.testing.expectEqual(@as(u64, 7899 - 1 - 2 * 2047), two.firstNeeded(7899));
 }

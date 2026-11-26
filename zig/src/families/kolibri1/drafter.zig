@@ -347,7 +347,8 @@ pub const Drafter = struct {
         for (items) |it| {
             const f = it.features;
             if (f.rows == 0) continue;
-            try parts.append(x.gpa, .{ .rows = rows.items[at..][0..f.rows], .taps = f.buffer + f.offset });
+            const end = it.stream.prompt().len -| 1; // a prompt chunk's rows a window before the prompt's last are never read
+            try parts.append(x.gpa, .{ .rows = rows.items[at..][0..f.rows], .taps = f.buffer + f.offset, .end = end });
             at += f.rows;
             const l = x.lanes.getPtr(it.stream).?;
             l.pos = it.start + f.rows - 1;
