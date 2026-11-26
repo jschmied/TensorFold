@@ -270,8 +270,9 @@ pub const minimax_m3_dflash2 = @embedFile("minimax_m3/dflash2.metal");
 pub const minimax_m3_index_nax = @embedFile("minimax_m3/index_nax.metal");
 /// Flint's glue at the reference's rounding points: embed, norms, q/k rotation, SwiGLU, residual and MoE adds.
 pub const flint_glue = @embedFile("flint/glue.metal");
-/// Flint's attention on the tensor units: prompt tiles, decode partials and their merge, with sinks.
-pub const flint_attention_nax = @embedFile("flint/attention_nax.metal");
+/// Flint's prompt attention: core/prompt_attention_nax.metal as fl_prompt_attention with its learned sinks.
+pub const flint_attention_nax = "#define TF_PROMPT_ATTENTION fl_prompt_attention\n#define TF_PROMPT_SINKS\n" ++
+    prompt_attention_nax;
 /// Step-5's sparse indexer (summaries, scores, top-k) and its sliding, sparse and dense attention.
 pub const step5_sparse = @embedFile("step5/sparse.metal");
 /// Step-5's prompt attention on the tensor units (a KV group's 16 heads one operand; nax.h inlined at load).

@@ -1,8 +1,10 @@
-// Spark2.5's and Llama's prompt attention on the tensor units (gemma4's prompt kernel over a [slot, KVH, DH] cache).
+// Spark2.5's, Llama's and Flint's prompt attention on the tensor units (gemma4's kernel over a [slot, KVH, DH] cache).
 #include "../nax.h"
 using namespace tfp;
 
 // Defines: TF_PROMPT_ATTENTION (its name), DH, NQ, G (query heads a key head), KVH, WINDOW (0: full), RING, SCALE.
+
+// TF_PROMPT_SINKS: each query head's learned sink (SINKS, buffer 5) joins every row's sum as Flint's does.
 
 constant constexpr int LD = KVH * DH;
 constant constexpr float kMasked = -3.402823466e+38f;
@@ -74,6 +76,9 @@ inline void prob_put(threadgroup PT* pt, int r, int c, short2 home, thread const
 [[kernel]] void TF_PROMPT_ATTENTION(const device bfloat* Q [[buffer(0)]], const device bfloat* K [[buffer(1)]],
                                     const device bfloat* V [[buffer(2)]], device bfloat* O [[buffer(3)]],
                                     constant int2& P [[buffer(4)]],
+#ifdef TF_PROMPT_SINKS
+                                    const device bfloat* SINKS [[buffer(5)]],
+#endif
                                     uint sg [[simdgroup_index_in_threadgroup]],
                                     uint lane [[thread_index_in_simdgroup]], uint3 tg [[threadgroup_position_in_grid]]) {
   const int R = P.x, p0 = P.y;
@@ -183,17 +188,24 @@ inline void prob_put(threadgroup PT* pt, int r, int c, short2 home, thread const
       }
     }
   }
-  // the tile's totals: every simdgroup's partial sums, scaled alike by the shared maxes
+  // the tile's totals: every simdgroup's partial sums, scaled alike by the shared maxes (and the head's sink)
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (home.x == 0) {
     TF_UNROLL
     for (short j = 0; j < 4; j++) rowmax[sg][home.y + 8 * j] = total[j];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
+#ifdef TF_PROMPT_SINKS
+  const float sink = float(SINKS[qh]) * kLog2e;
+#endif
   float inv[4];
   TF_UNROLL
   for (short j = 0; j < 4; j++) {
+#ifdef TF_PROMPT_SINKS
+    float t = fast::exp2(sink - top[j]);
+#else
     float t = 0.0f;
+#endif
     for (int u = 0; u < NS; u++) t += rowmax[u][home.y + 8 * j];
     inv[j] = 1.0f / t;
   }

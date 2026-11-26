@@ -134,7 +134,7 @@ pub const Prompt = struct {
     fn base(sliding: bool) []const u8 {
         return if (sliding) "metal flint nax fl_prompt_attention sliding (513-key window, ring, sinks)" else "metal flint nax fl_prompt_attention full (sinks)";
     }
-    const no_sink: fl.Edit = .{ .kernel = "fl_prompt_attention", .from = "float t = fast::exp2(sink - top[j]);", .to = "float t = 0.0f;" };
+    const no_sink: fl.Edit = .{ .kernel = "TF_PROMPT_ATTENTION", .from = "float t = fast::exp2(sink - top[j]);", .to = "float t = 0.0f;" };
 
     /// Rows: a chunk's rows (past 16; the gates' small calls take fewer); n: the head dim; k: its first position.
     pub fn spec(name: []const u8, sliding: bool) c.Spec {
