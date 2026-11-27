@@ -51,6 +51,7 @@ pub const Kernels = struct {
     embed: cuda.Function,
     mix: cuda.Function,
     mix_rows: cuda.Function,
+    mix_roles: cuda.Function,
     rowdot: cuda.Function,
     topk: cuda.Function,
     conv: cuda.Function,
@@ -75,6 +76,7 @@ pub const Kernels = struct {
             .embed = try mod.function("tf_ink2_embed"),
             .mix = try mod.function("tf_ink2_mix"),
             .mix_rows = try mod.function("tf_ink2_mix_rows"),
+            .mix_roles = try mod.function("tf_ink2_mix_roles"),
             .rowdot = try mod.function("tf_ink2_rowdot"),
             .topk = try mod.function("tf_ink2_topk"),
             .conv = try mod.function("tf_ink2_conv"),
@@ -117,6 +119,21 @@ pub fn mix(k: *const Kernels, s: cuda.Stream, m: MixArgs) !void {
     var a: cuda.Args = .{};
     a.add(m);
     try go(if (m.rows <= 16) k.mix else k.mix_rows, s, .{ .x = @intCast(m.rows) }, 512, &a); // equal bits either way
+}
+
+/// Up to three independent mixes of one row count in one launch, blockIdx.z the role: each role's bits are mix's.
+pub fn mixRoles(k: *const Kernels, s: cuda.Stream, roles: []const MixArgs) !void {
+    if (roles.len == 0 or roles.len > max_queries) return error.Inkling2MixRoles;
+    for (roles) |m| if (m.rows != roles[0].rows or m.c > 10 * 512 or @rem(m.c, 128) != 0) return error.Inkling2MixRoles;
+    if (roles[0].rows > 16) {
+        for (roles) |m| try mix(k, s, m); // wide calls stay on mix_rows, a launch a role
+        return;
+    }
+    var r: [max_queries]MixArgs = undefined;
+    for (&r, 0..) |*d, i| d.* = roles[@min(i, roles.len - 1)];
+    var a: cuda.Args = .{};
+    a.add(r);
+    try go(k.mix_roles, s, .{ .x = @intCast(roles[0].rows), .z = @intCast(roles.len) }, 512, &a);
 }
 
 /// out[row, j] = x[row] . w[j] over `c` (bf16 in), `j` outputs a row, bf16 or fp32 out, sigmoid when `sigmoid`.

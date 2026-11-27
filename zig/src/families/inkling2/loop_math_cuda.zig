@@ -26,6 +26,8 @@ pub const Kernels = struct {
     messages_fn: cuda.Function,
     gate_down_fn: cuda.Function,
     gate_up_fn: cuda.Function,
+    gate_down_roles_fn: cuda.Function,
+    gate_up_roles_fn: cuda.Function,
     project_qkv_fn: cuda.Function,
     qkv_rows_fns: [3]cuda.Function, // decode QKV for at most 1, 4 and 16 rows
     round_bf16_fn: cuda.Function,
@@ -40,6 +42,8 @@ pub const Kernels = struct {
             .messages_fn = try mod.function("tf_ink2_loop_messages"),
             .gate_down_fn = try mod.function("tf_ink2_loop_gate_down"),
             .gate_up_fn = try mod.function("tf_ink2_loop_gate_up"),
+            .gate_down_roles_fn = try mod.function("tf_ink2_loop_gate_down_roles"),
+            .gate_up_roles_fn = try mod.function("tf_ink2_loop_gate_up_roles"),
             .project_qkv_fn = try mod.function("tf_ink2_loop_project_qkv"),
             .qkv_rows_fns = .{
                 try mod.function("tf_ink2_loop_qkv_rows1"),
@@ -133,6 +137,45 @@ pub fn gateUp(k: *const Kernels, s: cuda.Stream, state_f32: u64, message_f32: u6
     try go(k.gate_up_fn, s, .{ .x = @intCast(rows), .y = @intCast((c + 63) / 64) }, 64, &a);
 }
 
+/// One gate of a message site: its state, message, controller weights, own zeta scratch and output.
+pub const GateRole = struct { state_f32: u64, message_f32: u64, down_bf16: u64, forget_bf16: u64, gain_bf16: u64, zeta_bf16: u64, out_f32: u64 };
+
+/// loop_math.cu's GateRoles, field for field.
+const GateRolesArgs = extern struct {
+    h: [3]u64,
+    m: [3]u64,
+    down: [3]u64,
+    zeta: [3]u64,
+    forget: [3]u64,
+    gain: [3]u64,
+    out: [3]u64,
+    c: i32,
+    eps: f32,
+};
+
+/// Up to three gates of one row count, a down and an up launch, blockIdx.z the role: each role owns its zeta.
+pub fn gateRoles(k: *const Kernels, s: cuda.Stream, roles: []const GateRole, rows: usize, pairs: usize, c: usize, eps: f32) !void {
+    if (roles.len == 0 or roles.len > 3 or rows == 0 or c == 0 or pairs == 0 or pairs > rank / 2) return error.Inkling2LoopGateShape;
+    var g: GateRolesArgs = undefined;
+    for (0..3) |i| {
+        const r = roles[@min(i, roles.len - 1)];
+        g.h[i] = r.state_f32;
+        g.m[i] = r.message_f32;
+        g.down[i] = r.down_bf16;
+        g.zeta[i] = r.zeta_bf16;
+        g.forget[i] = r.forget_bf16;
+        g.gain[i] = r.gain_bf16;
+        g.out[i] = r.out_f32;
+    }
+    g.c = int(c);
+    g.eps = eps;
+    var a: cuda.Args = .{};
+    a.add(g);
+    const z: u32 = @intCast(roles.len);
+    try go(k.gate_down_roles_fn, s, .{ .x = @intCast(rows), .y = @intCast(pairs), .z = z }, 256, &a);
+    try go(k.gate_up_roles_fn, s, .{ .x = @intCast(rows), .y = @intCast((c + 63) / 64), .z = z }, 64, &a);
+}
+
 /// Mini QKV: normalized BF16 uq/uk/uv, query-side u_q; per-visit K/V conv/cache, then wo/post-conv; no history.
 pub fn projectQkv(
     k: *const Kernels,
@@ -183,6 +226,7 @@ pub fn roundBf16(k: *const Kernels, s: cuda.Stream, in_f32: u64, out_f32: u64, n
 
 test "loop math argument ABI and message role offsets" {
     try std.testing.expectEqual(@as(usize, 112), @sizeOf(ArArgs));
+    try std.testing.expectEqual(@as(usize, 7 * 24 + 8), @sizeOf(GateRolesArgs));
     const c = 2304;
     const j = 7;
     const row = 3;

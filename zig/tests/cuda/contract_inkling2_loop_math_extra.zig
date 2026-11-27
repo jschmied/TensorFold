@@ -7,6 +7,7 @@ const ink = @import("inkling2");
 const rig_ = @import("contract_rig.zig");
 const ref = @import("contract_inkling2_ops_ref.zig");
 const base = @import("contract_inkling2_loop_math.zig");
+const roles = @import("contract_inkling2_loop_roles.zig");
 
 const c = core.contract.spec;
 const g = core.contract.gates;
@@ -425,6 +426,7 @@ pub const Set = struct {
     qkvs: [3]K(ProjectQkv) = undefined,
     ars: [3]K(Ar) = undefined,
     rounds: [2]K(RoundBf16) = undefined,
+    gate_roles: [2]K(roles.Roles(.gate)) = undefined,
 
     pub fn init(set: *Set, gpu: check.Gpu, s: cuda.Stream, a: std.mem.Allocator, list: *std.ArrayList(g.Kernel)) !void {
         set.k = try lm.Kernels.load(gpu.d);
@@ -436,12 +438,13 @@ pub const Set = struct {
         for (&set.qkvs, 0..) |*x, i| x.* = .{ .inner = .{ .rig = rig, .k = .{ .kern = k, .shared_input = i == 1, .short_rows = i == 2 } } };
         for (&set.ars, 0..) |*x, i| x.* = .{ .inner = .{ .rig = rig, .k = .{ .kern = k, .partial_bf16 = i == 1, .short = i == 2 } } };
         for (&set.rounds, 0..) |*x, i| x.* = .{ .inner = .{ .rig = rig, .k = .{ .kern = k, .short = i == 1 } } };
-        inline for (.{ "messages", "gates", "qkvs", "ars", "rounds" }) |f| for (&@field(set, f)) |*x| try list.append(a, x.kernel());
+        for (&set.gate_roles, 0..) |*x, i| x.* = .{ .inner = .{ .rig = rig, .k = .init(k, if (i == 1) .shared else .none) } };
+        inline for (.{ "messages", "gates", "qkvs", "ars", "rounds", "gate_roles" }) |f| for (&@field(set, f)) |*x| try list.append(a, x.kernel());
     }
 
     pub fn deinit(set: *Set) void {
         if (!set.loaded) return;
-        inline for (.{ "messages", "gates", "qkvs", "ars", "rounds" }) |f| for (&@field(set, f)) |*x| x.deinit();
+        inline for (.{ "messages", "gates", "qkvs", "ars", "rounds", "gate_roles" }) |f| for (&@field(set, f)) |*x| x.deinit();
         set.k.unload();
         set.loaded = false;
     }

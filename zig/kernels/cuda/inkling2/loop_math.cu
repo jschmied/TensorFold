@@ -325,6 +325,29 @@ extern "C" __global__ void __launch_bounds__(64)
     ink2l::gateUp(h, m, zeta, forget, gain, out, c);
 }
 
+// A message site's gates, one launch a half: role z has its own state, message, weights, zeta and output.
+struct GateRoles {
+    const float* h[3];
+    const float* m[3];
+    const uint16_t* down[3];
+    uint16_t* zeta[3];
+    const uint16_t* forget[3];
+    const uint16_t* gain[3];
+    float* out[3];
+    int c;
+    float eps;
+};
+
+extern "C" __global__ void __launch_bounds__(256) tf_ink2_loop_gate_down_roles(const GateRoles r) {
+    const int z = blockIdx.z;
+    ink2l::gateDown(r.h[z], r.m[z], r.down[z], r.zeta[z], r.c, r.eps);
+}
+
+extern "C" __global__ void __launch_bounds__(64) tf_ink2_loop_gate_up_roles(const GateRoles r) {
+    const int z = blockIdx.z;
+    ink2l::gateUp(r.h[z], r.m[z], r.zeta[z], r.forget[z], r.gain[z], r.out[z], r.c);
+}
+
 // Mini QKV launch uses three independently normalized inputs; other kernels and cache/partial layouts are unchanged.
 extern "C" __global__ void __launch_bounds__(256)
     tf_ink2_loop_project_qkv(const uint16_t* __restrict__ uq, const uint16_t* __restrict__ uk,

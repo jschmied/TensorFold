@@ -99,18 +99,20 @@ pub fn forward(m: *Model, k: *const Kernels, s: cuda.Stream, chains: []const Cha
         const raw_stride = rows * h * 4;
         const norm_stride = rows * h * 2;
         if (messages) {
-            if (nq == 3) {
-                try loop_math.ar(&k.loop, s, m.arBlocks(blocks, partial, query, m.s.raw, 3, true, rows));
-            } else {
-                // A sliding layer stores one query; each gated role gets its own AR result from that query.
-                for (0..3) |role| try loop_math.ar(&k.loop, s, m.arBlocks(blocks, partial, query, m.s.raw + role * raw_stride, 1, true, rows));
-            }
+            // one sliding query: the roles' AR results are one, computed once into the space the mixes refill
+            const once = nq == 1;
+            try loop_math.ar(&k.loop, s, m.arBlocks(blocks, partial, query, if (once) m.s.normalized else m.s.raw, nq, true, rows));
+            var gates: [3]loop_math.GateRole = undefined;
+            var mixes: [3]ops.MixArgs = undefined;
             for (0..3) |role| {
                 const ctl = lw.controllers[role];
-                try loop_math.gate(&k.loop, s, m.s.raw + role * raw_stride, m.s.messages + role * raw_stride, ctl.down, ctl.forget, ctl.gain, m.s.zeta, m.s.raw + role * raw_stride, rows, h, c.eps);
-                const norms = [3]u64{ lw.attn.norms[role], lw.attn.norms[role], lw.attn.norms[role] };
-                try ops.mix(&k.glue, s, m.mixArgs(&.{}, m.s.raw + role * raw_stride, 0, norms, m.s.normalized + role * norm_stride, 1, false, rows));
+                const state = m.s.raw + role * raw_stride;
+                const zeta = m.s.zeta + role * rows * loop_math.rank * 2; // a zeta a role: the downs run at once
+                gates[role] = .{ .state_f32 = if (once) m.s.normalized else state, .message_f32 = m.s.messages + role * raw_stride, .down_bf16 = ctl.down, .forget_bf16 = ctl.forget, .gain_bf16 = ctl.gain, .zeta_bf16 = zeta, .out_f32 = state };
+                mixes[role] = m.mixArgs(&.{}, state, 0, @splat(lw.attn.norms[role]), m.s.normalized + role * norm_stride, 1, false, rows);
             }
+            try loop_math.gateRoles(&k.loop, s, &gates, rows, loop_math.rank / 2, h, c.eps);
+            try ops.mixRoles(&k.glue, s, &mixes);
         } else {
             try ops.mix(&k.glue, s, m.mixArgs(blocks, partial, query, lw.attn.norms, m.s.normalized, nq, true, rows));
         }

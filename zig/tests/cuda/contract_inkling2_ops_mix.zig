@@ -13,8 +13,8 @@ const ops = ref.ops;
 const small_hidden = ref.hidden;
 const mini_hidden = 2304;
 
-/// forward.zig's mixes: attention's (q, k and v queries, bf16 stream), the MLP's (fp32 residual), layer 0's (no query).
-pub const Form = enum { attn, mlp, first };
+/// The mixes: attention's (q, k, v queries), the MLP's (fp32 residual), layer 0's, a message role's (fp32, no query).
+pub const Form = enum { attn, mlp, first, message };
 
 /// The served kernel, or the control: tf_ink2_mix_rows told one completed block fewer than its rows hold.
 pub const Fault = enum { none, short };
@@ -89,7 +89,11 @@ pub const Mix = struct {
     }
 
     fn bf16Part(self: *const Mix) bool {
-        return self.form != .mlp;
+        return self.form != .mlp and self.form != .message;
+    }
+
+    fn queried(self: *const Mix) bool {
+        return self.form != .first and self.form != .message;
     }
 
     /// Values in [-2, 2) with one in 61 eight times larger, queries in [-1, 1); stress: integers in [-16, 16].
@@ -126,7 +130,7 @@ pub const Mix = struct {
             for (h, self.part) |*d, v| d.* = c.toBf16(v);
             m.partial = try ref.input(rig, h);
         } else m.partial = try ref.input(rig, self.part);
-        if (self.form != .first) m.query = try ref.input(rig, self.query);
+        if (self.queried()) m.query = try ref.input(rig, self.query);
         for (0..q) |j| m.norm[j] = try ref.input(rig, self.norm[j * C ..][0..C]);
         m.out = try rig.output(q * rows * C * 2);
         if (self.narrow) self.base = try rig.scratch(q * rows * C * 2);
@@ -182,7 +186,7 @@ pub const Mix = struct {
         for (0..rows) |r| {
             var rr: [ops.max_blocks + 1]Iv = undefined;
             var w: [ops.max_queries][ops.max_blocks + 1]Iv = undefined;
-            if (self.form != .first) {
+            if (self.queried()) {
                 for (0..n) |j| {
                     for (terms, 0..) |*t, col| t.* = Iv.of(self.at(j, r, col)).mul(Iv.of(self.at(j, r, col)));
                     rr[j] = ref.rms(s.sum(terms, d, scratch), C, 1e-6);
@@ -196,7 +200,7 @@ pub const Mix = struct {
             for (0..q) |qi| {
                 const hq = h[qi * C ..][0..C];
                 for (hq, 0..) |*v, col| {
-                    if (self.form == .first) {
+                    if (!self.queried()) {
                         v.* = Iv.of(self.at(n - 1, r, col));
                         continue;
                     }
@@ -204,7 +208,7 @@ pub const Mix = struct {
                     for (0..n) |j| acc = acc.add(w[qi][j].mul(Iv.of(self.at(j, r, col)).mul(rr[j])));
                     v.* = acc;
                 }
-                const st: Sums = if (self.form == .first) s else ref.later(s);
+                const st: Sums = if (!self.queried()) s else ref.later(s);
                 for (terms, hq) |*t, v| t.* = ref.sq(v).mul(Iv.of(1));
                 const rq = ref.rms(st.sum(terms, d, scratch), C, ref.eps);
                 for (out[(qi * rows + r) * C ..][0..C], hq, self.norm[qi * C ..][0..C]) |*o, v, nw| o.* = Iv.of(ref.bf(nw)).mul(v.mul(rq)).bf();

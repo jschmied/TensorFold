@@ -5,6 +5,7 @@ const check = @import("check.zig");
 const g = @import("core").contract.gates;
 const ref = @import("contract_inkling2_ops_ref.zig");
 const mix = @import("contract_inkling2_ops_mix.zig");
+const roles = @import("contract_inkling2_loop_roles.zig");
 const rows = @import("contract_inkling2_ops_rows.zig");
 const route = @import("contract_inkling2_ops_route.zig");
 const conv = @import("contract_inkling2_ops_conv.zig");
@@ -12,13 +13,14 @@ const pick = @import("contract_inkling2_ops_pick.zig");
 
 const G = ref.Gated;
 const K = ref.Checked;
-const groups = .{ "embeds", "mixes", "dots", "topks", "gateups", "convs", "rewinds", "caps", "tails", "top1s", "races", "tobfs", "words" };
+const groups = .{ "embeds", "mixes", "mix_roles", "dots", "topks", "gateups", "convs", "rewinds", "caps", "tails", "top1s", "races", "tobfs", "words" };
 
 pub const Set = struct {
     k: ref.Kernels = undefined,
     ex: cuda.exl3_experts.Experts = undefined,
     loaded: bool = false,
     mixes: [7]G(mix.Mix) = undefined,
+    mix_roles: [2]G(roles.Roles(.mix)) = undefined,
     embeds: [2]G(rows.Embed) = undefined,
     dots: [6]G(rows.Rowdot) = undefined,
     caps: [2]G(rows.Softcap) = undefined,
@@ -42,6 +44,7 @@ pub const Set = struct {
         const rig: @import("contract_rig.zig").Rig = .{ .gpu = gpu, .s = s };
         const forms = [_]mix.Form{ .attn, .mlp, .first, .attn, .mlp, .first, .mlp };
         for (&set.mixes, forms, 0..) |*x, f, i| x.* = .{ .rig = rig, .k = .{ .kern = k, .form = f, .narrow = i >= 3 and i < 6, .fault = if (i == 6) .short else .none } };
+        for (&set.mix_roles, 0..) |*x, i| x.* = .{ .rig = rig, .k = .init(k, if (i == 1) .shared else .none) };
         for (&set.embeds, 0..) |*x, i| x.* = .{ .rig = rig, .k = .{ .kern = k, .shifted = i == 1 } };
         const dots = [_]rows.Dot{ .router, .sink, .taps, .router, .taps, .router };
         for (&set.dots, dots, 0..) |*x, d, i| x.* = .{ .rig = rig, .k = .{ .kern = k, .dot = d, .tiles = i == 3 or i == 4, .short = i == 5 } };

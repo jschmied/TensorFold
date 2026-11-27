@@ -69,7 +69,7 @@ const Scratch = struct {
     bank0: u64,
     bank1: u64,
     raw: u64, // three FP32 AR/gate rows per token
-    zeta: u64, // a gate's 64 BF16 bottleneck values per token, between its down and up halves
+    zeta: u64, // each of a site's 3 gates' 64 BF16 bottleneck values per token, between its down and up halves
     messages: u64, // four FP32 message rows per token
     normalized: u64, // three BF16 rows per token
     t: u64,
@@ -260,7 +260,7 @@ pub const Model = struct {
             .bank0 = try m.alloc(rows * h * 2),
             .bank1 = try m.alloc(rows * h * 2),
             .raw = try m.alloc(3 * rows * h * 4),
-            .zeta = try m.alloc(rows * loop_math.rank * 2),
+            .zeta = try m.alloc(3 * rows * loop_math.rank * 2),
             .messages = try m.alloc(4 * rows * h * 4),
             .normalized = try m.alloc(3 * rows * h * 2),
             .t = try m.alloc(rows * h * 4),
