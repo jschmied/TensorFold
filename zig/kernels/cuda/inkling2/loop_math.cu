@@ -469,6 +469,80 @@ TF_INK2_QKV_ROWS(tf_ink2_loop_qkv_rows1, 1)
 TF_INK2_QKV_ROWS(tf_ink2_loop_qkv_rows4, 4)
 TF_INK2_QKV_ROWS(tf_ink2_loop_qkv_rows16, 16)
 
+// Prompt QKV, rows > 128, c % 32 == 0: 128x64 tiles, a thread 8 rows x 4 outputs, each one fmaf chain over k in order
+extern "C" __global__ void __launch_bounds__(256)
+    tf_ink2_loop_project_qkv_prompt(const uint16_t* __restrict__ uq, const uint16_t* __restrict__ uk,
+                                    const uint16_t* __restrict__ uv, const uint16_t* __restrict__ wq,
+                                    const uint16_t* __restrict__ wk, const uint16_t* __restrict__ wv,
+                                    uint16_t* __restrict__ raw_q, uint16_t* __restrict__ raw_k,
+                                    uint16_t* __restrict__ raw_v, int rows, int c, int q_width, int kv_width) {
+    constexpr int kRows = 128, kOuts = 64, kSlice = 32;
+    __shared__ __align__(16) float xs[kSlice][kRows];
+    __shared__ __align__(16) float ws[kSlice][kOuts];
+    const int role = blockIdx.z;  // q=0, k=1, v=2
+    const int width = role == 0 ? q_width : kv_width;
+    const int row0 = static_cast<int>(blockIdx.x) * kRows;
+    const int j0 = static_cast<int>(blockIdx.y) * kOuts;
+    if (j0 >= width) return;
+    const uint16_t* x = role == 0 ? uq : role == 1 ? uk : uv;
+    const uint16_t* w = role == 0 ? wq : role == 1 ? wk : wv;
+    const int t = threadIdx.x, tj = t % 16, tr = t / 16;
+    // staging: x as 512 16-byte pieces (2 a thread), w as 256 (1 a thread); a row's 32 columns are 4 pieces
+    uint4 px[2], pw;
+    auto fetch = [&](int k0) {
+        for (int i = 0; i < 2; ++i) {
+            const int e = t + 256 * i, r = row0 + e / 4;
+            px[i] = r < rows ? __ldg(reinterpret_cast<const uint4*>(x + static_cast<size_t>(r) * c + k0) + e % 4)
+                             : make_uint4(0, 0, 0, 0);
+        }
+        const int j = j0 + t / 4;
+        pw = j < width ? __ldg(reinterpret_cast<const uint4*>(w + static_cast<size_t>(j) * c + k0) + t % 4)
+                       : make_uint4(0, 0, 0, 0);
+    };
+    auto put = [](float* col, int stride, uint4 v) {
+        const uint32_t u[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+        for (int q = 0; q < 8; ++q) col[q * stride] = ink2l::bf(static_cast<uint16_t>(u[q >> 1] >> (16 * (q & 1))));
+    };
+    float acc[8][4];
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) acc[i][j] = 0.0f;
+    fetch(0);
+    for (int k0 = 0; k0 < c; k0 += kSlice) {
+        __syncthreads();
+        for (int i = 0; i < 2; ++i) {
+            const int e = t + 256 * i;
+            put(&xs[8 * (e % 4)][e / 4], kRows, px[i]);
+        }
+        put(&ws[8 * (t % 4)][t / 4], kOuts, pw);
+        __syncthreads();
+        if (k0 + kSlice < c) fetch(k0 + kSlice);
+#pragma unroll 8
+        for (int k = 0; k < kSlice; ++k) {
+            const float4 a0 = *reinterpret_cast<const float4*>(&xs[k][8 * tr]);
+            const float4 a1 = *reinterpret_cast<const float4*>(&xs[k][8 * tr + 4]);
+            const float4 b = *reinterpret_cast<const float4*>(&ws[k][4 * tj]);
+            const float a[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w}, bv[4] = {b.x, b.y, b.z, b.w};
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) acc[i][j] = __fmaf_rn(a[i], bv[j], acc[i][j]);
+        }
+    }
+    uint16_t* out = role == 0 ? raw_q : role == 1 ? raw_k : raw_v;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int row = row0 + 8 * tr + i;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int col = j0 + 4 * tj + j;
+            if (row < rows && col < width) out[static_cast<size_t>(row) * width + col] = ink2l::tobf(acc[i][j]);
+        }
+    }
+}
+
 // Global dynamic taps: dot in FP32, store as BF16, and widen to FP32 before the convolution.
 extern "C" __global__ void __launch_bounds__(256)
     tf_ink2_loop_round_bf16(const float* __restrict__ in, float* __restrict__ out, long long n) {

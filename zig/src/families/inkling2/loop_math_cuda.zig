@@ -29,6 +29,7 @@ pub const Kernels = struct {
     gate_down_roles_fn: cuda.Function,
     gate_up_roles_fn: cuda.Function,
     project_qkv_fn: cuda.Function,
+    qkv_prompt_fn: cuda.Function, // prompt QKV past a decode round's 128 rows
     qkv_rows_fns: [3]cuda.Function, // decode QKV for at most 1, 4 and 16 rows
     round_bf16_fn: cuda.Function,
 
@@ -45,6 +46,7 @@ pub const Kernels = struct {
             .gate_down_roles_fn = try mod.function("tf_ink2_loop_gate_down_roles"),
             .gate_up_roles_fn = try mod.function("tf_ink2_loop_gate_up_roles"),
             .project_qkv_fn = try mod.function("tf_ink2_loop_project_qkv"),
+            .qkv_prompt_fn = try mod.function("tf_ink2_loop_project_qkv_prompt"),
             .qkv_rows_fns = .{
                 try mod.function("tf_ink2_loop_qkv_rows1"),
                 try mod.function("tf_ink2_loop_qkv_rows4"),
@@ -195,24 +197,40 @@ pub fn projectQkv(
     kv_width: usize,
 ) !void {
     const at = [9]u64{ u_q, u_k, u_v, wq, wk, wv, raw_q, raw_k, raw_v };
-    return qkvLaunch(k, s, at, rows, c, q_width, kv_width, rows <= 16 and c % 64 == 0);
+    return qkvLaunch(k, s, at, rows, c, q_width, kv_width, qkvForm(rows, c, &at));
 }
 
 /// tf_ink2_loop_project_qkv's 16x16 tiles at any row count (projectQkv's order): the decode kernels' baseline.
 pub fn projectQkvTiles(k: *const Kernels, s: cuda.Stream, at: [9]u64, rows: usize, c: usize, q_width: usize, kv_width: usize) !void {
-    return qkvLaunch(k, s, at, rows, c, q_width, kv_width, false);
+    return qkvLaunch(k, s, at, rows, c, q_width, kv_width, .tiles);
 }
 
-fn qkvLaunch(k: *const Kernels, s: cuda.Stream, at: [9]u64, rows: usize, c: usize, q_width: usize, kv_width: usize, decode: bool) !void {
+/// The prompt kernel's 16-byte loads need the six input and weight bases 16-byte aligned (c % 32 keeps rows so).
+fn aligned(at: []const u64) bool {
+    for (at[0..6]) |p| if (p % 16 != 0) return false;
+    return true;
+}
+
+fn qkvForm(rows: usize, c: usize, at: []const u64) QkvForm {
+    if (rows <= 16 and c % 64 == 0) return .decode;
+    return if (rows > 128 and c % 32 == 0 and aligned(at)) .prompt else .tiles;
+}
+
+/// The QKV kernels: 16x16 tiles, decode's warps (rows <= 16), the prompt's 128x64 tiles (rows > 128); one sum order.
+const QkvForm = enum { tiles, decode, prompt };
+
+fn qkvLaunch(k: *const Kernels, s: cuda.Stream, at: [9]u64, rows: usize, c: usize, q_width: usize, kv_width: usize, form: QkvForm) !void {
     if (rows == 0 or c == 0 or q_width == 0 or kv_width == 0) return error.Inkling2LoopQkvShape;
     var a: cuda.Args = .{};
     for (at) |v| a.add(v);
     for ([_]i32{ int(rows), int(c), int(q_width), int(kv_width) }) |v| a.add(v);
-    if (decode) { // a warp 32 outputs, the same sums in the same order
+    const widest = @max(q_width, kv_width);
+    if (form == .decode) { // a warp 32 outputs, the same sums in the same order
         const f = k.qkv_rows_fns[if (rows == 1) 0 else if (rows <= 4) 1 else 2];
-        return go(f, s, .{ .x = @intCast((@max(q_width, kv_width) + 31) / 32), .y = 3 }, 32, &a);
+        return go(f, s, .{ .x = @intCast((widest + 31) / 32), .y = 3 }, 32, &a);
     }
-    try go(k.project_qkv_fn, s, .{ .x = @intCast((rows + 15) / 16), .y = @intCast((@max(q_width, kv_width) + 15) / 16), .z = 3 }, 256, &a);
+    if (form == .prompt) return go(k.qkv_prompt_fn, s, .{ .x = @intCast((rows + 127) / 128), .y = @intCast((widest + 63) / 64), .z = 3 }, 256, &a);
+    try go(k.project_qkv_fn, s, .{ .x = @intCast((rows + 15) / 16), .y = @intCast((widest + 15) / 16), .z = 3 }, 256, &a);
 }
 
 /// BF16-round FP32 then widen, preserving section 6.3 unlike rowdot(false); in/out may alias, no scratch, n=0 no-op.
@@ -237,4 +255,22 @@ test "loop math argument ABI and message role offsets" {
         const queries = @as(usize, 2 * j + @as(usize, @intFromBool(i == 2 or i == 3))) * c;
         try std.testing.expect(at >= base and queries < 24 * c);
     }
+}
+
+test "projectQkv: which kernel a call takes" {
+    const t = std.testing;
+    const at: [9]u64 = @splat(0);
+    try t.expectEqual(QkvForm.decode, qkvForm(16, 2304, &at));
+    try t.expectEqual(QkvForm.tiles, qkvForm(17, 2304, &at));
+    try t.expectEqual(QkvForm.tiles, qkvForm(128, 2304, &at)); // a decode round's rows keep the 16x16 kernel
+    try t.expectEqual(QkvForm.prompt, qkvForm(129, 2304, &at));
+    try t.expectEqual(QkvForm.tiles, qkvForm(129, 2304 + 16, &at)); // c % 32
+    for (0..6) |i| { // each input or weight base alone off 16-byte alignment falls back
+        var off = at;
+        off[i] = 2;
+        try t.expectEqual(QkvForm.tiles, qkvForm(129, 2304, &off));
+    }
+    var outs = at; // the outputs' bases do not matter (scalar stores)
+    outs[6] = 2;
+    try t.expectEqual(QkvForm.prompt, qkvForm(129, 2304, &outs));
 }

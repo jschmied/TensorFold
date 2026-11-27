@@ -34,13 +34,27 @@ const qkv_shapes = [_]c.Shape{
     .{ .rows = 2048, .n = 384, .k = 128 },
     .{ .rows = 3, .n = 3072, .k = mini_h },
     .{ .rows = 9, .n = 3072, .k = mini_h },
+    // the prompt kernel (rows > 128): part tiles of rows and outputs, Mini's widths
+    .{ .rows = 130, .n = 96, .k = 64 },
+    .{ .rows = 257, .n = 384, .k = mini_h },
+    .{ .rows = 129, .n = 3072, .k = mini_h },
+    // either side of the 16/128-row switches, and k off the prompt kernel's 32-column slices (it falls back)
+    .{ .rows = 127, .n = 96, .k = 64 },
+    .{ .rows = 128, .n = 96, .k = 64 },
+    .{ .rows = 255, .n = 96, .k = 64 },
+    .{ .rows = 256, .n = 96, .k = 64 },
+    .{ .rows = 129, .n = 96, .k = 31 },
+    .{ .rows = 129, .n = 96, .k = 32 },
+    .{ .rows = 129, .n = 96, .k = 33 },
 };
 
-/// Distinct q/k/v rows; controls: the Small single-input aliasing bug, and a decode launch told one row fewer.
+/// Distinct q/k/v rows; controls: Small's one-input aliasing, decode one row fewer, prompt one 32-column slice fewer.
 pub const ProjectQkv = struct {
     kern: *const lm.Kernels,
     shared_input: bool = false,
     short_rows: bool = false,
+    short_k: bool = false,
+    offset: bool = false, // every input and weight 2 bytes past 16-byte alignment: the prompt shapes fall back
     shape: c.Shape = undefined,
     u: [3][]u16 = .{ &.{}, &.{}, &.{} },
     w: [3][]u16 = .{ &.{}, &.{}, &.{} },
@@ -53,10 +67,15 @@ pub const ProjectQkv = struct {
             "control: Mini split QKV projection using Small's one normalized input for all roles"
         else if (self.short_rows)
             "control: inkling2 loop decode QKV (tf_ink2_loop_qkv_rows4/16) told one row fewer than it holds"
+        else if (self.short_k)
+            "control: inkling2 loop prompt QKV (tf_ink2_loop_project_qkv_prompt) told one 32-column slice fewer"
+        else if (self.offset)
+            "inkling2 loop QKV with inputs and weights 2 bytes off 16-byte alignment (prompt rows fall back to 16x16)"
         else
-            "inkling2 loop tf_ink2_loop_project_qkv + decode tf_ink2_loop_qkv_rows1/4/16 (distinct q/k/v inputs, same raw layouts)";
-        const control_shapes = if (self.short_rows) qkv_shapes[3..5] else qkv_shapes[0..2];
-        return .{ .name = name, .accum = .f32, .depth = depth, .out = .bf16, .served = if (self.shared_input or self.short_rows) control_shapes else &qkv_shapes, .replaces = "tf_ink2_loop_project_qkv" };
+            "inkling2 loop tf_ink2_loop_project_qkv + decode qkv_rows1/4/16 + prompt project_qkv_prompt (distinct q/k/v inputs)";
+        const control_shapes = if (self.short_rows) qkv_shapes[3..5] else if (self.short_k or self.offset) qkv_shapes[5..7] else qkv_shapes[0..2];
+        const controlled = self.shared_input or self.short_rows or self.short_k or self.offset;
+        return .{ .name = name, .accum = .f32, .depth = depth, .out = .bf16, .served = if (controlled) control_shapes else &qkv_shapes, .replaces = "tf_ink2_loop_project_qkv" };
     }
 
     fn depth(s: c.Shape) usize {
@@ -64,7 +83,7 @@ pub const ProjectQkv = struct {
     }
 
     pub fn control(self: *const ProjectQkv) ?g.Gate {
-        return if (self.shared_input or self.short_rows) .shapes else null;
+        return if (self.shared_input or self.short_rows or self.short_k) .shapes else null;
     }
 
     pub fn free(self: *ProjectQkv, a: std.mem.Allocator) void {
@@ -103,17 +122,26 @@ pub const ProjectQkv = struct {
             };
         }
         if (fill == .nonfinite) for (&self.u) |*x| ref.plant(u16, x.*, shape.rows, shape.k, ref.asBf);
-        for (self.u, 0..) |x, i| self.dev[i] = try ref.input(rig, x);
-        for (self.w, 0..) |x, i| self.dev[3 + i] = try ref.input(rig, x);
+        for (self.u, 0..) |x, i| self.dev[i] = try self.upload(a, rig, x);
+        for (self.w, 0..) |x, i| self.dev[3 + i] = try self.upload(a, rig, x);
         for (0..3) |role| self.out[role] = try rig.output(shape.rows * (if (role == 0) shape.n else shape.n / 3) * 2);
         self.base = try rig.scratch(shape.rows * shape.n * 5 / 3 * 2);
         return true;
     }
 
+    fn upload(self: *const ProjectQkv, a: std.mem.Allocator, rig: *rig_.Rig, x: []const u16) !u64 {
+        if (!self.offset) return ref.input(rig, x);
+        const p = try a.alloc(u16, x.len + 1);
+        defer a.free(p);
+        p[0] = 0;
+        @memcpy(p[1..], x);
+        return (try ref.input(rig, p)) + 2;
+    }
+
     pub fn run(self: *ProjectQkv, rig: *rig_.Rig) !void {
         const k = if (self.shared_input) self.dev[0] else self.dev[1];
         const v = if (self.shared_input) self.dev[0] else self.dev[2];
-        try lm.projectQkv(self.kern, rig.s, self.dev[0], k, v, self.dev[3], self.dev[4], self.dev[5], self.out[0], self.out[1], self.out[2], self.shape.rows - @intFromBool(self.short_rows), self.shape.k, self.shape.n, self.shape.n / 3);
+        try lm.projectQkv(self.kern, rig.s, self.dev[0], k, v, self.dev[3], self.dev[4], self.dev[5], self.out[0], self.out[1], self.out[2], self.shape.rows - @intFromBool(self.short_rows), self.shape.k - @as(usize, if (self.short_k) 32 else 0), self.shape.n, self.shape.n / 3);
     }
 
     /// tf_ink2_loop_project_qkv's tiles on the same distinct inputs, which decode replaced: gate 3 wants its bytes.
@@ -423,7 +451,7 @@ pub const Set = struct {
     loaded: bool = false,
     messages: [2]K(Messages) = undefined,
     gates: [3]K(Gate) = undefined,
-    qkvs: [3]K(ProjectQkv) = undefined,
+    qkvs: [5]K(ProjectQkv) = undefined,
     ars: [3]K(Ar) = undefined,
     rounds: [2]K(RoundBf16) = undefined,
     gate_roles: [2]K(roles.Roles(.gate)) = undefined,
@@ -435,7 +463,7 @@ pub const Set = struct {
         const rig: rig_.Rig = .{ .gpu = gpu, .s = s };
         for (&set.messages, 0..) |*x, i| x.* = .{ .inner = .{ .rig = rig, .k = .{ .kern = k, .aliased = i == 1 } } };
         for (&set.gates, 0..) |*x, i| x.* = .{ .inner = .{ .rig = rig, .k = .{ .kern = k, .fault = @fromBackingInt(@intCast(i)) } } };
-        for (&set.qkvs, 0..) |*x, i| x.* = .{ .inner = .{ .rig = rig, .k = .{ .kern = k, .shared_input = i == 1, .short_rows = i == 2 } } };
+        for (&set.qkvs, 0..) |*x, i| x.* = .{ .inner = .{ .rig = rig, .k = .{ .kern = k, .shared_input = i == 1, .short_rows = i == 2, .short_k = i == 3, .offset = i == 4 } } };
         for (&set.ars, 0..) |*x, i| x.* = .{ .inner = .{ .rig = rig, .k = .{ .kern = k, .partial_bf16 = i == 1, .short = i == 2 } } };
         for (&set.rounds, 0..) |*x, i| x.* = .{ .inner = .{ .rig = rig, .k = .{ .kern = k, .short = i == 1 } } };
         for (&set.gate_roles, 0..) |*x, i| x.* = .{ .inner = .{ .rig = rig, .k = .init(k, if (i == 1) .shared else .none) } };
