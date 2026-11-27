@@ -47,6 +47,7 @@ pub const Kernels = struct {
     mod: cuda.Module,
     rows_mod: cuda.Module,
     rowdot_tiles: cuda.Function,
+    rowdot_tiles_bf16: cuda.Function,
     prompt_tail: cuda.Function,
     embed: cuda.Function,
     mix: cuda.Function,
@@ -72,6 +73,7 @@ pub const Kernels = struct {
             .mod = mod,
             .rows_mod = rows_mod,
             .rowdot_tiles = try rows_mod.function("tf_ink2_rowdot_tiles"),
+            .rowdot_tiles_bf16 = try rows_mod.function("tf_ink2_rowdot_tiles_bf16"),
             .prompt_tail = try rows_mod.function("tf_ink2_prompt_tail"),
             .embed = try mod.function("tf_ink2_embed"),
             .mix = try mod.function("tf_ink2_mix"),
@@ -136,13 +138,21 @@ pub fn mixRoles(k: *const Kernels, s: cuda.Stream, roles: []const MixArgs) !void
     try go(k.mix_roles, s, .{ .x = @intCast(roles[0].rows), .z = @intCast(roles.len) }, 512, &a);
 }
 
+/// Tiles: fp32 outs from 32 rows; bf16 outs past 128 rows (prompt chunks), 32+ outputs, 16-byte aligned bases.
+fn tiled(rows: usize, j: usize, c: usize, x: u64, w: u64, out_bf16: bool) bool {
+    if (c % 128 != 0) return false;
+    if (!out_bf16) return rows >= 32;
+    return rows >= 129 and j >= 32 and x % 16 == 0 and w % 16 == 0;
+}
+
 /// out[row, j] = x[row] . w[j] over `c` (bf16 in), `j` outputs a row, bf16 or fp32 out, sigmoid when `sigmoid`.
 pub fn rowdot(k: *const Kernels, s: cuda.Stream, x: u64, w: u64, out: u64, rows: usize, j: usize, c: usize, out_bf16: bool, sigmoid: bool) !void {
     var a: cuda.Args = .{};
     for ([_]u64{ x, w, out }) |v| a.add(v);
-    if (rows >= 32 and !out_bf16 and c % 128 == 0) { // prompt rows: 32 x 16 tiles, the same sums in the same order
+    if (tiled(rows, j, c, x, w, out_bf16)) { // 32 x 16 tiles, the same sums in the same order
         for ([_]i32{ int(rows), int(j), int(c), @intFromBool(sigmoid) }) |v| a.add(v);
-        return go(k.rowdot_tiles, s, .{ .x = @intCast((rows + 31) / 32), .y = @intCast((j + 15) / 16) }, 256, &a);
+        const f = if (out_bf16) k.rowdot_tiles_bf16 else k.rowdot_tiles;
+        return go(f, s, .{ .x = @intCast((rows + 31) / 32), .y = @intCast((j + 15) / 16) }, 256, &a);
     }
     for ([_]i32{ int(j), int(c), @intFromBool(out_bf16), @intFromBool(sigmoid) }) |v| a.add(v);
     try go(k.rowdot, s, .{ .x = @intCast(rows), .y = @intCast((j + 7) / 8) }, 256, &a);
@@ -243,4 +253,17 @@ test "ops: the argument structs keep ops.cu's layouts" {
     try std.testing.expectEqual(@as(usize, 8 * 8 + 8 + 8 + 3 * 8 + 8 + 6 * 4), @sizeOf(MixArgs));
     try std.testing.expectEqual(@as(usize, 9 * 8 + 2 * 8 + 7 * 4 + 4), @sizeOf(ConvArgs));
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(RewindSite));
+}
+
+test "ops.rowdot: which calls take the tile kernels" {
+    const t = std.testing;
+    try t.expect(!tiled(128, 384, 2304, 0, 0, true)); // a decode round keeps tf_ink2_rowdot
+    try t.expect(tiled(129, 384, 2304, 0, 0, true));
+    try t.expect(!tiled(129, 31, 2304, 0, 0, true)); // narrow outputs (the sinks) keep it too
+    try t.expect(tiled(129, 32, 2304, 0, 0, true));
+    try t.expect(!tiled(129, 32, 2304, 2, 0, true)); // each base alone off 16-byte alignment falls back
+    try t.expect(!tiled(129, 32, 2304, 0, 2, true));
+    try t.expect(!tiled(129, 32, 2304 + 1, 0, 0, true));
+    try t.expect(!tiled(31, 16, 2304, 0, 0, false)); // fp32 as before: 32 rows, c % 128
+    try t.expect(tiled(32, 16, 2304, 2, 2, false));
 }
