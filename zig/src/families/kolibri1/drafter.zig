@@ -32,6 +32,15 @@ fn gib(bytes: u64) f64 {
 
 const Lane = struct { slot: u32, pos: u64 = 0, token: u32 = 0, rows: bool = false, held: [chain]u32 = undefined, held_len: u32 = 0 };
 
+/// `free` as `n` slots, every one free but the last (the timing slot); the old table freed only once the new is made.
+fn growSlots(gpa: std.mem.Allocator, free: *[]bool, n: usize) !void {
+    const grown = try gpa.alloc(bool, n);
+    @memset(grown, true);
+    grown[n - 1] = false;
+    gpa.free(free.*);
+    free.* = grown;
+}
+
 pub const Drafter = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -233,10 +242,7 @@ pub const Drafter = struct {
         if (x.lanes.count() != 0) return error.DraftReserveWithStreams;
         try x.e.reserve(streams + 1);
         try x.clearCaches(); // the timing passes below read them: zeroed first, not fresh device memory
-        x.gpa.free(x.free);
-        x.free = try x.gpa.alloc(bool, streams + 1);
-        @memset(x.free, true);
-        x.free[streams] = false;
+        try growSlots(x.gpa, &x.free, streams + 1);
         x.step_ms = try x.time(streams);
         x.n_holds = try x.timeHolds(streams); // on the streams' slots: zeroed after, before any stream opens
         x.absorb_ms = try x.timeAbsorb(streams);
@@ -511,4 +517,14 @@ test "DrafterPastMemory: the target's tap ring for 64 paged slots and a prompt c
     // control: without the taps (the accounting before) the same one-byte-short budget is admitted
     load = .{ .slots = 8, .first = window, .now = 2, .left = enough - 1 };
     try std.testing.expectEqual(untapped, try Drafter.admit(c, v, load));
+}
+
+test "reserve's slot table: a larger reserve that fails to allocate keeps the smaller table, freed once at teardown" {
+    var fail: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .fail_index = 1 });
+    const gpa = fail.allocator();
+    var free: []bool = &.{};
+    try growSlots(gpa, &free, 3); // a smaller reserve: 2 streams and the timing slot
+    try std.testing.expectError(error.OutOfMemory, growSlots(gpa, &free, 9)); // the larger one fails to allocate
+    try std.testing.expectEqualSlices(bool, &.{ true, true, false }, free);
+    gpa.free(free); // teardown: once, no double free (the testing allocator checks)
 }
