@@ -169,17 +169,17 @@ pub const Rows = struct {
         }
         p.refs[2] = try p.rig.input(std.mem.sliceAsBytes(at));
         p.refs[3] = try p.rig.output(shape.rows * n * @as(usize, if (p.v.kind == .glu) 2 else 4));
-        try p.plan(kinds);
+        try p.groups(kinds);
         return true;
     }
 
     /// The groups tf_moe_plan makes: pairs sorted by expert, at most 16 a group.
-    fn plan(p: *Rows, kinds: usize) !void {
+    fn groups(p: *Rows, kinds: usize) !void {
         var items: std.ArrayList(u32) = .empty;
         defer items.deinit(p.a);
         var members: std.ArrayList(u32) = .empty;
         defer members.deinit(p.a);
-        var count: u32 = 0;
+        var made: u32 = 0;
         for (0..kinds) |e| {
             const first: u32 = @intCast(members.items.len);
             for (p.pick, 0..) |x, r| if (x == e) try members.append(p.a, @intCast(r));
@@ -187,15 +187,15 @@ pub const Rows = struct {
             var i: u32 = 0;
             while (i < c_e) : (i += 16) {
                 try items.appendSlice(p.a, &.{ @intCast(e), first + i, @min(16, c_e - i) });
-                count += 1;
+                made += 1;
             }
         }
         p.refs[4] = try p.rig.input(std.mem.sliceAsBytes(items.items));
         p.refs[5] = try p.rig.input(std.mem.sliceAsBytes(members.items));
-        p.refs[6] = try p.rig.input(std.mem.asBytes(&count));
+        p.refs[6] = try p.rig.input(std.mem.asBytes(&made));
     }
 
-    fn r(x: rig_.Ref) br.Ref {
+    fn view(x: rig_.Ref) br.Ref {
         return .{ .buf = x.buf, .off = x.off };
     }
 
@@ -204,11 +204,11 @@ pub const Rows = struct {
         const pass = p.rig.begin();
         const bf: u32 = @intFromBool(p.v.bf16);
         switch (p.v.kind) {
-            .dense => try p.pipes.dense(pass.e, r(p.refs[0]), r(p.refs[1]), r(p.refs[2]), r(p.refs[3]), .{ .rows = @intCast(s.rows), .k = @intCast(s.k), .n = @intCast(s.n), .ldx = @intCast(s.k), .ldy = @intCast(s.n), .bf16 = bf }),
+            .dense => try p.pipes.dense(pass.e, view(p.refs[0]), view(p.refs[1]), view(p.refs[2]), view(p.refs[3]), .{ .rows = @intCast(s.rows), .k = @intCast(s.k), .n = @intCast(s.n), .ldx = @intCast(s.k), .ldy = @intCast(s.n), .bf16 = bf }),
             .down, .glu => {
-                const plan: br.Pipes.Plan = .{ .items = r(p.refs[4]), .members = r(p.refs[5]), .count = r(p.refs[6]), .most = br.maxItems(s.rows, p.experts) };
+                const plan: br.Pipes.Plan = .{ .items = view(p.refs[4]), .members = view(p.refs[5]), .count = view(p.refs[6]), .most = br.maxItems(s.rows, p.experts) };
                 const a: br.PickArgs = .{ .k = @intCast(s.k), .n = @intCast(s.n), .ldx = @intCast(s.k), .slots = 1, .bf16 = bf };
-                if (p.v.kind == .down) try p.pipes.down(pass.e, r(p.refs[0]), r(p.refs[1]), r(p.refs[2]), plan, r(p.refs[3]), a) else try p.pipes.gateUp(pass.e, r(p.refs[0]), r(p.refs[1]), r(p.refs[2]), plan, r(p.refs[3]), a);
+                if (p.v.kind == .down) try p.pipes.down(pass.e, view(p.refs[0]), view(p.refs[1]), view(p.refs[2]), plan, view(p.refs[3]), a) else try p.pipes.gateUp(pass.e, view(p.refs[0]), view(p.refs[1]), view(p.refs[2]), plan, view(p.refs[3]), a);
             },
         }
         try p.rig.finish(pass);

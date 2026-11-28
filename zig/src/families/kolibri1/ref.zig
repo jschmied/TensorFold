@@ -71,6 +71,8 @@ const Ctx = struct {
     att: []f64, // [n, H * Dh]
     tmp: []f64, // per worker scratch
     tmp_len: usize,
+    picks: ?[]u32 = null, // [n][top_k + 1] each slot's expert, when a caller asks
+    gaps: ?[]f64 = null, // [n] the last routed pick's key minus the best key left out
 };
 
 /// Calls f(ctx, row, scratch) for every row over the machine's cores.
@@ -174,7 +176,7 @@ fn moeRow(cx: *Ctx, r: usize, t: []f64) void {
     for (x) |*v| v.* = roundBf16(v.*);
     const out = t[d..][0..d];
     @memset(out, 0);
-    moe(cx, L, x, out, t[2 * d ..]);
+    moe(cx, L, r, x, out, t[2 * d ..]);
     for (out) |*v| v.* = roundBf16(v.*);
     rms(out, L.post_moe_norm, c.eps, x);
     for (res, x) |*v, w| v.* = roundF32(v.* + w);
@@ -184,7 +186,7 @@ fn moeRow(cx: *Ctx, r: usize, t: []f64) void {
 }
 
 /// Top-k by fp32 logit + bias (lower id on ties), weight fp32 sigmoid(logit) unnormalised; the shared expert at 1.
-fn moe(cx: *Ctx, L: names.Layer, x: []const f64, out: []f64, t: []f64) void {
+fn moe(cx: *Ctx, L: names.Layer, r: usize, x: []const f64, out: []f64, t: []f64) void {
     const c = cx.c;
     const d = c.hidden;
     const width = c.moe_width;
@@ -204,9 +206,14 @@ fn moe(cx: *Ctx, L: names.Layer, x: []const f64, out: []f64, t: []f64) void {
         var w: f64 = 1;
         if (slot < c.top_k) {
             e = std.mem.indexOfMax(f64, key);
+            const ky0 = key[e];
             w = roundF32(1.0 / (1.0 + @exp(-logit[e])));
             key[e] = -std.math.inf(f64);
+            if (slot + 1 == c.top_k) if (cx.gaps) |g| {
+                g[r] = ky0 - key[std.mem.indexOfMax(f64, key)];
+            };
         }
+        if (cx.picks) |p| p[r * (c.top_k + 1) + slot] = @intCast(e);
         const ex = L.experts[e];
         fp8Rows(&cx.lut, ex.gate.w, ex.gate.s, x, gate);
         fp8Rows(&cx.lut, ex.up.w, ex.up.s, x, up);
@@ -214,6 +221,18 @@ fn moe(cx: *Ctx, L: names.Layer, x: []const f64, out: []f64, t: []f64) void {
         fp8Rows(&cx.lut, ex.down.w, ex.down.s, gate, y);
         for (out, y) |*o, v| o.* += w * roundF32(v);
     }
+}
+
+/// One layer's MoE half alone: `res` [n, D] (the attention half's residual) becomes the layer's output residual.
+pub fn moeHalf(a: std.mem.Allocator, m: *const names.Map, c: Config, layer: usize, res: []f64, picks: ?[]u32, gaps: ?[]f64) !void {
+    const n = res.len / c.hidden;
+    const per = 3 * c.hidden + 2 * c.experts + 2 * c.moe_width;
+    const workers = @min(std.Thread.getCpuCount() catch 1, 64);
+    var cx: Ctx = .{ .m = m, .c = c, .lut = undefined, .layer = layer, .n = n, .tokens = &.{}, .res = res, .x = try a.alloc(f64, n * c.hidden), .q = &.{}, .k = &.{}, .v = &.{}, .att = &.{}, .tmp = try a.alloc(f64, workers * per), .tmp_len = per, .picks = picks, .gaps = gaps };
+    defer a.free(cx.x);
+    defer a.free(cx.tmp);
+    for (&cx.lut, 0..) |*v, i| v.* = e4m3(@intCast(i));
+    try rows(&cx, moeRow);
 }
 
 fn headRow(cx: *Ctx, r: usize, _: []f64) void {

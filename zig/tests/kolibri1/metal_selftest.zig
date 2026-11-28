@@ -22,7 +22,7 @@ const gates = struct {
     const tie = 1e-3; // a top-1 swap passes only where float64's own top-2 margin is below this
 };
 
-const Stats = struct { worst_cos: f64 = 1, worst_rel: f64 = 0, swaps: usize = 0, ties: usize = 0, rows: usize = 0, ok: bool = true };
+const Stats = struct { worst_cos: f64 = 1, worst_row: usize = 0, worst_rel: f64 = 0, swaps: usize = 0, ties: usize = 0, rows: usize = 0, ok: bool = true };
 
 fn compare(st: *Stats, got: []const f32, want: []const f64, width: usize, logits: bool) void {
     for (0..want.len / width) |r| {
@@ -40,6 +40,7 @@ fn compare(st: *Stats, got: []const f32, want: []const f64, width: usize, logits
         }
         const cos = dot / @sqrt(gg * ww);
         const rel = @sqrt(err / ww);
+        if (cos < st.worst_cos) st.worst_row = r;
         st.worst_cos = @min(st.worst_cos, cos);
         st.worst_rel = @max(st.worst_rel, rel);
         st.rows += 1;
@@ -83,6 +84,36 @@ fn run(a: std.mem.Allocator, m: *fwd.Model, ids: []const u32, chunk: usize, sing
         at += n;
     }
     return out;
+}
+
+/// Each layer's MoE half on the host from Metal's attention residual; the last layer's picks against the host's.
+fn local(a: std.mem.Allocator, map: *const k1.names.Map, c: k1.config.Config, m: *fwd.Model, tapped: []const f32) !bool {
+    const d = c.hidden;
+    const slots = c.top_k + 1;
+    var ok = true;
+    for (0..c.layers) |l| {
+        const res = try a.alloc(f64, tokens_n * d);
+        for (res, tapped[l * 2 * tokens_n * d ..][0 .. tokens_n * d]) |*o, v| o.* = v;
+        const last = l + 1 == c.layers;
+        const hp = try a.alloc(u32, tokens_n * slots);
+        const gaps = try a.alloc(f64, tokens_n);
+        try k1.ref.moeHalf(a, map, c, l, res, hp, gaps);
+        var st: Stats = .{};
+        compare(&st, tapped[(l * 2 + 1) * tokens_n * d ..][0 .. tokens_n * d], res, d, false);
+        report(try std.fmt.allocPrint(a, "A layer {d} MoE alone (worst row {d}, its edge margin {e:.2})", .{ l, st.worst_row, gaps[st.worst_row] }), st);
+        ok = ok and st.ok;
+        if (!last) continue;
+        const mp = m.s.moe[1].slice(u32, tokens_n * slots);
+        var differ: usize = 0;
+        for (0..tokens_n) |r| {
+            if (std.mem.eql(u32, mp[r * slots ..][0..slots], hp[r * slots ..][0..slots])) continue;
+            differ += 1;
+            if (differ <= 3) std.debug.print("  row {d}: metal picks {any}, host {any}, margin {e:.2}\n", .{ r, mp[r * slots ..][0..slots], hp[r * slots ..][0..slots], gaps[r] });
+        }
+        std.debug.print("{s} A layer {d} picks: {d} of {d} rows differ from the host's\n", .{ if (differ == 0) "PASS" else "FAIL", l, differ, tokens_n });
+        ok = ok and differ == 0;
+    }
+    return ok;
 }
 
 fn plant(text: []const u8) !fwd.Ctl {
@@ -166,6 +197,7 @@ pub fn main(init: std.process.Init) !u8 {
         report(try std.fmt.allocPrint(a, "A layer {d} {s} residual", .{ l, if (h == 0) "attention" else "MoE" }), ts);
         ok = ok and ts.ok;
     };
+    ok = try local(a, &map, c, &big, tapped) and ok;
     try big.rewind(0);
     ok = sameBytes("A again", one, try run(a, &big, ids, tokens_n, tokens_n, null)) and ok;
 

@@ -89,7 +89,7 @@ pub const Glue = struct {
 
     const vt = g.hooks(Glue);
 
-    fn r(x: rig_.Ref) glue.Ref {
+    fn view(x: rig_.Ref) glue.Ref {
         return .{ .buf = x.buf, .off = x.off };
     }
 
@@ -250,13 +250,13 @@ pub const Glue = struct {
         const e = pass.e;
         const ga: glue.Args = .{ .rows = @intCast(s.rows), .width = @intCast(s.k), .eps = eps };
         switch (p.v.kind) {
-            .embed => p.gp.embed(e, r(p.refs[0]), r(p.refs[1]), r(p.refs[2]), ga),
-            .rms => p.gp.rmsNorm(e, r(p.refs[0]), r(p.refs[1]), r(p.refs[2]), ga),
+            .embed => p.gp.embed(e, view(p.refs[0]), view(p.refs[1]), view(p.refs[2]), ga),
+            .rms => p.gp.rmsNorm(e, view(p.refs[0]), view(p.refs[1]), view(p.refs[2]), ga),
             .add_rms => {
                 @memcpy(p.rig.bytes(p.refs[1], p.host.len), p.host);
-                p.gp.addRms(e, r(p.refs[0]), r(p.refs[1]), r(p.refs[2]), r(p.refs[3]), r(p.refs[4]), ga);
+                p.gp.addRms(e, view(p.refs[0]), view(p.refs[1]), view(p.refs[2]), view(p.refs[3]), view(p.refs[4]), ga);
             },
-            .qk => try p.gp.qk(e, .{ .qkv = r(p.refs[0]), .q_norm = r(p.refs[1]), .k_norm = r(p.refs[2]), .cos = r(p.refs[3]), .sin = r(p.refs[4]), .pos = r(p.refs[5]), .q = r(p.refs[6]), .k_cache = r(p.refs[7]), .v_cache = r(p.refs[8]) }, .{ .rows = @intCast(s.rows), .heads = @intCast(s.n - 8), .kv_heads = 4, .dim = @intCast(s.k), .rope = 1, .ring = @intCast(s.rows), .eps = eps }),
+            .qk => try p.gp.qk(e, .{ .qkv = view(p.refs[0]), .q_norm = view(p.refs[1]), .k_norm = view(p.refs[2]), .cos = view(p.refs[3]), .sin = view(p.refs[4]), .pos = view(p.refs[5]), .q = view(p.refs[6]), .k_cache = view(p.refs[7]), .v_cache = view(p.refs[8]) }, .{ .rows = @intCast(s.rows), .heads = @intCast(s.n - 8), .kv_heads = 4, .dim = @intCast(s.k), .rope = 1, .ring = @intCast(s.rows), .eps = eps }),
             .select, .plan => {
                 const rt = p.route();
                 const a = moe.argsOf(rt, s.rows, 1);
