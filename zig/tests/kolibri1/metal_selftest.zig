@@ -9,7 +9,8 @@ const fwd = k1.forward;
 const usage =
     \\usage: tf-kolibri-metal selftest [DIR] [--plant BLOCK:N] [--shape parity|wide]
     \\  DIR    holds the seeded checkpoint (written when DIR has no config.json; default kolibri1-selftest)
-    \\  plant  a planted fault: glue:1-3, rows:1-3 or moe:1-3; the run must fail its gate (exit 1)
+    \\  plant  a planted fault: glue:1-3, rows:1-3, moe:1-3, or swap:1-2 (logits moved on the host: one swap
+    \\         past the tie margin, or every near tie swapped past the cap); the run must fail its gate (exit 1)
     \\Exit 0: every gate passed; 1: a gate failed; 2: usage or setup.
     \\
 ;
@@ -20,6 +21,7 @@ const gates = struct {
     const cosine = 0.9999; // every row's logits and each tap row against float64
     const rel = 0.02; // a tap row's relative L2 error
     const tie = 2e-2; // a top-1 swap passes only where float64's own top-2 margin is below this (~3 sigma)
+    const tie_cap = 4; // and at most one in this many of those near rows swaps
     const alone_margin = 1e-3; // MoE alone: a pick may differ only where the host's rank keys are this close
     const flip_margin = 2e-2; // the chain: a route may differ only where the reference's own keys are this close
 };
@@ -66,10 +68,11 @@ fn compare(st: *Stats, got: []const f32, want: []const f64, width: usize, logits
             st.ok = false;
         }
     }
+    if (logits and st.ties * gates.tie_cap > st.near) st.ok = false; // more excused swaps than the cap allows
 }
 
 fn report(name: []const u8, st: Stats) void {
-    std.debug.print("{s} {s}: {d} rows, worst cosine {d:.7}, worst rel {e:.3}, top-1 swaps {d} (ties {d}, widest {e:.2}; {d} rows have a top-2 margin under {e:.0})\n", .{ if (st.ok) "PASS" else "FAIL", name, st.rows, st.worst_cos, st.worst_rel, st.swaps, st.ties, st.tie_gap, st.near, gates.tie });
+    std.debug.print("{s} {s}: {d} rows, worst cosine {d:.7}, worst rel {e:.3}, top-1 swaps {d} (ties {d}, widest {e:.2}; {d} rows have a top-2 margin under {e:.0}, at most 1 in {d} may swap)\n", .{ if (st.ok) "PASS" else "FAIL", name, st.rows, st.worst_cos, st.worst_rel, st.swaps, st.ties, st.tie_gap, st.near, gates.tie, gates.tie_cap });
 }
 
 fn sameBytes(name: []const u8, a: []const f32, b: []const f32) bool {
@@ -156,15 +159,52 @@ fn local(a: std.mem.Allocator, map: *const k1.names.Map, c: k1.config.Config, ta
     return ok;
 }
 
-fn plant(text: []const u8) !fwd.Ctl {
+const Plant = struct { ctl: fwd.Ctl = .{}, swap: u8 = 0 };
+
+fn plant(text: []const u8) !Plant {
     const colon = std.mem.indexOfScalar(u8, text, ':') orelse return error.Usage;
     const n = try std.fmt.parseInt(u8, text[colon + 1 ..], 10);
     if (n == 0 or n > 3) return error.Usage;
     const block = text[0..colon];
-    if (std.mem.eql(u8, block, "glue")) return .{ .glue = n };
-    if (std.mem.eql(u8, block, "rows")) return .{ .rows = n };
-    if (std.mem.eql(u8, block, "moe")) return .{ .moe = n };
+    if (std.mem.eql(u8, block, "glue")) return .{ .ctl = .{ .glue = n } };
+    if (std.mem.eql(u8, block, "rows")) return .{ .ctl = .{ .rows = n } };
+    if (std.mem.eql(u8, block, "moe")) return .{ .ctl = .{ .moe = n } };
+    if (std.mem.eql(u8, block, "swap") and n <= 2) return .{ .swap = n };
     return error.Usage;
+}
+
+/// Gate controls on a copy of the logits: 1 swaps the nearest row past the tie bound, 2 every near-tie row.
+fn swapped(a: std.mem.Allocator, got: []const f32, want: []const f64, v: usize, mode: u8) ![]const f32 {
+    if (mode == 0) return got;
+    const out = try a.dupe(f32, got);
+    var pick: ?usize = null;
+    var pick_gap: f64 = std.math.inf(f64);
+    for (0..want.len / v) |r| {
+        const w = want[r * v ..][0..v];
+        const top = std.mem.indexOfMax(f64, w);
+        var second: usize = if (top == 0) 1 else 0;
+        for (w, 0..) |x, i| if (i != top and x > w[second]) {
+            second = i;
+        };
+        const margin = w[top] - w[second];
+        const lift = mode == 2 and margin < gates.tie;
+        if (lift) out[r * v + second] = out[r * v + top] + @abs(out[r * v + top]) * 1e-6 + 1e-6;
+        if (mode == 1 and margin >= gates.tie and margin < pick_gap) {
+            pick = r;
+            pick_gap = margin;
+        }
+    }
+    if (pick) |r| {
+        const w = want[r * v ..][0..v];
+        const top = std.mem.indexOfMax(f64, w);
+        var second: usize = if (top == 0) 1 else 0;
+        for (w, 0..) |x, i| if (i != top and x > w[second]) {
+            second = i;
+        };
+        out[r * v + second] = out[r * v + top] + @as(f32, @floatCast(1e-3));
+        std.debug.print("  planted: row {d}'s runner-up lifted past its top, float64 margin {e:.3}\n", .{ r, pick_gap });
+    }
+    return out;
 }
 
 pub fn main(init: std.process.Init) !u8 {
@@ -176,13 +216,13 @@ pub fn main(init: std.process.Init) !u8 {
         return 2;
     }
     var dir_path: []const u8 = "kolibri1-selftest";
-    var ctl: fwd.Ctl = .{};
+    var planted: Plant = .{};
     var shape = k1.fixture.parity;
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--plant") and i + 1 < args.len) {
             i += 1;
-            ctl = plant(args[i]) catch {
+            planted = plant(args[i]) catch {
                 std.debug.print("{s}", .{usage});
                 return 2;
             };
@@ -191,6 +231,7 @@ pub fn main(init: std.process.Init) !u8 {
             shape = if (std.mem.eql(u8, args[i], "wide")) k1.fixture.wide else k1.fixture.parity;
         } else dir_path = args[i];
     }
+    const ctl = planted.ctl;
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -231,7 +272,7 @@ pub fn main(init: std.process.Init) !u8 {
     const got = try a.dupe(u32, picks_buf.slice(u32, c.layers * tokens_n * slots));
     const want = try forced(a, &map, c, ids, got, "A", &ok);
     var st: Stats = .{};
-    compare(&st, one, want.logits, c.vocab, true);
+    compare(&st, try swapped(a, one, want.logits, c.vocab, planted.swap), want.logits, c.vocab, true);
     report("A one call: logits", st);
     ok = ok and st.ok;
     const tapped = taps_buf.slice(f32, c.layers * 2 * tokens_n * c.hidden);
@@ -251,7 +292,7 @@ pub fn main(init: std.process.Init) !u8 {
     const chunked = try run(a, &small, ids, 16, 592, null, picks_buf);
     const want_b = try forced(a, &map, c, ids, picks_buf.slice(u32, c.layers * tokens_n * slots), "B", &ok);
     st = .{};
-    compare(&st, chunked, want_b.logits, c.vocab, true);
+    compare(&st, try swapped(a, chunked, want_b.logits, c.vocab, planted.swap), want_b.logits, c.vocab, true);
     report(try std.fmt.allocPrint(a, "B 16-row calls, 1-row from 592 (ring {d})", .{small.ring}), st);
     ok = ok and st.ok;
 
@@ -271,6 +312,6 @@ pub fn main(init: std.process.Init) !u8 {
     std.debug.print("{s} C a resume whose window the ring overwrote is refused\n", .{if (refused) "PASS" else "FAIL"});
     ok = ok and refused;
 
-    std.debug.print("{s} kolibri1 metal selftest{s}\n", .{ if (ok) "PASS" else "FAIL", if (ctl.glue + ctl.rows + ctl.moe != 0) " (planted)" else "" });
+    std.debug.print("{s} kolibri1 metal selftest{s}\n", .{ if (ok) "PASS" else "FAIL", if (ctl.glue + ctl.rows + ctl.moe + planted.swap != 0) " (planted)" else "" });
     return if (ok) 0 else 1;
 }
