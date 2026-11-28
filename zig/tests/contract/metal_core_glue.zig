@@ -18,7 +18,7 @@ pub const Variant = struct { kind: Kind, ctl: u8 = 0, score: bool = false };
 const eps: f32 = 1e-6;
 /// Kolibri-1's widths: hidden 2560 rows, 48 + 2 x 4 heads of 128, 384 or 8 experts top-6 and the shared one.
 const row_shapes = [_]c.Shape{ .{ .rows = 16, .n = 1, .k = 2560 }, .{ .rows = 1, .n = 1, .k = 2560 }, .{ .rows = 5, .n = 1, .k = 1536 }, .{ .rows = 3, .n = 1, .k = 256 } };
-const qk_shapes = [_]c.Shape{ .{ .rows = 4, .n = 56, .k = 128 }, .{ .rows = 1, .n = 56, .k = 128 }, .{ .rows = 3, .n = 6, .k = 64 } };
+const qk_shapes = [_]c.Shape{ .{ .rows = 4, .n = 56, .k = 128 }, .{ .rows = 1, .n = 56, .k = 128 }, .{ .rows = 3, .n = 12, .k = 64 } };
 const route_shapes = [_]c.Shape{ .{ .rows = 16, .n = 384, .k = 6 }, .{ .rows = 1, .n = 384, .k = 6 }, .{ .rows = 7, .n = 8, .k = 6 }, .{ .rows = 3, .n = 128, .k = 8 } };
 const combine_shapes = [_]c.Shape{ .{ .rows = 16, .n = 2560, .k = 7 }, .{ .rows = 1, .n = 2560, .k = 7 }, .{ .rows = 3, .n = 1536, .k = 9 } };
 
@@ -40,10 +40,10 @@ pub fn spec(v: Variant, name: []const u8) c.Spec {
     const raw: c.Nan = .{ .stated = "exact: picks, groups and copies equal the host rule's bytes" };
     return switch (v.kind) {
         .embed, .select, .plan => .{ .name = name, .accum = .none, .depth = none, .out = .raw, .nan = raw, .served = if (v.kind == .embed) &row_shapes else &route_shapes },
-        .rms => .{ .name = name, .accum = .f32, .depth = rowDepth, .ops = 3, .out = .bf16, .served = &row_shapes, .tiles = .{ .{}, .{}, .{ .size = 256, .step = 256, .min = 256 } } },
+        .rms => .{ .name = name, .accum = .f32, .depth = rowDepth, .ops = 3, .out = .bf16, .served = &row_shapes, .sums = .{ .f16 = 0, .bf16 = 0, .why = "bf16 out: its rounding outweighs what bf16 sums would add to the norm", .exact = false }, .tiles = .{ .{}, .{}, .{ .size = 256, .step = 256, .min = 256 } } },
         .add_rms => .{ .name = name, .accum = .f32, .depth = rowDepth, .ops = 6, .out = .bf16, .served = &row_shapes, .sums = .{ .f16 = 0, .bf16 = 0, .why = "the sandwich's two norms: its bound is norms_ref's, not a sums proof", .exact = false } },
         .qk => .{ .name = name, .accum = .f32, .depth = headDepth, .ops = 6, .out = .bf16, .served = &qk_shapes, .sums = .{ .f16 = 0, .bf16 = 0, .why = "a head's 128 squares: too short to make bf16 sums miss 100x", .exact = false } },
-        .combine => .{ .name = name, .accum = .f32, .depth = slotDepth, .out = .bf16, .served = &combine_shapes },
+        .combine => .{ .name = name, .accum = .f32, .depth = slotDepth, .out = .bf16, .served = &combine_shapes, .sums = .{ .f16 = 0, .bf16 = 0, .why = "7 to 9 slots: too short for a sums proof; one fp32 fma chain in slot order", .exact = false } },
     };
 }
 
@@ -84,10 +84,17 @@ pub const Glue = struct {
     }
 
     pub fn kernel(p: *Glue) g.Kernel {
-        return .{ .spec = spec(p.v, p.name), .ctx = p, .vt = &vt, .control = if (p.v.ctl != 0) .shapes else null };
+        const exact = p.v.kind == .embed or p.v.kind == .select or p.v.kind == .plan;
+        return .{ .spec = spec(p.v, p.name), .ctx = p, .vt = if (exact) &vt else &numeric, .control = if (p.v.ctl != 0) .shapes else null };
     }
 
     const vt = g.hooks(Glue);
+    // rms, add_rms, qk and combine: the float64 bound decides, not the exact check
+    const numeric = blk: {
+        var v = g.hooks(Glue);
+        v.check = null;
+        break :blk v;
+    };
 
     fn view(x: rig_.Ref) glue.Ref {
         return .{ .buf = x.buf, .off = x.off };
@@ -226,8 +233,9 @@ pub const Glue = struct {
         const ne = shape.n;
         const logits = try p.a.alloc(f32, shape.rows * ne + ne);
         defer p.a.free(logits);
-        for (logits[0 .. shape.rows * ne], 0..) |*v, i| v.* = if (fill == .stress or i % 5 == 0) @floatFromInt(@as(i32, @intCast(i % 3))) else rng.float(f32) * 8 - 4; // exact ties
-        for (logits[shape.rows * ne ..]) |*v| v.* = if (rng.uintLessThan(u32, 4) == 0) 0 else rng.float(f32) * 0.5;
+        // experts e % 5 == 0 tie exactly above every other expert (logit 6, bias 0): the lower ids must win
+        for (logits[0 .. shape.rows * ne], 0..) |*v, i| v.* = if (fill == .stress or (i % ne) % 5 == 0) 6 else rng.float(f32) * 8 - 4;
+        for (logits[shape.rows * ne ..], 0..) |*v, e| v.* = if (e % 5 == 0) 0 else rng.float(f32) * 0.5;
         if (fill == .nonfinite) logits[1] = std.math.inf(f32);
         p.host = try p.a.dupe(u8, std.mem.sliceAsBytes(logits));
         const rt = p.route();

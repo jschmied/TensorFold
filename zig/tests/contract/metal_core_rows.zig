@@ -45,6 +45,7 @@ pub fn spec(v: Variant, name: []const u8) c.Spec {
         .out = if (v.kind == .glu) .bf16 else .f32,
         .tiles = .{ .{ .size = 16 }, .{ .size = 4 }, .{ .size = 256, .step = 128, .min = 128 } },
         .served = &served,
+        .sums = if (v.kind == .glu) .{ .f16 = 0, .bf16 = 0, .why = "tf_block_rows' column sums, proven fp32 by its gate; silu(gate) * up hides them", .exact = false } else .{},
     };
 }
 
@@ -281,8 +282,8 @@ pub const Rows = struct {
 
     pub fn bounds(p: *Rows, want: []const f64, _: []const f64, allow: []f64) !void {
         if (p.v.kind != .glu) return;
-        // the sigmoid's exp and divide and the two products: four fp32 roundings of the value
-        for (allow, want) |*l, w| l.* += 4 * 0x1p-24 * @abs(w);
+        // four fp32 roundings (exp, divide, two products), and Apple GPUs flush results below 2^-126 to zero
+        for (allow, want) |*l, w| l.* += 4 * 0x1p-24 * @abs(w) + 0x1p-126;
     }
 
     pub fn simulate(p: *Rows, acc: c.Accum, order: g.Order, out: []f64) !void {

@@ -182,7 +182,8 @@ fn hostRoute(p: *const Glue, row: usize, picks: []u32, wts: []f64, gaps: []f64) 
     const lg = all[row * ne ..][0..ne];
     const bias = all[p.shape.rows * ne ..][0..ne];
     var choice: [4096]f64 = undefined;
-    for (0..ne) |e| choice[e] = if (rt.score) 1 / (1 + @exp(-@as(f64, lg[e]))) + bias[e] else @as(f32, lg[e] + bias[e]);
+    // one fp32 key as the kernel ranks by: fp32(sigmoid) + bias, or logit + bias, each sum rounded once
+    for (0..ne) |e| choice[e] = if (rt.score) @as(f32, @as(f32, @floatCast(1 / (1 + @exp(-@as(f64, lg[e]))))) + bias[e]) else @as(f32, lg[e] + bias[e]);
     var kept: u32 = ~@as(u32, 0);
     if (rt.groups > 1) {
         const gs = ne / rt.groups;
@@ -229,6 +230,20 @@ fn hostRoute(p: *const Glue, row: usize, picks: []u32, wts: []f64, gaps: []f64) 
     wts[rt.topk] = 1;
 }
 
+/// Row r's weights at `picks`: sigmoid(logit) in float64, normalised over the routed slots if asked, scaled; shared 1.
+fn weightsOf(p: *const Glue, row: usize, picks: []align(1) const u32, out: []f64) void {
+    const rt = p.route();
+    const all: []align(1) const f32 = std.mem.bytesAsSlice(f32, p.host);
+    const lg = all[row * rt.experts ..][0..rt.experts];
+    var total: f64 = 0;
+    for (out[0..rt.topk], picks[0..rt.topk]) |*w, e| {
+        w.* = if (e < rt.experts) 1 / (1 + @exp(-@as(f64, lg[e]))) else std.math.nan(f64);
+        total += w.*;
+    }
+    for (out[0..rt.topk]) |*w| w.* = (if (rt.normalize) w.* / total else w.*) * rt.scale;
+    out[rt.topk] = 1;
+}
+
 pub fn check(p: *Glue, _: g.Gate) !?[]const u8 {
     const s = p.shape;
     const out = try p.rig.outputBytes();
@@ -257,9 +272,10 @@ pub fn check(p: *Glue, _: g.Gate) !?[]const u8 {
                     const got = picks[r * slots + sl];
                     const tie = p.v.score and gap[sl] < 1e-6; // sigmoid's last bits: the GPU's exp may order a near tie
                     if (got != hp[sl] and !tie) return try std.fmt.bufPrint(&p.msg, "row {d} slot {d}: expert {d} where the rule picks {d}", .{ r, sl, got, hp[sl] });
-                    if (got == hp[sl] and @abs(wts[r * slots + sl] - hw[sl]) > 8 * 0x1p-24 * @abs(hw[sl]) + 0x1p-140)
-                        return try std.fmt.bufPrint(&p.msg, "row {d} slot {d}: weight {e} where float64 gives {e}", .{ r, sl, wts[r * slots + sl], hw[sl] });
                 }
+                weightsOf(p, r, picks[r * slots ..][0..slots], hw[0..slots]); // the weight rule at the device's picks
+                for (0..slots) |sl| if (@abs(wts[r * slots + sl] - hw[sl]) > 8 * 0x1p-24 * @abs(hw[sl]) + 0x1p-140)
+                    return try std.fmt.bufPrint(&p.msg, "row {d} slot {d}: weight {e} where float64 gives {e}", .{ r, sl, wts[r * slots + sl], hw[sl] });
             }
             if (p.v.kind == .plan) return planCheck(p, picks, out[2 * pairs * 4 ..]);
             return null;
