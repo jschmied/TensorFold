@@ -16,8 +16,11 @@ pub fn ringSize(rows: usize, window: usize) usize {
     return (rows + window + 63) / 64 * 64;
 }
 
-/// Residuals after each layer's attention and MoE halves, fp32 [layers][2][rows][D]; picks u32 [layers][rows][slots].
-pub const Taps = struct { buf: mtl.Buffer, rows: usize, picks: ?mtl.Buffer = null };
+/// Residuals after each layer's attention and MoE halves, fp32 [layers][2][n][D] (n: the call's rows), when given.
+pub const Taps = struct { buf: ?mtl.Buffer = null, picks: ?Picks = null };
+
+/// Routes u32 [layers][rows][slots]: this call's rows land from row `at` of each layer's `rows`.
+pub const Picks = struct { buf: mtl.Buffer, rows: usize, at: usize };
 
 pub const Model = struct {
     gpa: std.mem.Allocator,
@@ -128,8 +131,11 @@ pub const Model = struct {
             id.* = t;
             pos.* = @intCast(m.p + i);
         }
-        if (taps) |t| if (t.rows < n or t.buf.length() < c.layers * 2 * n * c.hidden * 4) return error.TapsTooSmall;
-        if (taps) |t| if (t.picks) |pk| if (pk.length() < c.layers * n * m.route.slots() * 4) return error.TapsTooSmall;
+        const slots = m.route.slots();
+        if (taps) |t| {
+            if (t.buf) |b| if (b.length() < c.layers * 2 * n * c.hidden * 4) return error.TapsTooSmall;
+            if (t.picks) |pk| if (pk.at + n > pk.rows or pk.buf.length() < c.layers * pk.rows * slots * 4) return error.TapsTooSmall;
+        }
         const cb = m.queue.commandBuffer();
         var e = cb.compute(.serial);
         const d = c.hidden;
@@ -149,16 +155,19 @@ pub const Model = struct {
             try m.attention(e, L, i, n);
             m.glue.addRms(e, .{ .buf = m.s.o }, .{ .buf = m.s.res }, L.post_attn_norm, L.pre_moe_norm, .{ .buf = m.s.x }, ga);
             e.barrier();
-            if (taps) |t| e = tap(cb, e, m.s.res, t.buf, i * 2 * n * d * 4, n * d * 4);
+            if (taps) |t| if (t.buf) |b| {
+                e = tap(cb, e, m.s.res, b, i * 2 * n * d * 4, n * d * 4);
+            };
             try moe.encode(e, m.moe, m.rows, m.route, .{ .buf = m.s.x }, d, n, L.router, L.bias, L.experts, sc, .{ .buf = m.s.mo });
             e.barrier();
             const next = if (i + 1 < m.w.layers.len) m.w.layers[i + 1].input_norm else m.w.norm;
             m.glue.addRms(e, .{ .buf = m.s.mo }, .{ .buf = m.s.res }, L.post_moe_norm, next, .{ .buf = m.s.x }, ga);
             e.barrier();
-            if (taps) |t| e = tap(cb, e, m.s.res, t.buf, (i * 2 + 1) * n * d * 4, n * d * 4);
+            if (taps) |t| if (t.buf) |b| {
+                e = tap(cb, e, m.s.res, b, (i * 2 + 1) * n * d * 4, n * d * 4);
+            };
             if (taps) |t| if (t.picks) |pk| {
-                const per = n * m.route.slots() * 4;
-                e = tap(cb, e, z[1], pk, i * per, per);
+                e = tap(cb, e, z[1], pk.buf, (i * pk.rows + pk.at) * slots * 4, n * slots * 4);
             };
         }
         const first = if (all) 0 else n - 1;
