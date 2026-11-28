@@ -24,7 +24,7 @@ const gates = struct {
     const flip_margin = 2e-2; // the chain: a route may differ only where the reference's own keys are this close
 };
 
-const Stats = struct { worst_cos: f64 = 1, worst_row: usize = 0, worst_rel: f64 = 0, swaps: usize = 0, ties: usize = 0, tie_gap: f64 = 0, rows: usize = 0, ok: bool = true };
+const Stats = struct { worst_cos: f64 = 1, worst_row: usize = 0, worst_rel: f64 = 0, swaps: usize = 0, ties: usize = 0, tie_gap: f64 = 0, near: usize = 0, rows: usize = 0, ok: bool = true };
 
 fn compare(st: *Stats, got: []const f32, want: []const f64, width: usize, logits: bool) void {
     for (0..want.len / width) |r| {
@@ -51,12 +51,14 @@ fn compare(st: *Stats, got: []const f32, want: []const f64, width: usize, logits
         if (!logits) continue;
         const top = std.mem.indexOfMax(f64, w);
         const mine = std.mem.indexOfMax(f32, g);
-        if (top == mine) continue;
         var second: f64 = -std.math.inf(f64);
         for (w, 0..) |v, i| if (i != top) {
             second = @max(second, v);
         };
+        if (w[top] - second < gates.tie) st.near += 1; // rows the tie margin could excuse at all
+        if (top == mine) continue;
         if (w[top] - second < gates.tie) {
+            std.debug.print("  excused top-1 swap, row {d}: float64 top-2 margin {e:.3}\n", .{ r, w[top] - second });
             st.ties += 1;
             st.tie_gap = @max(st.tie_gap, w[top] - second);
         } else {
@@ -67,7 +69,7 @@ fn compare(st: *Stats, got: []const f32, want: []const f64, width: usize, logits
 }
 
 fn report(name: []const u8, st: Stats) void {
-    std.debug.print("{s} {s}: {d} rows, worst cosine {d:.7}, worst rel {e:.3}, top-1 swaps {d} (ties {d}, widest {e:.2})\n", .{ if (st.ok) "PASS" else "FAIL", name, st.rows, st.worst_cos, st.worst_rel, st.swaps, st.ties, st.tie_gap });
+    std.debug.print("{s} {s}: {d} rows, worst cosine {d:.7}, worst rel {e:.3}, top-1 swaps {d} (ties {d}, widest {e:.2}; {d} rows have a top-2 margin under {e:.0})\n", .{ if (st.ok) "PASS" else "FAIL", name, st.rows, st.worst_cos, st.worst_rel, st.swaps, st.ties, st.tie_gap, st.near, gates.tie });
 }
 
 fn sameBytes(name: []const u8, a: []const f32, b: []const f32) bool {
