@@ -68,6 +68,7 @@ pub const Rows = struct {
     fill: g.Fill = .random,
     experts: usize = 3,
     pick: []u32 = &.{}, // a pair's (row's) expert
+    flush: []f64 = &.{}, // glu: what flushing an intermediate below 2^-126 can lose, an output
     refs: [8]rig_.Ref = undefined, // x, w, s or at, y, items, members, count
 
     pub fn init(a: std.mem.Allocator, device: mtl.Device, queue: mtl.Queue, v: Variant, name: []const u8) !Rows {
@@ -86,6 +87,8 @@ pub const Rows = struct {
         p.d = null;
         p.u = null;
         p.a.free(p.pick);
+        p.a.free(p.flush);
+        p.flush = &.{};
         p.pick = &.{};
         p.rig.reset();
     }
@@ -256,7 +259,11 @@ pub const Rows = struct {
         const s = p.d.?.shape;
         const tmp = try p.a.alloc(f64, 4 * s.n);
         defer p.a.free(tmp);
-        const Ctx = struct { want: []f64, mag: []f64, tmp: []f64 };
+        if (p.v.kind == .glu) {
+            p.a.free(p.flush);
+            p.flush = try p.a.alloc(f64, want.len);
+        }
+        const Ctx = struct { want: []f64, mag: []f64, tmp: []f64, flush: []f64 };
         try p.perRow(struct {
             fn one(q: *Rows, d: Dense, row: usize, half: usize, x: Ctx) !void {
                 const n = d.shape.n;
@@ -275,15 +282,17 @@ pub const Rows = struct {
                     // |d out / d gate| times the gate's terms plus |d out / d up| times the up's: the sums' errors
                     const dg = @abs(uv * (sg + gv * sg * (1 - sg)));
                     x.mag[row * n + j] = dg * x.tmp[2 * n + j] + @abs(gv * sg) * x.tmp[3 * n + j];
+                    // a flushed sigmoid (|g u| 2^-126 at most), a flushed g * sigmoid (|u| 2^-126), a flushed output
+                    x.flush[row * n + j] = @abs(gv * uv) * 0x1p-125 + @abs(uv) * 0x1p-126 + 0x1p-126;
                 }
             }
-        }.one, Ctx{ .want = want, .mag = mag, .tmp = tmp });
+        }.one, Ctx{ .want = want, .mag = mag, .tmp = tmp, .flush = p.flush });
     }
 
     pub fn bounds(p: *Rows, want: []const f64, _: []const f64, allow: []f64) !void {
         if (p.v.kind != .glu) return;
-        // four fp32 roundings (exp, divide, two products), and Apple GPUs flush results below 2^-126 to zero
-        for (allow, want) |*l, w| l.* += 4 * 0x1p-24 * @abs(w) + 0x1p-126;
+        // four fp32 roundings (exp, divide, two products), and what the GPU's flush to zero can lose
+        for (allow, want, p.flush) |*l, w, f| l.* += 4 * 0x1p-24 * @abs(w) + f;
     }
 
     pub fn simulate(p: *Rows, acc: c.Accum, order: g.Order, out: []f64) !void {
