@@ -268,7 +268,10 @@ pub fn main(init: std.process.Init) !u8 {
     defer taps_buf.deinit();
     const picks_buf = try device.buffer(c.layers * tokens_n * slots * 4, mtl.ResourceOptions.shared);
     defer picks_buf.deinit();
+    const t0 = std.Io.Clock.awake.now(io);
     const one = try run(a, &big, ids, tokens_n, tokens_n, taps_buf, picks_buf);
+    const ms = @as(f64, @floatFromInt(t0.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds())) / 1e6;
+    std.debug.print("info A forward: {d} rows in one call, {d:.1} ms wall (first call, with taps)\n", .{ tokens_n, ms });
     const got = try a.dupe(u32, picks_buf.slice(u32, c.layers * tokens_n * slots));
     const want = try forced(a, &map, c, ids, got, "A", &ok);
     var st: Stats = .{};
