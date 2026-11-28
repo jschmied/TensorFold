@@ -50,7 +50,7 @@ pub const Model = struct {
     held: []u32 = &.{}, // per sliding ring slot: the position + 1 its keys belong to (0: none since init)
     fail_after: usize = 0, // tests: the n-th buffer fails with error.Injected (0: never)
 
-    const Scratch = struct { ids: mtl.Buffer, pos: mtl.Buffer, res: mtl.Buffer, x: mtl.Buffer, qkv: mtl.Buffer, q: mtl.Buffer, att: mtl.Buffer, o: mtl.Buffer, mo: mtl.Buffer, mask: mtl.Buffer, logits: mtl.Buffer, moe: [10]mtl.Buffer };
+    const Scratch = struct { ids: mtl.Buffer, pos: mtl.Buffer, res: mtl.Buffer, x: mtl.Buffer, qkv: mtl.Buffer, q: mtl.Buffer, att: mtl.Buffer, o: mtl.Buffer, mo: mtl.Buffer, mask: mtl.Buffer, logits: mtl.Buffer, moe: [9]mtl.Buffer };
 
     /// Every buffer the model made (caches, tables, scratch), freed together; `live` counts them across models.
     fn buffer(m: *Model, bytes: usize) !mtl.Buffer {
@@ -107,8 +107,8 @@ pub const Model = struct {
         const r = max_rows;
         const d = c.hidden;
         const z = moe.bytes(m.route, r, d, c.moe_width);
-        var ms: [10]mtl.Buffer = undefined;
-        for (&ms, [_]usize{ z.logits, z.pick, z.wts, z.bucket, z.members, z.items, z.count, z.act, z.y, z.keys }) |*b, n| b.* = try m.buffer(n);
+        var ms: [9]mtl.Buffer = undefined;
+        for (&ms, [_]usize{ z.logits, z.pick, z.wts, z.bucket, z.members, z.items, z.count, z.act, z.y }) |*b, n| b.* = try m.buffer(n);
         m.s = .{ .ids = try m.buffer(r * 4), .pos = try m.buffer(r * 4), .res = try m.buffer(r * d * 4), .x = try m.buffer(r * d * 2), .qkv = try m.buffer(r * c.qkvDim() * 2), .q = try m.buffer(r * c.heads * c.head_dim * 2), .att = try m.buffer(r * c.heads * c.head_dim * 2), .o = try m.buffer(r * d * 2), .mo = try m.buffer(r * d * 2), .mask = try m.buffer(2 * r * cap), .logits = try m.buffer(r * c.vocab * 4), .moe = ms };
         return m;
     }
@@ -179,7 +179,7 @@ pub const Model = struct {
         masks(mask[0 .. n * m.slidingKeys(last)], m.p, n, m.slidingKeys(last), .{ .window = c.window, .ring = m.ring });
         masks(mask[n * m.ring ..][0 .. n * (last + 1)], m.p, n, last + 1, null);
         const z = m.s.moe;
-        const sc: moe.Scratch = .{ .logits = .{ .buf = z[0] }, .pick = .{ .buf = z[1] }, .wts = .{ .buf = z[2] }, .bucket = .{ .buf = z[3] }, .members = .{ .buf = z[4] }, .items = .{ .buf = z[5] }, .count = .{ .buf = z[6] }, .act = .{ .buf = z[7] }, .y = .{ .buf = z[8] }, .keys = .{ .buf = z[9] } };
+        const sc: moe.Scratch = .{ .logits = .{ .buf = z[0] }, .pick = .{ .buf = z[1] }, .wts = .{ .buf = z[2] }, .bucket = .{ .buf = z[3] }, .members = .{ .buf = z[4] }, .items = .{ .buf = z[5] }, .count = .{ .buf = z[6] }, .act = .{ .buf = z[7] }, .y = .{ .buf = z[8] } };
         for (m.w.layers, 0..) |L, i| {
             try m.attention(e, L, i, n);
             m.glue.addRms(e, .{ .buf = m.s.o }, .{ .buf = m.s.res }, L.post_attn_norm, L.pre_moe_norm, .{ .buf = m.s.x }, ga);

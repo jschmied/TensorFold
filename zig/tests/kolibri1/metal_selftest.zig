@@ -406,7 +406,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     // D: a late failure gives back everything: a buffer error injected at the first, a middle and the last buffer
     const base = fwd.live;
-    for ([_]usize{ 1, 2 * c.layers + 1, 2 * c.layers + 23 }) |at| {
+    for ([_]usize{ 1, 2 * c.layers + 1, 2 * c.layers + 22 }) |at| {
         var plain = ctl;
         plain.fail_after = at;
         const refused_init = if (fwd.Model.init(gpa, device, &w, tokens_n, 16, plain)) |m| blk: {

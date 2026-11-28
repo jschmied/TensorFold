@@ -24,8 +24,8 @@ pub const Shape = struct {
 
 /// The parity checkpoint: two sliding layers then a full one, 8 experts top-6 and the shared one.
 pub const parity: Shape = .{};
-/// Two shards splitting one expert (as 30 of 50 released layers do): small, for the loader's refusal.
-pub const split: Shape = .{ .full = &.{ false, true }, .experts = 3, .top_k = 2, .vocab = 32, .hidden = 256, .heads = 4, .kv_heads = 1, .width = 128, .window = 3, .eos = 31, .split = true };
+/// Two shards splitting one expert (as 30 of 50 released layers do); every tensor a multiple of 16 bytes.
+pub const split: Shape = .{ .full = &.{ false, true }, .experts = 8, .top_k = 2, .vocab = 32, .hidden = 512, .heads = 4, .kv_heads = 1, .width = 128, .window = 3, .eos = 31, .split = true };
 
 /// All 384 experts top-6 in one sliding layer: upper expert ids, uneven groups and the real router width.
 pub const wide: Shape = .{ .full = &.{false}, .experts = 384 };

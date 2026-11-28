@@ -68,14 +68,14 @@ pub const Pipes = struct {
 pub const Experts = struct { w: Ref, at: Ref, width: usize, bf16: bool = false };
 
 /// Scratch a layer of `rows` rows takes, as views of caller buffers (sizes from `bytes`).
-pub const Scratch = struct { logits: Ref, pick: Ref, wts: Ref, bucket: Ref, members: Ref, items: Ref, count: Ref, act: Ref, y: Ref, keys: Ref };
+pub const Scratch = struct { logits: Ref, pick: Ref, wts: Ref, bucket: Ref, members: Ref, items: Ref, count: Ref, act: Ref, y: Ref };
 
-pub const Sizes = struct { logits: usize, pick: usize, wts: usize, bucket: usize, members: usize, items: usize, count: usize, act: usize, y: usize, keys: usize };
+pub const Sizes = struct { logits: usize, pick: usize, wts: usize, bucket: usize, members: usize, items: usize, count: usize, act: usize, y: usize };
 
 /// Bytes of each scratch view for `rows` rows at hidden `d` and expert width `width`.
 pub fn bytes(r: Route, rows: usize, d: usize, width: usize) Sizes {
     const pairs = rows * r.slots();
-    return .{ .logits = rows * r.experts * 4, .pick = pairs * 4, .wts = pairs * 4, .bucket = (r.experts + 1) * 4, .members = pairs * 4, .items = rows_.maxItems(pairs, r.experts + 1) * 12, .count = 4, .act = pairs * width * 2, .y = pairs * d * 4, .keys = rows * r.experts * 4 };
+    return .{ .logits = rows * r.experts * 4, .pick = pairs * 4, .wts = pairs * 4, .bucket = (r.experts + 1) * 4, .members = pairs * 4, .items = rows_.maxItems(pairs, r.experts + 1) * 12, .count = 4, .act = pairs * width * 2, .y = pairs * d * 4 };
 }
 
 /// out [rows, d] bf16 = the layer's MoE of x [rows, d] bf16; router [E, d] bf16 rows, bias [E] fp32.
@@ -94,7 +94,6 @@ pub fn encode(e: mtl.ComputeEncoder, p: Pipes, br: rows_.Pipes, r: Route, x: Ref
     e.setValue(a, 2);
     e.setBuffer(s.pick.buf, s.pick.off, 3);
     e.setBuffer(s.wts.buf, s.wts.off, 4);
-    e.setBuffer(s.keys.buf, s.keys.off, 5);
     e.dispatchThreads(mtl.Size.of(rows, 1, 1), mtl.Size.of(@min(rows, 64), 1, 1));
     e.barrier();
     e.setPipeline(p.plan);

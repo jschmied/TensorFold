@@ -244,7 +244,6 @@ pub const Glue = struct {
         p.refs[1] = try p.rig.input(std.mem.sliceAsBytes(logits[shape.rows * ne ..]));
         p.refs[2] = try p.rig.output(pairs * 4); // picks
         p.refs[3] = try p.rig.output(pairs * 4); // weights
-        p.refs[9] = try p.rig.scratch(shape.rows * ne * 4); // the rank keys, computed once a row
         if (p.v.kind == .plan) {
             p.refs[4] = try p.rig.scratch((ne + 1) * 4);
             p.refs[5] = try p.rig.output(pairs * 4); // members
@@ -274,7 +273,6 @@ pub const Glue = struct {
                 e.setValue(a, 2);
                 e.setBuffer(p.refs[2].buf, p.refs[2].off, 3);
                 e.setBuffer(p.refs[3].buf, p.refs[3].off, 4);
-                e.setBuffer(p.refs[9].buf, p.refs[9].off, 5);
                 e.dispatchThreads(mtl.Size.of(s.rows, 1, 1), mtl.Size.of(s.rows, 1, 1));
                 if (p.v.kind == .plan) {
                     e.barrier();

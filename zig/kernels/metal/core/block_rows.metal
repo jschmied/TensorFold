@@ -86,28 +86,7 @@ inline const device float* tf_rows_s(const device uchar* W, ulong at) {
   return (const device float*)(W + at);
 }
 
-// Column `n` over up to 16 gathered rows X + xoff[i]: codes and scale decoded once a block, sums as tf_rows_column.
-inline void tf_rows_gather(const device bfloat* X, const thread size_t* xoff, uint rows, const device uchar* W,
-    const device float* S, uint k, uint n, uint bf16, uint lane, thread float* acc) {
-  const uint kb = k / 128u;
-  for (uint r = 0; r < rows; ++r) acc[r] = 0.0f;
-  for (uint b = 0; b < kb; ++b) {
-    const uint c = b * 128u + lane * 4u;
-    const float4 w = tf_rows_w4(W, k, n, c, bf16);
-    const uint sb = TF_CTL == 1 ? min(b + 1u, kb - 1u) : b;
-    const float s = bf16 != 0 ? 1.0f : S[(n / 128u) * kb + sb];
-    for (uint r = 0; r < rows; ++r) {
-      const device bfloat* x = X + xoff[r] + c;
-      float p = float(x[0]) * w.x;
-      p = fma(float(x[1]), w.y, p);
-      p = fma(float(x[2]), w.z, p);
-      p = fma(float(x[3]), w.w, p);
-      acc[r] = bf16 != 0 ? acc[r] + simd_sum(p) : fma(simd_sum(p), s, acc[r]);
-    }
-  }
-}
-
-// Gate and up columns `n` of an item's pairs (one expert), bf16(silu(gate) * up) into act[pair][n]; fp32 gate, up.
+// Gate and up columns `n` of each pair's expert, bf16(silu(gate) * up) into act[pair][n]; fp32 gate and up.
 [[kernel, max_total_threads_per_threadgroup(128)]] void tf_block_glu(const device bfloat* X [[buffer(0)]],
     const device uchar* W [[buffer(1)]], const device TfExpertAt* at [[buffer(2)]],
     const device TfRowsItem* items [[buffer(3)]], const device uint* members [[buffer(4)]],
@@ -118,20 +97,18 @@ inline void tf_rows_gather(const device bfloat* X, const thread size_t* xoff, ui
   if (tg.y >= count[0] || n >= a.n) return;
   const TfRowsItem it = items[tg.y];
   const TfExpertAt e = at[it.expert];
-  const uint rows = min(it.count, 16u);
-  size_t xoff[16];
-  for (uint i = 0; i < rows; ++i) xoff[i] = (size_t)(members[it.first + i] / a.slots) * a.ldx;
-  float g[16], u[16];
-  tf_rows_gather(X, xoff, rows, W + e.gate, tf_rows_s(W, e.gate_s), a.k, n, a.bf16, lane, g);
-  tf_rows_gather(X, xoff, rows, W + e.up, tf_rows_s(W, e.up_s), a.k, n, a.bf16, lane, u);
-  if (lane != 0) return;
-  for (uint i = 0; i < rows; ++i) {
-    const float gi = TF_CTL == 3 ? u[i] : g[i], ui = TF_CTL == 3 ? g[i] : u[i];
-    act[(size_t)members[it.first + i] * a.n + n] = bfloat(gi / (1.0f + precise::exp(-gi)) * ui);
+  for (uint i = 0; i < it.count; ++i) {
+    const uint p = members[it.first + i];
+    const device bfloat* x = X + (size_t)(p / a.slots) * a.ldx;
+    float g, u;
+    tf_rows_column<1>(x, 0, W + e.gate, tf_rows_s(W, e.gate_s), a.k, n, 1, a.bf16, lane, &g);
+    tf_rows_column<1>(x, 0, W + e.up, tf_rows_s(W, e.up_s), a.k, n, 1, a.bf16, lane, &u);
+    if (TF_CTL == 3) { const float t = g; g = u; u = t; }
+    if (lane == 0) act[(size_t)p * a.n + n] = bfloat(g / (1.0f + precise::exp(-g)) * u);
   }
 }
 
-// Down columns `n` of an item's pairs over their act rows: fp32 y[pair][n].
+// Down columns `n` of each pair's expert over its act row: fp32 y[pair][n].
 [[kernel, max_total_threads_per_threadgroup(128)]] void tf_block_down(const device bfloat* act [[buffer(0)]],
     const device uchar* W [[buffer(1)]], const device TfExpertAt* at [[buffer(2)]],
     const device TfRowsItem* items [[buffer(3)]], const device uint* members [[buffer(4)]],
@@ -142,11 +119,10 @@ inline void tf_rows_gather(const device bfloat* X, const thread size_t* xoff, ui
   if (tg.y >= count[0] || n >= a.n) return;
   const TfRowsItem it = items[tg.y];
   const TfExpertAt e = at[it.expert];
-  const uint rows = min(it.count, 16u);
-  size_t xoff[16];
-  for (uint i = 0; i < rows; ++i) xoff[i] = (size_t)members[it.first + i] * a.k;
-  float y[16];
-  tf_rows_gather(act, xoff, rows, W + e.down, tf_rows_s(W, e.down_s), a.k, n, a.bf16, lane, y);
-  if (lane != 0) return;
-  for (uint i = 0; i < rows; ++i) Y[(size_t)members[it.first + i] * a.n + n] = y[i];
+  for (uint i = 0; i < it.count; ++i) {
+    const uint p = members[it.first + i];
+    float y;
+    tf_rows_column<1>(act + (size_t)p * a.k, 0, W + e.down, tf_rows_s(W, e.down_s), a.k, n, 1, a.bf16, lane, &y);
+    if (lane == 0) Y[(size_t)p * a.n + n] = y;
+  }
 }

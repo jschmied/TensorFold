@@ -24,15 +24,15 @@ inline float tf_moe_choice(const device float* lg, const device float* bias, uin
   return (score != 0 ? tf_moe_sigmoid(lg[e]) : lg[e]) + bias[e];
 }
 
-// The `keep` groups (of experts / groups, at least two each) of the best top-2 key sums, ties to the lower group.
-inline uint tf_moe_kept(const device float* key, constant TfMoeArgs& a) {
+// The `keep` groups (of experts / groups) of the best top-2 choice sums, ties to the lower group, as bits.
+inline uint tf_moe_kept(const device float* lg, const device float* bias, constant TfMoeArgs& a) {
   if (a.groups <= 1) return ~0u;
   const uint gs = a.experts / a.groups;
   float sums[32];
   for (uint g = 0; g < a.groups; ++g) {
     float x = -INFINITY, y = -INFINITY;
     for (uint e = g * gs; e < g * gs + gs; ++e) {
-      const float c = key[e];
+      const float c = tf_moe_choice(lg, bias, e, a.score);
       if (c > x) { y = x; x = c; } else if (c > y) { y = c; }
     }
     sums[g] = x + y;
@@ -47,27 +47,25 @@ inline uint tf_moe_kept(const device float* key, constant TfMoeArgs& a) {
   return kept;
 }
 
-// Row r's top-k by fp32 rank key (computed once into keys[r]) in the kept groups, lower id on ties; sigmoid weights.
+// Row r's top-k by choice in the kept groups (the lower id on ties); weight sigmoid(logit), [normalised], scaled.
 [[kernel, max_total_threads_per_threadgroup(64)]] void tf_moe_select(const device float* logits [[buffer(0)]], const device float* bias [[buffer(1)]],
     constant TfMoeArgs& a [[buffer(2)]], device uint* expert_of [[buffer(3)]], device float* weight [[buffer(4)]],
-    device float* keys [[buffer(5)]], uint r [[thread_position_in_grid]]) {
+    uint r [[thread_position_in_grid]]) {
   if (r >= a.rows) return;
   const uint slots = a.topk + a.shared;
   const device float* lg = logits + (size_t)r * a.experts;
-  device float* key = keys + (size_t)r * a.experts;
   device uint* pick = expert_of + (size_t)r * slots;
   device float* w = weight + (size_t)r * slots;
-  for (uint e = 0; e < a.experts; ++e) key[e] = tf_moe_choice(lg, bias, e, a.score);
-  const uint kept = tf_moe_kept(key, a), gs = a.groups <= 1 ? a.experts : a.experts / a.groups;
+  const uint kept = tf_moe_kept(lg, bias, a), gs = a.groups <= 1 ? a.experts : a.experts / a.groups;
   float total = 0.0f;
   for (uint s = 0; s < a.topk; ++s) {
     uint best = a.experts;
-    float top = -INFINITY;
+    float key = -INFINITY;
     for (uint e = 0; e < a.experts; ++e) {
       bool taken = !((kept >> (e / gs)) & 1u);
       for (uint t = 0; t < s; ++t) taken = taken || pick[t] == e;
-      const float v = key[e];
-      if (!taken && (best == a.experts || (TF_CTL == 1 ? v >= top : v > top))) { best = e; top = v; }
+      const float v = tf_moe_choice(lg, bias, e, a.score);
+      if (!taken && (best == a.experts || (TF_CTL == 1 ? v >= key : v > key))) { best = e; key = v; }
     }
     pick[s] = best;
     w[s] = tf_moe_sigmoid(lg[best]);
