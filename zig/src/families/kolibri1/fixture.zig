@@ -121,7 +121,7 @@ pub fn write(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, s: Shape) !voi
     defer arena.deinit();
     const a = arena.allocator();
     try dir.writeFile(io, .{ .sub_path = "config.json", .data = try configText(a, s) });
-    try fixture.write(a, io, dir, "model.safetensors", try entries(a, s));
+    try dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = try fixture.aligned(a, try entries(a, s)) }); // tensors on 16 bytes
 }
 
 const testing = std.testing;

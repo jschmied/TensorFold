@@ -183,7 +183,7 @@ fn moeRow(cx: *Ctx, r: usize, t: []f64) void {
     for (cx.x[r * d ..][0..d]) |*v| v.* = roundBf16(v.*);
 }
 
-/// Top-k by fp32 logit + bias (lower id on ties), weight fp32 sigmoid(logit), unnormalised; the shared expert at 1.
+/// Top-k by the fp32 sum logit + bias (lower id on ties), weight fp32 sigmoid(logit), unnormalised; the shared expert at 1.
 fn moe(cx: *Ctx, L: names.Layer, x: []const f64, out: []f64, t: []f64) void {
     const c = cx.c;
     const d = c.hidden;
@@ -197,7 +197,7 @@ fn moe(cx: *Ctx, L: names.Layer, x: []const f64, out: []f64, t: []f64) void {
         var acc: f64 = 0;
         for (x, 0..) |v, i| acc += v * bf16At(L.router.?, e * d + i);
         lg.* = roundF32(acc);
-        ky.* = lg.* + bf16At(L.bias.?, e);
+        ky.* = roundF32(lg.* + bf16At(L.bias.?, e)); // the kernels rank one fp32 sum (core/moe_ref.zig)
     }
     for (0..c.top_k + 1) |slot| {
         var e: usize = c.experts;

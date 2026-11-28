@@ -253,6 +253,12 @@ pub const core_lane_projection = @embedFile("core/lane_projection.metal");
 pub const core_lane_order = @embedFile("core/lane_order.metal");
 /// Lane rows attending a shared context through an explicit mask (core/shared_attention.zig).
 pub const core_shared_attention = @embedFile("core/shared_attention.metal");
+/// Products over 128-column blocks, block-FP8 or bf16 weights: dense rows and expert pairs (core/block_rows.zig).
+pub const core_block_rows = @embedFile("core/block_rows.metal");
+/// A sigmoid + bias MoE route at any expert count: picks, groups and the ordered combine (core/moe_sigmoid.zig).
+pub const core_moe_sigmoid = @embedFile("core/moe_sigmoid.metal");
+/// Embedding widen, RMS norms and the sandwich add, q/k norms with RoPE into a cache (core/row_glue.zig).
+pub const core_row_glue = @embedFile("core/row_glue.metal");
 /// The core DeltaNet kernels (core/deltanet_kernels.zig).
 pub const core_deltanet = @embedFile("core/deltanet.metal") ++ "\n" ++ @embedFile("core/deltanet_slots.metal");
 /// SenseNova-Loop two-stream mHC routing, stream enter/leave collapse, and norm kernels.
