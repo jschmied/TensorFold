@@ -159,6 +159,10 @@ pub const kv_pool = @import("core/kv_pool.zig");
 pub const rope_freq = @import("core/rope_freq.zig");
 
 pub const shared_attention = @import("core/shared_attention.zig");
+/// Runtime-shaped Metal blocks (core/metal_blocks.zig): block products, the sigmoid MoE layer, row glue.
+pub const block_rows = @import("core/block_rows.zig");
+pub const moe_sigmoid = @import("core/moe_sigmoid.zig");
+pub const row_glue = @import("core/row_glue.zig");
 
 pub const tile_qmm = @import("core/tile_qmm.zig");
 

@@ -48,7 +48,7 @@ inline uint tf_moe_kept(const device float* lg, const device float* bias, consta
 }
 
 // Row r's top-k by choice in the kept groups (the lower id on ties); weight sigmoid(logit), [normalised], scaled.
-[[kernel]] void tf_moe_select(const device float* logits [[buffer(0)]], const device float* bias [[buffer(1)]],
+[[kernel, max_total_threads_per_threadgroup(64)]] void tf_moe_select(const device float* logits [[buffer(0)]], const device float* bias [[buffer(1)]],
     constant TfMoeArgs& a [[buffer(2)]], device uint* expert_of [[buffer(3)]], device float* weight [[buffer(4)]],
     uint r [[thread_position_in_grid]]) {
   if (r >= a.rows) return;
@@ -81,7 +81,7 @@ struct TfMoeItem {
 };
 
 // Pairs grouped by expert, in pair order within one, then items of at most 16 pairs: one thread, any count.
-[[kernel]] void tf_moe_plan(const device uint* expert_of [[buffer(0)]], constant TfMoeArgs& a [[buffer(1)]],
+[[kernel, max_total_threads_per_threadgroup(32)]] void tf_moe_plan(const device uint* expert_of [[buffer(0)]], constant TfMoeArgs& a [[buffer(1)]],
     device uint* bucket [[buffer(2)]], device uint* members [[buffer(3)]], device TfMoeItem* items [[buffer(4)]],
     device uint* count [[buffer(5)]], uint t [[thread_position_in_grid]]) {
   if (t != 0) return;
@@ -100,7 +100,7 @@ struct TfMoeItem {
 }
 
 // out[r][d] = bf16 of each slot's weight times its fp32 y, added in slot order.
-[[kernel]] void tf_moe_combine(const device float* y [[buffer(0)]], const device float* weight [[buffer(1)]],
+[[kernel, max_total_threads_per_threadgroup(256)]] void tf_moe_combine(const device float* y [[buffer(0)]], const device float* weight [[buffer(1)]],
     constant TfMoeArgs& a [[buffer(2)]], device bfloat* out [[buffer(3)]], uint2 id [[thread_position_in_grid]]) {
   const uint d = id.x, r = id.y;
   if (d >= a.ldy || r >= a.rows) return;

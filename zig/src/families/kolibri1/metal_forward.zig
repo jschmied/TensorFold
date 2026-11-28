@@ -72,7 +72,7 @@ pub const Model = struct {
         const z = moe.bytes(m.route, r, d, c.moe_width);
         var ms: [9]mtl.Buffer = undefined;
         for (&ms, [_]usize{ z.logits, z.pick, z.wts, z.bucket, z.members, z.items, z.count, z.act, z.y }) |*b, n| b.* = try m.buffer(n);
-        m.s = .{ .ids = try m.buffer(r * 4), .pos = try m.buffer(r * 4), .res = try m.buffer(r * d * 4), .x = try m.buffer(r * d * 2), .qkv = try m.buffer(r * c.qkvDim() * 2), .q = try m.buffer(r * c.heads * c.head_dim * 2), .att = try m.buffer(r * c.heads * c.head_dim * 2), .o = try m.buffer(r * d * 2), .mo = try m.buffer(r * d * 2), .mask = try m.buffer(r * cap), .logits = try m.buffer(r * c.vocab * 4), .moe = ms };
+        m.s = .{ .ids = try m.buffer(r * 4), .pos = try m.buffer(r * 4), .res = try m.buffer(r * d * 4), .x = try m.buffer(r * d * 2), .qkv = try m.buffer(r * c.qkvDim() * 2), .q = try m.buffer(r * c.heads * c.head_dim * 2), .att = try m.buffer(r * c.heads * c.head_dim * 2), .o = try m.buffer(r * d * 2), .mo = try m.buffer(r * d * 2), .mask = try m.buffer(2 * r * cap), .logits = try m.buffer(r * c.vocab * 4), .moe = ms };
         return m;
     }
 
@@ -137,6 +137,11 @@ pub const Model = struct {
         e.barrier();
         m.glue.rmsNorm(e, .{ .buf = m.s.res }, m.w.layers[0].input_norm, .{ .buf = m.s.x }, ga);
         e.barrier();
+        // one command buffer reads every mask: sliding layers' at 0, full layers' after, each written once
+        const last = m.p + n - 1;
+        const mask = m.s.mask.contents();
+        masks(mask[0 .. n * m.slidingKeys(last)], m.p, n, m.slidingKeys(last), .{ .window = c.window, .ring = m.ring });
+        masks(mask[n * m.ring ..][0 .. n * (last + 1)], m.p, n, last + 1, null);
         const z = m.s.moe;
         const sc: moe.Scratch = .{ .logits = .{ .buf = z[0] }, .pick = .{ .buf = z[1] }, .wts = .{ .buf = z[2] }, .bucket = .{ .buf = z[3] }, .members = .{ .buf = z[4] }, .items = .{ .buf = z[5] }, .count = .{ .buf = z[6] }, .act = .{ .buf = z[7] }, .y = .{ .buf = z[8] } };
         for (m.w.layers, 0..) |L, i| {
@@ -189,18 +194,21 @@ pub const Model = struct {
         try m.glue.qk(e, .{ .qkv = .{ .buf = m.s.qkv }, .q_norm = L.q_norm, .k_norm = L.k_norm, .cos = .{ .buf = m.cos }, .sin = .{ .buf = m.sin }, .pos = .{ .buf = m.s.pos }, .q = .{ .buf = m.s.q }, .k_cache = .{ .buf = m.k[i] }, .v_cache = .{ .buf = m.v[i] } }, .{ .rows = @intCast(n), .heads = @intCast(c.heads), .kv_heads = @intCast(c.kv_heads), .dim = @intCast(dh), .rope = @intFromBool(!full), .ring = if (full) 0 else @intCast(m.ring), .eps = c.eps });
         e.barrier();
         const last = m.p + n - 1;
-        const keys = if (full) last + 1 else @min(m.ring, last + 1);
+        const keys = if (full) last + 1 else m.slidingKeys(last);
         const scale: f32 = @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(dh))));
-        const mask = m.s.mask.contents();
-        masks(mask[0 .. n * keys], m.p, n, keys, if (full) null else .{ .window = c.window, .ring = m.ring });
+        const base = if (full) n * m.ring else 0;
         var at: usize = 0;
         while (at < n) : (at += 16) {
             const r = @min(16, n - at);
-            try m.att.encodeSplit(e, r, keys, keys, scale, .{ .buf = m.s.q, .off = at * qd * 2 }, .{ .buf = m.k[i] }, .{ .buf = m.v[i] }, .{ .buf = m.s.mask, .off = at * keys }, .{ .buf = m.s.att, .off = at * qd * 2 });
+            try m.att.encodeSplit(e, r, keys, keys, scale, .{ .buf = m.s.q, .off = at * qd * 2 }, .{ .buf = m.k[i] }, .{ .buf = m.v[i] }, .{ .buf = m.s.mask, .off = base + at * keys }, .{ .buf = m.s.att, .off = at * qd * 2 });
             e.barrier();
         }
         try m.dense16(e, .{ .buf = m.s.att }, L.o, .{ .buf = m.s.o }, n, qd, d, d);
         e.barrier();
+    }
+
+    fn slidingKeys(m: *const Model, last: usize) usize {
+        return @min(m.ring, last + 1);
     }
 
     fn dense16(m: *Model, e: mtl.ComputeEncoder, x: Ref, w: [2]Ref, out: Ref, n: usize, k: usize, cols: usize, ldy: usize) !void {

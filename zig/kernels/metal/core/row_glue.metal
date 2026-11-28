@@ -28,7 +28,7 @@ inline float tf_glue_inv(float ss, uint width, float eps) {
 }
 
 // res[r] = table[ids[r]] widened exactly; one thread an element.
-[[kernel]] void tf_glue_embed(const device uint* ids [[buffer(0)]], const device bfloat* table [[buffer(1)]],
+[[kernel, max_total_threads_per_threadgroup(256)]] void tf_glue_embed(const device uint* ids [[buffer(0)]], const device bfloat* table [[buffer(1)]],
     constant TfGlueArgs& a [[buffer(2)]], device float* res [[buffer(3)]], uint2 id [[thread_position_in_grid]]) {
   if (id.x >= a.width || id.y >= a.rows) return;
   res[(size_t)id.y * a.width + id.x] = float(table[(size_t)ids[id.y] * a.width + id.x]);
@@ -74,7 +74,7 @@ struct TfQkArgs {
 };
 
 // One simdgroup a (row, head): q/k normed, neox RoPE by fp32 [pos][dim] tables, rounded once; k, v into cache rows.
-[[kernel]] void tf_glue_qk(const device bfloat* qkv [[buffer(0)]], const device bfloat* qn [[buffer(1)]],
+[[kernel, max_total_threads_per_threadgroup(32)]] void tf_glue_qk(const device bfloat* qkv [[buffer(0)]], const device bfloat* qn [[buffer(1)]],
     const device bfloat* kn [[buffer(2)]], const device float* cos_t [[buffer(3)]],
     const device float* sin_t [[buffer(4)]], const device uint* pos [[buffer(5)]], constant TfQkArgs& a [[buffer(6)]],
     device bfloat* q [[buffer(7)]], device bfloat* kc [[buffer(8)]], device bfloat* vc [[buffer(9)]],

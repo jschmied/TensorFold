@@ -11,6 +11,7 @@ pub const rows = @import("contract/rows.zig");
 pub const reference_threads = @import("contract/reference_threads.zig");
 pub const affine = @import("contract/affine.zig");
 pub const dense = @import("contract/dense.zig");
+pub const norms_ref = @import("norms_ref.zig");
 pub const bf16_round = @import("bf16_round");
 pub const attention_range = @import("attention_range.zig");
 pub const limits = @import("contract/limits.zig");
@@ -56,6 +57,7 @@ test {
     _ = @import("contract/simd_half_records.zig");
     _ = @import("contract/glm_rows_records.zig");
     _ = @import("contract/glm_tap_records.zig");
+    _ = @import("contract/core_blocks_records.zig");
     _ = @import("contract/glm_dflash_records.zig");
     _ = @import("contract/row_wide_records.zig");
     _ = @import("contract/nemotron_experts_records.zig");

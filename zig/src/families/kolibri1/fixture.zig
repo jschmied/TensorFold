@@ -45,6 +45,15 @@ const Gen = struct {
         try g.add(name, "BF16", shape, std.mem.sliceAsBytes(out));
     }
 
+    /// The last router and bias entries' expert 1 made expert 0's: equal logits and keys, ties to the lower id.
+    fn tie(g: *Gen, d: usize) void {
+        const it = g.list.items;
+        const router: []u8 = @constCast(it[it.len - 2].bytes);
+        const bias: []u8 = @constCast(it[it.len - 1].bytes);
+        @memcpy(router[2 * d ..][0 .. 2 * d], router[0 .. 2 * d]);
+        @memcpy(bias[2..4], bias[0..2]);
+    }
+
     /// e4m3 codes [n, k] (signed zeros, subnormals, normals to 2^1; no NaN) and fp32 scales unequal block to block.
     fn fp8Proj(g: *Gen, pre: []const u8, n: usize, k: usize) !void {
         const r = g.rng.random();
@@ -103,6 +112,7 @@ pub fn entries(a: std.mem.Allocator, s: Shape) ![]const fixture.Entry {
             try g.fp8Proj(try std.fmt.allocPrint(a, "{s}self_attn.{s}_proj", .{ p, x[0] }), x[1], x[2]);
         try g.bf16(try std.fmt.allocPrint(a, "{s}mlp.gate.weight", .{p}), &.{ s.experts, d }, 0, 1 / @sqrt(@as(f32, @floatFromInt(d))));
         try g.bf16(try std.fmt.allocPrint(a, "{s}moe.router.expert_bias", .{p}), &.{s.experts}, 0, 0.1);
+        g.tie(d); // experts 0 and 1 tie exactly in every row: the lower-id rule decides
         for (0..s.experts + 1) |j| {
             const e = if (j < s.experts) try std.fmt.allocPrint(a, "{s}mlp.experts.{d}", .{ p, j }) else try std.fmt.allocPrint(a, "{s}mlp.shared_experts", .{p});
             try g.fp8Proj(try std.fmt.allocPrint(a, "{s}.gate_proj", .{e}), s.width, d);

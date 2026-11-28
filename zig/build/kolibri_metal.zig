@@ -25,4 +25,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const bare = b.createModule(.{ .root_source_file = b.path("zig/src/metal/metal.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const obj = b.addObject(.{ .name = "kolibri-metal-check", .root_module = modules(b, target, optimize, bare, sources)[1] });
     b.step("compile-kolibri-metal", "Compile tf-kolibri-metal without linking or running a shader").dependOn(&obj.step);
+    const blocks = b.createModule(.{ .root_source_file = b.path("zig/src/core/metal_blocks.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "metal", .module = bare }, .{ .name = "kernel_sources", .module = sources } } });
+    const suite = b.createModule(.{ .root_source_file = b.path("zig/tests/contract/core_blocks_check.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "metal", .module = bare }, .{ .name = "tensorfold", .module = blocks }, .{ .name = "contract", .module = @import("kernel_contract.zig").module(b, target, optimize) }, .{ .name = "kernel_sources", .module = sources } } });
+    b.step("compile-core-blocks-contract", "Compile the core Metal blocks' contract suites without linking or a Metal compiler").dependOn(&b.addObject(.{ .name = "core-blocks-contract", .root_module = suite }).step);
 }

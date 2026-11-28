@@ -372,6 +372,15 @@ fn resolve(a: std.mem.Allocator, device: mtl.Device, d: limits.MetalLaunch, comp
     } else if (std.mem.startsWith(u8, d.name, "glm tap ")) {
         if (!assemble) return undefined;
         text = sources.glm_glue;
+    } else if (std.mem.startsWith(u8, d.name, "core rows ")) {
+        if (!assemble) return undefined;
+        text = try tf.block_rows.source(a, .f32, 0);
+    } else if (std.mem.startsWith(u8, d.name, "core glue tf_moe_")) {
+        if (!assemble) return undefined;
+        text = try tf.moe_sigmoid.source(a, 0);
+    } else if (std.mem.startsWith(u8, d.name, "core glue ")) {
+        if (!assemble) return undefined;
+        text = try tf.row_glue.source(a, 0);
     } else if (std.mem.startsWith(u8, d.name, "glm ")) {
         if (!assemble) return undefined;
         const key = d.name[4..std.mem.indexOfScalarPos(u8, d.name, 4, ' ').?];

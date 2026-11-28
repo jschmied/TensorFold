@@ -30,7 +30,8 @@ pub const Route = struct {
 
 pub const Args = extern struct { rows: u32, experts: u32, topk: u32, shared: u32, ldy: u32, score: u32, normalize: u32, groups: u32, keep: u32, scale: f32 };
 
-fn args(r: Route, rows: usize, ldy: usize) Args {
+/// The kernels' arguments for `rows` rows of y stride `ldy` (the contract binds them too).
+pub fn argsOf(r: Route, rows: usize, ldy: usize) Args {
     return .{ .rows = @intCast(rows), .experts = @intCast(r.experts), .topk = @intCast(r.topk), .shared = @intFromBool(r.shared), .ldy = @intCast(ldy), .score = @intFromBool(r.score), .normalize = @intFromBool(r.normalize), .groups = @intCast(r.groups), .keep = @intCast(r.keep), .scale = r.scale };
 }
 
@@ -81,7 +82,7 @@ pub fn bytes(r: Route, rows: usize, d: usize, width: usize) Sizes {
 pub fn encode(e: mtl.ComputeEncoder, p: Pipes, br: rows_.Pipes, r: Route, x: Ref, d: usize, rows: usize, router: Ref, bias: Ref, ex: Experts, s: Scratch, out: Ref) !void {
     try r.check();
     if (rows == 0) return error.EmptyRows;
-    const a = args(r, rows, d);
+    const a = argsOf(r, rows, d);
     var at: usize = 0;
     while (at < rows) : (at += 16) { // the router's 16-row launches
         const n = @min(16, rows - at);

@@ -377,6 +377,10 @@ pub fn main(init: std.process.Init) !u8 {
     try glm_launches.collect(o.only);
     var glm_tap = try @import("metal_glm_tap_ring.zig").Suite.create(a, device, queue, &kernels, o.only);
     defer glm_tap.destroy();
+    var core_rows = try @import("metal_core_rows.zig").Suite.create(a, device, queue, &kernels, o.only);
+    defer core_rows.destroy();
+    var core_glue = try @import("metal_core_glue.zig").Suite.create(a, device, queue, &kernels, o.only);
+    defer core_glue.destroy();
     var glm_dflash_opt = try @import("metal_glm_dflash_opt.zig").Suite.create(a, device, queue, &kernels, o.only);
     defer glm_dflash_opt.destroy();
     var glm_dflash_head: @import("metal_glm_dflash_head.zig").Suite = .{ .a = a, .device = device, .queue = queue, .kernels = &kernels };
