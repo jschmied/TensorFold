@@ -16,8 +16,8 @@ pub fn ringSize(rows: usize, window: usize) usize {
     return (rows + window + 63) / 64 * 64;
 }
 
-/// Residuals after each layer's attention half and MoE half, fp32 [layers][2][rows][D], when a forward asks.
-pub const Taps = struct { buf: mtl.Buffer, rows: usize };
+/// Residuals after each layer's attention and MoE halves, fp32 [layers][2][rows][D]; picks u32 [layers][rows][slots].
+pub const Taps = struct { buf: mtl.Buffer, rows: usize, picks: ?mtl.Buffer = null };
 
 pub const Model = struct {
     gpa: std.mem.Allocator,
@@ -129,6 +129,7 @@ pub const Model = struct {
             pos.* = @intCast(m.p + i);
         }
         if (taps) |t| if (t.rows < n or t.buf.length() < c.layers * 2 * n * c.hidden * 4) return error.TapsTooSmall;
+        if (taps) |t| if (t.picks) |pk| if (pk.length() < c.layers * n * m.route.slots() * 4) return error.TapsTooSmall;
         const cb = m.queue.commandBuffer();
         var e = cb.compute(.serial);
         const d = c.hidden;
@@ -155,6 +156,10 @@ pub const Model = struct {
             m.glue.addRms(e, .{ .buf = m.s.mo }, .{ .buf = m.s.res }, L.post_moe_norm, next, .{ .buf = m.s.x }, ga);
             e.barrier();
             if (taps) |t| e = tap(cb, e, m.s.res, t.buf, (i * 2 + 1) * n * d * 4, n * d * 4);
+            if (taps) |t| if (t.picks) |pk| {
+                const per = n * m.route.slots() * 4;
+                e = tap(cb, e, z[1], pk, i * per, per);
+            };
         }
         const first = if (all) 0 else n - 1;
         try project(e, m.rows, 4, .{ .buf = m.s.x, .off = first * d * 2 }, .{ m.w.head, m.w.head }, .{ .buf = m.s.logits }, n - first, d, c.vocab, c.vocab, true);

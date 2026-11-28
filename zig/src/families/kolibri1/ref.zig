@@ -71,8 +71,9 @@ const Ctx = struct {
     att: []f64, // [n, H * Dh]
     tmp: []f64, // per worker scratch
     tmp_len: usize,
-    picks: ?[]u32 = null, // [n][top_k + 1] each slot's expert, when a caller asks
-    gaps: ?[]f64 = null, // [n] the last routed pick's key minus the best key left out
+    picks: ?[]u32 = null, // [n][top_k + 1] this reference's own choice per slot, when a caller asks
+    keys: ?[]f64 = null, // [n][E] the fp32 rank keys it chose by
+    force: ?[]const u32 = null, // [n][top_k + 1] experts to run instead of its own (a device's routes)
 };
 
 /// Calls f(ctx, row, scratch) for every row over the machine's cores.
@@ -201,19 +202,19 @@ fn moe(cx: *Ctx, L: names.Layer, r: usize, x: []const f64, out: []f64, t: []f64)
         lg.* = roundF32(acc);
         ky.* = roundF32(lg.* + bf16At(L.bias.?, e)); // the kernels rank one fp32 sum (core/moe_ref.zig)
     }
-    for (0..c.top_k + 1) |slot| {
-        var e: usize = c.experts;
-        var w: f64 = 1;
-        if (slot < c.top_k) {
-            e = std.mem.indexOfMax(f64, key);
-            const ky0 = key[e];
-            w = roundF32(1.0 / (1.0 + @exp(-logit[e])));
-            key[e] = -std.math.inf(f64);
-            if (slot + 1 == c.top_k) if (cx.gaps) |g| {
-                g[r] = ky0 - key[std.mem.indexOfMax(f64, key)];
-            };
-        }
-        if (cx.picks) |p| p[r * (c.top_k + 1) + slot] = @intCast(e);
+    const slots = c.top_k + 1;
+    if (cx.keys) |k| @memcpy(k[r * c.experts ..][0..c.experts], key);
+    var own: [64]u32 = undefined;
+    for (own[0..c.top_k]) |*o| {
+        o.* = @intCast(std.mem.indexOfMax(f64, key)); // the lower id on ties
+        key[o.*] = -std.math.inf(f64);
+    }
+    own[c.top_k] = @intCast(c.experts);
+    if (cx.picks) |p| @memcpy(p[r * slots ..][0..slots], own[0..slots]);
+    const use = if (cx.force) |f| f[r * slots ..][0..slots] else own[0..slots];
+    for (use, 0..) |pe, slot| {
+        const e: usize = pe;
+        const w: f64 = if (slot < c.top_k) roundF32(1.0 / (1.0 + @exp(-logit[e]))) else 1;
         const ex = L.experts[e];
         fp8Rows(&cx.lut, ex.gate.w, ex.gate.s, x, gate);
         fp8Rows(&cx.lut, ex.up.w, ex.up.s, x, up);
@@ -224,11 +225,12 @@ fn moe(cx: *Ctx, L: names.Layer, r: usize, x: []const f64, out: []f64, t: []f64)
 }
 
 /// One layer's MoE half alone: `res` [n, D] (the attention half's residual) becomes the layer's output residual.
-pub fn moeHalf(a: std.mem.Allocator, m: *const names.Map, c: Config, layer: usize, res: []f64, picks: ?[]u32, gaps: ?[]f64) !void {
+pub fn moeHalf(a: std.mem.Allocator, m: *const names.Map, c: Config, layer: usize, res: []f64, picks: ?[]u32, keys: ?[]f64) !void {
+    if (c.top_k >= 64) return error.TopKPastReference;
     const n = res.len / c.hidden;
     const per = 3 * c.hidden + 2 * c.experts + 2 * c.moe_width;
     const workers = @min(std.Thread.getCpuCount() catch 1, 64);
-    var cx: Ctx = .{ .m = m, .c = c, .lut = undefined, .layer = layer, .n = n, .tokens = &.{}, .res = res, .x = try a.alloc(f64, n * c.hidden), .q = &.{}, .k = &.{}, .v = &.{}, .att = &.{}, .tmp = try a.alloc(f64, workers * per), .tmp_len = per, .picks = picks, .gaps = gaps };
+    var cx: Ctx = .{ .m = m, .c = c, .lut = undefined, .layer = layer, .n = n, .tokens = &.{}, .res = res, .x = try a.alloc(f64, n * c.hidden), .q = &.{}, .k = &.{}, .v = &.{}, .att = &.{}, .tmp = try a.alloc(f64, workers * per), .tmp_len = per, .picks = picks, .keys = keys };
     defer a.free(cx.x);
     defer a.free(cx.tmp);
     for (&cx.lut, 0..) |*v, i| v.* = e4m3(@intCast(i));
@@ -248,6 +250,15 @@ fn headRow(cx: *Ctx, r: usize, _: []f64) void {
 
 /// `tokens` at positions 0.. through every layer of `m` (Kolibri-1, block FP8): taps and every row's logits.
 pub fn run(a: std.mem.Allocator, m: *const names.Map, c: Config, tokens: []const u32) !Out {
+    return runWith(a, m, c, tokens, .{});
+}
+
+/// Per layer: its own picks and keys out, or a device's picks to run instead (teacher-forced routes).
+pub const Routes = struct { picks: ?[]const []u32 = null, keys: ?[]const []f64 = null, force: ?[]const []const u32 = null };
+
+/// The `run` above, with each layer's routes recorded or forced.
+pub fn runWith(a: std.mem.Allocator, m: *const names.Map, c: Config, tokens: []const u32, routes: Routes) !Out {
+    if (c.top_k >= 64) return error.TopKPastReference;
     if (c.v11) return error.Kolibri11NotCovered;
     const n = tokens.len;
     const d = c.hidden;
@@ -283,6 +294,9 @@ pub fn run(a: std.mem.Allocator, m: *const names.Map, c: Config, tokens: []const
         try rows(&cx, attnRow);
         try rows(&cx, restRow);
         out.attn[i] = try a.dupe(f64, cx.res);
+        cx.picks = if (routes.picks) |p| p[i] else null;
+        cx.keys = if (routes.keys) |k| k[i] else null;
+        cx.force = if (routes.force) |f| f[i] else null;
         try rows(&cx, moeRow);
         out.moe[i] = try a.dupe(f64, cx.res);
     }

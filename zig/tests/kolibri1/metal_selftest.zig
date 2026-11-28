@@ -20,6 +20,8 @@ const gates = struct {
     const cosine = 0.9999; // every row's logits and each tap row against float64
     const rel = 0.02; // a tap row's relative L2 error
     const tie = 1e-3; // a top-1 swap passes only where float64's own top-2 margin is below this
+    const alone_margin = 1e-3; // MoE alone: a pick may differ only where the host's rank keys are this close
+    const flip_margin = 2e-2; // the chain: a route may differ only where the reference's own keys are this close
 };
 
 const Stats = struct { worst_cos: f64 = 1, worst_row: usize = 0, worst_rel: f64 = 0, swaps: usize = 0, ties: usize = 0, rows: usize = 0, ok: bool = true };
@@ -86,32 +88,48 @@ fn run(a: std.mem.Allocator, m: *fwd.Model, ids: []const u32, chunk: usize, sing
     return out;
 }
 
-/// Each layer's MoE half on the host from Metal's attention residual; the last layer's picks against the host's.
-fn local(a: std.mem.Allocator, map: *const k1.names.Map, c: k1.config.Config, m: *fwd.Model, tapped: []const f32) !bool {
+/// The reference's key gap at the first slot the routes differ (none: equal; 0: a tie broken the wrong way).
+fn gap(keys: []const f64, own: []const u32, got: []const u32, k: usize) ?f64 {
+    for (0..k) |s| if (own[s] != got[s]) return if (got[s] >= keys.len) std.math.inf(f64) else keys[own[s]] - keys[got[s]];
+    return null;
+}
+
+/// Device routes against the reference's own, layer by layer: how many rows differ, and whether each is a near tie.
+fn routes(name: []const u8, c: k1.config.Config, own: []const u32, keys: []const f64, got: []const u32, bound: f64) bool {
+    const slots = c.top_k + 1;
+    const n = own.len / slots;
+    var differ: usize = 0;
+    var worst: f64 = 0;
+    var bad: usize = 0;
+    for (0..n) |r| {
+        const g = gap(keys[r * c.experts ..][0..c.experts], own[r * slots ..][0..slots], got[r * slots ..][0..slots], c.top_k) orelse continue;
+        differ += 1;
+        worst = @max(worst, g);
+        if (!(g > 0 and g < bound)) {
+            bad += 1;
+            if (bad <= 3) std.debug.print("  row {d}: device {any}, reference {any}, key gap {e:.3}\n", .{ r, got[r * slots ..][0..slots], own[r * slots ..][0..slots], g });
+        }
+    }
+    std.debug.print("{s} {s}: {d} of {d} rows route differently, largest key gap {e:.3} (bound {e:.0}, ties broken wrong or past it: {d})\n", .{ if (bad == 0) "PASS" else "FAIL", name, differ, n, worst, bound, bad });
+    return bad == 0;
+}
+
+/// Each layer's MoE half on the host from Metal's attention residual, and its picks against Metal's.
+fn local(a: std.mem.Allocator, map: *const k1.names.Map, c: k1.config.Config, tapped: []const f32, picks: []const u32) !bool {
     const d = c.hidden;
     const slots = c.top_k + 1;
     var ok = true;
     for (0..c.layers) |l| {
         const res = try a.alloc(f64, tokens_n * d);
         for (res, tapped[l * 2 * tokens_n * d ..][0 .. tokens_n * d]) |*o, v| o.* = v;
-        const last = l + 1 == c.layers;
         const hp = try a.alloc(u32, tokens_n * slots);
-        const gaps = try a.alloc(f64, tokens_n);
-        try k1.ref.moeHalf(a, map, c, l, res, hp, gaps);
+        const keys = try a.alloc(f64, tokens_n * c.experts);
+        try k1.ref.moeHalf(a, map, c, l, res, hp, keys);
         var st: Stats = .{};
         compare(&st, tapped[(l * 2 + 1) * tokens_n * d ..][0 .. tokens_n * d], res, d, false);
-        report(try std.fmt.allocPrint(a, "A layer {d} MoE alone (worst row {d}, its edge margin {e:.2})", .{ l, st.worst_row, gaps[st.worst_row] }), st);
+        report(try std.fmt.allocPrint(a, "A layer {d} MoE alone (from Metal's attention residual)", .{l}), st);
         ok = ok and st.ok;
-        if (!last) continue;
-        const mp = m.s.moe[1].slice(u32, tokens_n * slots);
-        var differ: usize = 0;
-        for (0..tokens_n) |r| {
-            if (std.mem.eql(u32, mp[r * slots ..][0..slots], hp[r * slots ..][0..slots])) continue;
-            differ += 1;
-            if (differ <= 3) std.debug.print("  row {d}: metal picks {any}, host {any}, margin {e:.2}\n", .{ r, mp[r * slots ..][0..slots], hp[r * slots ..][0..slots], gaps[r] });
-        }
-        std.debug.print("{s} A layer {d} picks: {d} of {d} rows differ from the host's\n", .{ if (differ == 0) "PASS" else "FAIL", l, differ, tokens_n });
-        ok = ok and differ == 0;
+        ok = routes(try std.fmt.allocPrint(a, "A layer {d} MoE alone, picks", .{l}), c, hp, keys, picks[l * tokens_n * slots ..][0 .. tokens_n * slots], gates.alone_margin) and ok;
     }
     return ok;
 }
@@ -177,7 +195,14 @@ pub fn main(init: std.process.Init) !u8 {
     var map = try k1.names.map(gpa, &ck, c);
     defer map.deinit();
     std.debug.print("float64 reference over {d} rows\n", .{ids.len});
-    const want = try k1.ref.run(a, &map, c, ids);
+    const slots = c.top_k + 1;
+    const own = try a.alloc([]u32, c.layers);
+    const keys = try a.alloc([]f64, c.layers);
+    for (own, keys) |*o, *k| {
+        o.* = try a.alloc(u32, tokens_n * slots);
+        k.* = try a.alloc(f64, tokens_n * c.experts);
+    }
+    const free = try k1.ref.runWith(a, &map, c, ids, .{ .picks = own, .keys = keys });
 
     var ok = true;
     // A: the whole prompt in one call, with taps; twice, byte for byte
@@ -185,7 +210,19 @@ pub fn main(init: std.process.Init) !u8 {
     defer big.deinit();
     const taps_buf = try device.buffer(c.layers * 2 * tokens_n * c.hidden * 4, mtl.ResourceOptions.shared);
     defer taps_buf.deinit();
-    const one = try run(a, &big, ids, tokens_n, tokens_n, .{ .buf = taps_buf, .rows = tokens_n });
+    const picks_buf = try device.buffer(c.layers * tokens_n * slots * 4, mtl.ResourceOptions.shared);
+    defer picks_buf.deinit();
+    const one = try run(a, &big, ids, tokens_n, tokens_n, .{ .buf = taps_buf, .rows = tokens_n, .picks = picks_buf });
+    const got = picks_buf.slice(u32, c.layers * tokens_n * slots);
+    // the unforced chain: Metal's routes against the reference's own, each difference a near tie
+    for (0..c.layers) |l| ok = routes(try std.fmt.allocPrint(a, "A layer {d} routes", .{l}), c, own[l], keys[l], got[l * tokens_n * slots ..][0 .. tokens_n * slots], gates.flip_margin) and ok;
+    var info: Stats = .{};
+    compare(&info, one, free.logits, c.vocab, true);
+    std.debug.print("info A logits against the unforced reference: worst cosine {d:.7}, top-1 swaps {d}\n", .{ info.worst_cos, info.swaps });
+    // the gates: the reference run on Metal's routes (teacher-forced), every other step its own
+    const force = try a.alloc([]const u32, c.layers);
+    for (force, 0..) |*f, l| f.* = got[l * tokens_n * slots ..][0 .. tokens_n * slots];
+    const want = try k1.ref.runWith(a, &map, c, ids, .{ .force = force });
     var st: Stats = .{};
     compare(&st, one, want.logits, c.vocab, true);
     report("A one call: logits", st);
@@ -197,7 +234,7 @@ pub fn main(init: std.process.Init) !u8 {
         report(try std.fmt.allocPrint(a, "A layer {d} {s} residual", .{ l, if (h == 0) "attention" else "MoE" }), ts);
         ok = ok and ts.ok;
     };
-    ok = try local(a, &map, c, &big, tapped) and ok;
+    ok = try local(a, &map, c, tapped, got) and ok;
     try big.rewind(0);
     ok = sameBytes("A again", one, try run(a, &big, ids, tokens_n, tokens_n, null)) and ok;
 
