@@ -222,8 +222,7 @@ pub const Ctl = struct { glue: u8 = 0, rows: u8 = 0, moe: u8 = 0 };
 
 pub const Sliding = struct { window: usize, ring: usize };
 
-/// Row r (position p0 + r) sees key slot s: full, the slot's position s <= p; sliding, the position the ring's
-/// slot holds after this call's writes (the latest q <= the last row's congruent to s) inside (p - window, p].
+/// Row r at p sees slot s: full, position s <= p; sliding, the slot's latest position q (mod ring) in (p - window, p].
 pub fn masks(out: []u8, p0: usize, n: usize, keys: usize, sliding: ?Sliding) void {
     const last = p0 + n - 1;
     for (0..n) |r| {

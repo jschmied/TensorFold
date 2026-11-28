@@ -86,8 +86,7 @@ pub const Weights = struct {
     }
 };
 
-/// config.json and every tensor checked by names.zig, then each shard mapped once; nothing is copied but the
-/// experts' offset tables and the bf16 biases widened to fp32.
+/// Every tensor checked by names.zig, each shard mapped once; copied: only expert offset tables and fp32 biases.
 pub fn load(gpa: std.mem.Allocator, io: std.Io, device: mtl.Device, dir: []const u8) !Weights {
     const c = try Config.read(gpa, io, dir);
     if (c.v11) return error.Kolibri11NotOnMetal;

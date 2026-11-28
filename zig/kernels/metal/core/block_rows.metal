@@ -1,7 +1,6 @@
-// Products over 128-column blocks, bf16 rows in, fp32 sums: block-FP8 weights (e4m3 [N][K], fp32 scale_inv
-// [N/128][K/128]) or bf16 weights [N][K] (no scales). Every output: per block, a lane's four-term FMA chain, the
-// simdgroup's sum, times the block's scale (fp8), added block by block. Row counts and grouping never change it.
+// Products over 128-column blocks, block-FP8 (fp32 scales a 128 x 128 block) or bf16 weights, bf16 rows, fp32 sums.
 #include <metal_stdlib>
+// Per block: a lane's 4-term FMA chain, the simdgroup sum, times the scale; rows and grouping never change the order.
 using namespace metal;
 #pragma METAL fp contract(off)
 

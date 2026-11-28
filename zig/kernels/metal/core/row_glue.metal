@@ -1,5 +1,4 @@
-// Row glue at runtime widths: a bf16 table's rows widened to fp32, RMS norms (plain and the sandwich add), and
-// per-head q/k norms with neox RoPE from fp32 tables into a ring or linear cache. fp32 sums, one bf16 rounding.
+// Row glue at runtime widths: embed widen, RMS norms (plain, sandwich add), q/k norms + RoPE into a cache; fp32 sums.
 #include <metal_stdlib>
 using namespace metal;
 #pragma METAL fp contract(off)
@@ -74,8 +73,7 @@ struct TfQkArgs {
   float eps;
 };
 
-// One simdgroup a (row, head): q and k heads RMS-normed by their weights, RoPE'd (neox halves) by fp32 cos/sin
-// [pos][dim], rounded once; q into q [rows][heads][dim]; k and v into the cache rows [slot][kv_heads][dim].
+// One simdgroup a (row, head): q/k normed, neox RoPE by fp32 [pos][dim] tables, rounded once; k, v into cache rows.
 [[kernel]] void tf_glue_qk(const device bfloat* qkv [[buffer(0)]], const device bfloat* qn [[buffer(1)]],
     const device bfloat* kn [[buffer(2)]], const device float* cos_t [[buffer(3)]],
     const device float* sin_t [[buffer(4)]], const device uint* pos [[buffer(5)]], constant TfQkArgs& a [[buffer(6)]],
