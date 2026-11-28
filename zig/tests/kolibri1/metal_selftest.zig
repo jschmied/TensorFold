@@ -239,7 +239,7 @@ fn badRoute(a: std.mem.Allocator, c: k1.config.Config, got: []const u32, keys: [
             for (kr, 0..) |x, e| if (std.mem.indexOfScalar(u32, row[0..k], @intCast(e)) == null and (low == null or x < kr[low.?])) {
                 low = @intCast(e);
             };
-            std.debug.print("  planted: row {d}: slots {d}, {d} swapped (gap {e:.3}), slot {d} now expert {d}\n", .{ r, s, s + 1, g, k - 1, low });
+            std.debug.print("  planted: row {d}: slots {d}, {d} swapped (gap {e:.3}), slot {d} now expert {d}\n", .{ r, s, s + 1, g, k - 1, low.? });
             row[k - 1] = low.?;
             return out;
         }
