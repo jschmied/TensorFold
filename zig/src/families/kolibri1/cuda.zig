@@ -3,6 +3,8 @@
 pub const Config = @import("config.zig").Config;
 pub const config = @import("config.zig");
 pub const names = @import("names.zig");
+pub const fixture = @import("fixture.zig");
+pub const ref = @import("ref.zig");
 pub const pack = @import("pack.zig");
 pub const weights = @import("weights.zig");
 pub const tree = @import("tree.zig");
@@ -17,6 +19,8 @@ test {
     _ = @import("config.zig");
     _ = @import("config_v11.zig");
     _ = @import("names.zig");
+    _ = @import("fixture.zig");
+    _ = @import("ref.zig");
     _ = @import("pack.zig");
     _ = @import("weights.zig");
     _ = @import("tree.zig");
