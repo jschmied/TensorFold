@@ -9,6 +9,9 @@ const names = @import("names.zig");
 const Ref = blocks.block_rows.Ref;
 const ExpertAt = blocks.block_rows.ExpertAt;
 
+/// Weight buffers alive in this process (shard views, owned tables): a failed load gives back every one it made.
+pub var live: usize = 0;
+
 pub const Layer = struct {
     input_norm: Ref,
     q: [2]Ref, // codes, scales
@@ -38,8 +41,8 @@ pub const Weights = struct {
     layers: []Layer = &.{},
 
     pub fn deinit(w: *Weights) void {
-        for (w.owned.items) |b| b.deinit();
-        w.owned.deinit(w.gpa);
+        w.freeOwned();
+        live -= w.shards.len;
         for (w.shards) |b| b.deinit();
         w.gpa.free(w.shards);
         w.gpa.free(w.layers);
@@ -69,10 +72,17 @@ pub const Weights = struct {
         errdefer b.deinit();
         @memcpy(b.contents()[0..bytes.len], bytes);
         try w.owned.append(w.gpa, b);
+        live += 1;
         return b;
     }
 
-    /// A layer's experts: every tensor in one shard (the kernels take one weights buffer), offsets into it.
+    fn freeOwned(w: *Weights) void {
+        for (w.owned.items) |b| b.deinit();
+        live -= w.owned.items.len;
+        w.owned.deinit(w.gpa);
+    }
+
+    /// A layer's experts, all in one shard (one weights buffer); released Kolibri-1 splits 30 of 50: refused here.
     fn experts(w: *Weights, l: names.Layer, width: usize) !blocks.moe_sigmoid.Experts {
         const at = try w.gpa.alloc(ExpertAt, l.experts.len);
         defer w.gpa.free(at);
@@ -98,6 +108,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, device: mtl.Device, dir: []const
     var made: usize = 0;
     errdefer {
         for (w.shards[0..made]) |b| b.deinit();
+        live -= made;
         gpa.free(w.shards);
     }
     const page = std.heap.pageSize();
@@ -105,9 +116,11 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, device: mtl.Device, dir: []const
         const len = (f.map.memory.len + page - 1) / page * page;
         b.* = try device.bufferNoCopy(@constCast(f.map.memory.ptr), len, mtl.ResourceOptions.shared);
         made += 1;
+        live += 1;
     }
     w.layers = try gpa.alloc(Layer, c.layers);
     errdefer gpa.free(w.layers);
+    errdefer w.freeOwned(); // the bias and offset tables of layers loaded before a later layer's error
     w.embed = try w.view(m.embed);
     w.norm = try w.view(m.norm);
     w.head = try w.view(m.head);

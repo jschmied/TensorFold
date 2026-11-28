@@ -16,6 +16,9 @@ pub fn ringSize(rows: usize, window: usize) usize {
     return (rows + window + 63) / 64 * 64;
 }
 
+/// Model buffers alive in this process: a failed init or a deinit gives back every one it made.
+pub var live: usize = 0;
+
 /// Residuals after each layer's attention and MoE halves, fp32 [layers][2][n][D] (n: the call's rows), when given.
 pub const Taps = struct { buf: ?mtl.Buffer = null, picks: ?Picks = null };
 
@@ -43,26 +46,57 @@ pub const Model = struct {
     sin: mtl.Buffer,
     s: Scratch,
     p: usize = 0, // positions the caches hold
+    owned: std.ArrayList(mtl.Buffer) = .empty,
+    held: []u32 = &.{}, // per sliding ring slot: the position + 1 its keys belong to (0: none since init)
+    fail_after: usize = 0, // tests: the n-th buffer fails with error.Injected (0: never)
 
-    const Scratch = struct { ids: mtl.Buffer, pos: mtl.Buffer, res: mtl.Buffer, x: mtl.Buffer, qkv: mtl.Buffer, q: mtl.Buffer, att: mtl.Buffer, o: mtl.Buffer, mo: mtl.Buffer, mask: mtl.Buffer, logits: mtl.Buffer, moe: [9]mtl.Buffer };
+    const Scratch = struct { ids: mtl.Buffer, pos: mtl.Buffer, res: mtl.Buffer, x: mtl.Buffer, qkv: mtl.Buffer, q: mtl.Buffer, att: mtl.Buffer, o: mtl.Buffer, mo: mtl.Buffer, mask: mtl.Buffer, logits: mtl.Buffer, moe: [10]mtl.Buffer };
 
+    /// Every buffer the model made (caches, tables, scratch), freed together; `live` counts them across models.
     fn buffer(m: *Model, bytes: usize) !mtl.Buffer {
-        return m.device.buffer(@max(bytes, 16), mtl.ResourceOptions.shared);
+        if (m.fail_after != 0 and m.owned.items.len + 1 == m.fail_after) return error.Injected;
+        const b = try m.device.buffer(@max(bytes, 16), mtl.ResourceOptions.shared);
+        m.owned.append(m.gpa, b) catch |e| {
+            b.deinit();
+            return e;
+        };
+        live += 1;
+        return b;
+    }
+
+    fn freeOwned(m: *Model) void {
+        for (m.owned.items) |b| b.deinit();
+        live -= m.owned.items.len;
+        m.owned.deinit(m.gpa);
+        m.gpa.free(m.held);
     }
 
     /// Caches for `context` positions, RoPE tables and scratch for calls of up to `max_rows` rows.
     pub fn init(gpa: std.mem.Allocator, device: mtl.Device, w: *const wts.Weights, context: usize, max_rows: usize, ctl: Ctl) !Model {
         const c = w.config;
-        var m: Model = .{ .gpa = gpa, .device = device, .queue = try device.queue(), .w = w, .c = c, .context = context, .max_rows = max_rows, .ring = ringSize(max_rows, c.window), .glue = undefined, .rows = undefined, .rows16 = undefined, .moe = undefined, .att = undefined, .route = .{ .experts = c.experts, .topk = c.top_k, .shared = true }, .k = &.{}, .v = &.{}, .cos = undefined, .sin = undefined, .s = undefined };
-        try m.route.check();
+        const route: moe.Route = .{ .experts = c.experts, .topk = c.top_k, .shared = true };
+        try route.check();
+        var m: Model = .{ .gpa = gpa, .device = device, .queue = undefined, .w = w, .c = c, .context = context, .max_rows = max_rows, .ring = ringSize(max_rows, c.window), .glue = undefined, .rows = undefined, .rows16 = undefined, .moe = undefined, .att = undefined, .route = route, .k = &.{}, .v = &.{}, .cos = undefined, .sin = undefined, .s = undefined, .fail_after = ctl.fail_after };
+        m.held = try gpa.alloc(u32, m.ring);
+        @memset(m.held, 0);
+        errdefer m.freeOwned();
+        m.queue = try device.queue();
+        errdefer m.queue.deinit();
         m.glue = try glue.Pipes.init(gpa, device, ctl.glue);
+        errdefer m.glue.deinit();
         m.rows = try br.Pipes.init(gpa, device, .f32, ctl.rows);
+        errdefer m.rows.deinit();
         m.rows16 = try br.Pipes.init(gpa, device, .bf16, ctl.rows);
+        errdefer m.rows16.deinit();
         m.moe = try moe.Pipes.init(gpa, device, ctl.moe);
+        errdefer m.moe.deinit();
         const cap = @max(m.ring, context);
         m.att = try attn.Attention.init(gpa, device, .{ .query_heads = c.heads, .kv_heads = c.kv_heads, .head_dim = c.head_dim, .capacity = cap, .output = .bf16 });
+        errdefer m.att.deinit();
         m.k = try gpa.alloc(mtl.Buffer, c.layers);
+        errdefer gpa.free(m.k);
         m.v = try gpa.alloc(mtl.Buffer, c.layers);
+        errdefer gpa.free(m.v);
         const kvd = c.kv_heads * c.head_dim;
         for (0..c.layers) |i| {
             const len = if (c.full[i]) context else m.ring;
@@ -73,21 +107,16 @@ pub const Model = struct {
         const r = max_rows;
         const d = c.hidden;
         const z = moe.bytes(m.route, r, d, c.moe_width);
-        var ms: [9]mtl.Buffer = undefined;
-        for (&ms, [_]usize{ z.logits, z.pick, z.wts, z.bucket, z.members, z.items, z.count, z.act, z.y }) |*b, n| b.* = try m.buffer(n);
+        var ms: [10]mtl.Buffer = undefined;
+        for (&ms, [_]usize{ z.logits, z.pick, z.wts, z.bucket, z.members, z.items, z.count, z.act, z.y, z.keys }) |*b, n| b.* = try m.buffer(n);
         m.s = .{ .ids = try m.buffer(r * 4), .pos = try m.buffer(r * 4), .res = try m.buffer(r * d * 4), .x = try m.buffer(r * d * 2), .qkv = try m.buffer(r * c.qkvDim() * 2), .q = try m.buffer(r * c.heads * c.head_dim * 2), .att = try m.buffer(r * c.heads * c.head_dim * 2), .o = try m.buffer(r * d * 2), .mo = try m.buffer(r * d * 2), .mask = try m.buffer(2 * r * cap), .logits = try m.buffer(r * c.vocab * 4), .moe = ms };
         return m;
     }
 
     pub fn deinit(m: *Model) void {
-        for (m.k, m.v) |a, b| {
-            a.deinit();
-            b.deinit();
-        }
+        m.freeOwned();
         m.gpa.free(m.k);
         m.gpa.free(m.v);
-        const s = m.s;
-        for ([_]mtl.Buffer{ s.ids, s.pos, s.res, s.x, s.qkv, s.q, s.att, s.o, s.mo, s.mask, s.logits, m.cos, m.sin } ++ s.moe) |b| b.deinit();
         m.att.deinit();
         m.moe.deinit();
         m.rows.deinit();
@@ -113,10 +142,10 @@ pub const Model = struct {
         };
     }
 
-    /// The next forward starts at `p`: a prefix the caches still hold (a sliding ring keeps only its last keys).
+    /// The next forward starts at `p`: every key of row p's window (p - window, p) still the one written for it.
     pub fn rewind(m: *Model, p: usize) !void {
         if (p > m.p) return error.PastCachedPositions;
-        if (p > 0 and m.p - p + m.c.window > m.ring + 1) return error.RingOverwritten; // the window before p is gone
+        if (!windowHeld(m.held, p, m.c.window)) return error.RingOverwritten;
         m.p = p;
     }
 
@@ -150,7 +179,7 @@ pub const Model = struct {
         masks(mask[0 .. n * m.slidingKeys(last)], m.p, n, m.slidingKeys(last), .{ .window = c.window, .ring = m.ring });
         masks(mask[n * m.ring ..][0 .. n * (last + 1)], m.p, n, last + 1, null);
         const z = m.s.moe;
-        const sc: moe.Scratch = .{ .logits = .{ .buf = z[0] }, .pick = .{ .buf = z[1] }, .wts = .{ .buf = z[2] }, .bucket = .{ .buf = z[3] }, .members = .{ .buf = z[4] }, .items = .{ .buf = z[5] }, .count = .{ .buf = z[6] }, .act = .{ .buf = z[7] }, .y = .{ .buf = z[8] } };
+        const sc: moe.Scratch = .{ .logits = .{ .buf = z[0] }, .pick = .{ .buf = z[1] }, .wts = .{ .buf = z[2] }, .bucket = .{ .buf = z[3] }, .members = .{ .buf = z[4] }, .items = .{ .buf = z[5] }, .count = .{ .buf = z[6] }, .act = .{ .buf = z[7] }, .y = .{ .buf = z[8] }, .keys = .{ .buf = z[9] } };
         for (m.w.layers, 0..) |L, i| {
             try m.attention(e, L, i, n);
             m.glue.addRms(e, .{ .buf = m.s.o }, .{ .buf = m.s.res }, L.post_attn_norm, L.pre_moe_norm, .{ .buf = m.s.x }, ga);
@@ -179,6 +208,7 @@ pub const Model = struct {
             std.log.err("kolibri1 metal forward: {s}", .{why});
             return error.GpuFailed;
         }
+        for (m.p..m.p + n) |q| m.held[q % m.ring] = @intCast(q + 1);
         m.p += n;
         return m.s.logits.slice(f32, (n - first) * c.vocab);
     }
@@ -239,8 +269,15 @@ fn project(e: mtl.ComputeEncoder, p: br.Pipes, elt: usize, x: Ref, w: [2]Ref, ou
     }
 }
 
-/// Planted faults by block (0: none), for the selftest's whole-forward controls.
-pub const Ctl = struct { glue: u8 = 0, rows: u8 = 0, moe: u8 = 0 };
+/// Planted faults by block (0: none), for the selftest's whole-forward controls; fail_after: an injected late error.
+pub const Ctl = struct { glue: u8 = 0, rows: u8 = 0, moe: u8 = 0, fail_after: usize = 0 };
+
+/// Whether a ring whose slots hold `held` (position + 1) still has every key row p's window reads before p.
+pub fn windowHeld(held: []const u32, p: usize, window: usize) bool {
+    const lo = if (p + 1 > window) p + 1 - window else 0;
+    for (lo..p) |x| if (held[x % held.len] != x + 1) return false;
+    return true;
+}
 
 pub const Sliding = struct { window: usize, ring: usize };
 
@@ -269,6 +306,22 @@ test "Kolibri Metal masks: a sliding row sees exactly its window's slots across 
     var early: [4]u8 = undefined;
     masks(&early, 0, 1, 4, .{ .window = 4, .ring = 8 }); // keys only slot 0 at position 0
     try std.testing.expectEqualSlices(u8, &.{ 1, 0, 0, 0 }, &early);
+}
+
+test "Kolibri Metal rewind: consecutive rewinds after a wrap are refused, the start of a context is not" {
+    const ring = 8;
+    const window = 5;
+    var held: [ring]u32 = @splat(0);
+    for (0..10) |q| held[q % ring] = @intCast(q + 1); // 0..9 written: slots 0, 1 now hold 8, 9
+    try std.testing.expect(windowHeld(&held, 10, window)); // keys 6..9
+    try std.testing.expect(windowHeld(&held, 8, window)); // a first rewind 10 -> 8: keys 4..7
+    try std.testing.expect(windowHeld(&held, 6, window)); // and on to 6: keys 2..5, still written for themselves
+    try std.testing.expect(!windowHeld(&held, 5, window)); // and to 5: key 1's slot holds 9
+    var fresh: [ring]u32 = @splat(0);
+    for (0..3) |q| fresh[q] = @intCast(q + 1); // 0..2 written, no wrap
+    try std.testing.expect(windowHeld(&fresh, 1, window)); // back to 1 before a wrap: key 0 is live
+    try std.testing.expect(windowHeld(&fresh, 0, window));
+    try std.testing.expect(!windowHeld(&fresh, 4, window)); // position 3 was never written
 }
 
 test "Kolibri Metal ring: a call's rows and a window, whole 64s" {

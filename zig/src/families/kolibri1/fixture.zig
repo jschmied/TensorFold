@@ -19,10 +19,14 @@ pub const Shape = struct {
     window: usize = 513,
     seed: u64 = 0x6b6f6c,
     eos: u32 = 1023,
+    split: bool = false, // two shards, layer 1's expert 0 gate in the first and its up and down in the second
 };
 
 /// The parity checkpoint: two sliding layers then a full one, 8 experts top-6 and the shared one.
 pub const parity: Shape = .{};
+/// Two shards splitting one expert (as 30 of 50 released layers do): small, for the loader's refusal.
+pub const split: Shape = .{ .full = &.{ false, true }, .experts = 3, .top_k = 2, .vocab = 32, .hidden = 256, .heads = 4, .kv_heads = 1, .width = 128, .window = 3, .eos = 31, .split = true };
+
 /// All 384 experts top-6 in one sliding layer: upper expert ids, uneven groups and the real router width.
 pub const wide: Shape = .{ .full = &.{false}, .experts = 384 };
 
@@ -131,7 +135,18 @@ pub fn write(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, s: Shape) !voi
     defer arena.deinit();
     const a = arena.allocator();
     try dir.writeFile(io, .{ .sub_path = "config.json", .data = try configText(a, s) });
-    try dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = try fixture.aligned(a, try entries(a, s)) }); // tensors on 16 bytes
+    const all = try entries(a, s);
+    if (!s.split) return dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = try fixture.aligned(a, all) }); // on 16 bytes
+    var cut: usize = 0;
+    while (!std.mem.eql(u8, all[cut].name, "model.layers.1.mlp.experts.0.up_proj.weight")) cut += 1;
+    const names_ = [2][]const u8{ "model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors" };
+    try dir.writeFile(io, .{ .sub_path = names_[0], .data = try fixture.aligned(a, all[0..cut]) });
+    try dir.writeFile(io, .{ .sub_path = names_[1], .data = try fixture.aligned(a, all[cut..]) });
+    var out: std.Io.Writer.Allocating = .init(a);
+    try out.writer.writeAll("{\"weight_map\": {");
+    for (all, 0..) |e, i| try out.writer.print("{s}\"{s}\": \"{s}\"", .{ if (i == 0) "" else ", ", e.name, names_[@intFromBool(i >= cut)] });
+    try out.writer.writeAll("}}\n");
+    try dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = out.written() });
 }
 
 const testing = std.testing;
@@ -172,4 +187,32 @@ test "Kolibri fixture: the same seed gives the same bytes, another seed others" 
     const one = try fixture.image(a, try entries(a, s));
     try testing.expectEqualSlices(u8, one, try fixture.image(a, try entries(a, s)));
     try testing.expect(!std.mem.eql(u8, one, try fixture.image(a, try entries(a, other))));
+}
+
+test "Kolibri fixture: the split checkpoint puts layer 1's expert 0 gate and up in different shards" {
+    const config = @import("config.zig");
+    const names = @import("names.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try write(testing.allocator, testing.io, tmp.dir, split);
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, tmp.sub_path });
+    defer testing.allocator.free(path);
+    const c = try config.Config.read(testing.allocator, testing.io, path);
+    var ck = try core.checkpoint.Checkpoint.openModel(testing.allocator, testing.io, path);
+    defer ck.close();
+    try testing.expectEqual(@as(usize, 2), ck.files.items.len);
+    var m = try names.map(testing.allocator, &ck, c);
+    defer m.deinit();
+    const e = m.layers[1].experts[0];
+    const in = struct {
+        fn file(k: *const core.checkpoint.Checkpoint, t: core.checkpoint.Tensor) usize {
+            for (k.files.items, 0..) |f, i| if (@intFromPtr(t.bytes.ptr) >= @intFromPtr(f.map.memory.ptr) and
+                @intFromPtr(t.bytes.ptr) < @intFromPtr(f.map.memory.ptr) + f.map.memory.len) return i;
+            return k.files.items.len;
+        }
+    };
+    try testing.expect(in.file(&ck, e.gate.w) != in.file(&ck, e.up.w));
+    try testing.expectEqual(in.file(&ck, m.layers[0].experts[0].gate.w), in.file(&ck, m.layers[0].experts[0].down.w));
 }
