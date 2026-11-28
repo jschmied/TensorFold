@@ -46,7 +46,12 @@ pub const Dims = struct {
 
     /// The first position a part ending at `end` computes: the rows its last output and later rows still read.
     pub fn firstNeeded(d: Dims, end: u64) u64 {
-        return end -| (1 + d.layers * (d.window - 1));
+        return end -| (1 + d.reach());
+    }
+
+    /// Positions before a row that its read reaches through every layer: a prompt's rows a drafter still needs.
+    pub fn reach(d: Dims) usize {
+        return d.layers * (d.window - 1);
     }
 
     fn attention(d: Dims) wa.Window {

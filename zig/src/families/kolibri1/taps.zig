@@ -8,6 +8,8 @@ const fwd = @import("forward.zig");
 pub const keep = 256;
 /// Rows a ring view hands out at most; ring rows below it are mirrored past `keep`, so every view is contiguous.
 pub const mirror = 64;
+/// Positions before its end a prefilling prompt's slab keeps: a one-layer drafter's window, read after token one.
+pub const slab_rows = 2048;
 /// Layers a drafter may tap.
 pub const most = 8;
 
@@ -34,7 +36,7 @@ pub fn pieces(p0: u64, n: usize, out: *[4]Piece) []const Piece {
 
 /// Rows, each the tapped layers' width, `prepare` allocates: a forward's `max_rows` and a ring for each of `slots`.
 pub fn heldRows(max_rows: usize, slots: usize) usize {
-    return max_rows + slots * (keep + mirror);
+    return max_rows + slots * (keep + mirror) + slab_rows;
 }
 
 pub const Taps = struct {
@@ -45,10 +47,15 @@ pub const Taps = struct {
     slots: usize = 0,
     written: []u64 = &.{}, // a slot's ring holds positions [written - keep, written)
     prompt: ?fwd.Chain = null, // the last forward was this stream's prompt chunk: its rows are in tap_rows whole
+    slab: ?cuda.DeviceBuffer = null, // [slab_rows, row]: one prefilling stream's prompt end, linear from `slab_from`
+    slab_slot: ?usize = null, // the stream holding it, until its first round or its release
+    slab_from: u64 = 0,
+    slab_to: u64 = 0, // positions [slab_from, slab_to) written
 
     pub fn deinit(t: *Taps, gpa: std.mem.Allocator) void {
         if (t.rows) |*b| b.free();
         if (t.ring) |*b| b.free();
+        if (t.slab) |*b| b.free();
         gpa.free(t.written);
         t.* = .{};
     }
@@ -69,6 +76,11 @@ pub const Taps = struct {
         errdefer if (t.rows) |*b| {
             b.free();
             t.rows = null;
+        };
+        t.slab = try cuda.DeviceBuffer.alloc(m.d, slab_rows * t.rowBytes(m));
+        errdefer if (t.slab) |*b| {
+            b.free();
+            t.slab = null;
         };
         try t.reserve(gpa, m, m.slotCap());
         m.taps = t.ids[0..t.n];
@@ -108,8 +120,39 @@ pub const Taps = struct {
             }
             t.written[ch.slot] = ch.p0 + ch.tokens.len;
             at += ch.tokens.len;
+            if (!prompt and t.slab_slot == ch.slot) t.slab_slot = null; // its first round: the first draft read it
         }
         t.prompt = if (prompt) chains[0] else null;
+    }
+
+    /// A prompt chunk of a `len`-token prompt: kept as `kept`, and its rows past `len - slab_rows` into the slab.
+    pub fn keptPrompt(t: *Taps, gpa: std.mem.Allocator, m: *const fwd.Model, s: cuda.Stream, ch: fwd.Chain, len: u64) !void {
+        try t.kept(gpa, m, s, &.{ch}, true);
+        const slab = t.slab orelse return;
+        if (t.slab_slot) |held| if (held != ch.slot) return; // another prompt's: this one absorbs as it goes
+        const end = ch.p0 + ch.tokens.len;
+        if (t.slab_slot == null) {
+            t.slab_slot = ch.slot;
+            t.slab_from = @max(len -| slab_rows, ch.p0);
+            t.slab_to = t.slab_from;
+        }
+        const lo = @max(t.slab_from, ch.p0);
+        if (end <= lo) return; // rows before the slab's: never read
+        if (lo != t.slab_to) return error.SlabGap;
+        const row = t.rowBytes(m);
+        const dst = slab.ptr + @as(usize, @intCast(lo - t.slab_from)) * row;
+        try m.d.check(m.d.api.cuMemcpyDtoDAsync_v2(dst, m.tap_rows + @as(usize, @intCast(lo - ch.p0)) * row, @as(usize, @intCast(end - lo)) * row, s.handle), "cuMemcpyDtoDAsync");
+        t.slab_to = end;
+    }
+
+    /// The first prompt position `slot`'s slab holds for its first draft, if it holds the slab.
+    pub fn slabFrom(t: *const Taps, slot: usize) ?u64 {
+        return if (t.slab_slot == slot) t.slab_from else null;
+    }
+
+    /// A stream released: its slab, if it held it, free for the next prompt.
+    pub fn drop(t: *Taps, slot: usize) void {
+        if (t.slab_slot == slot) t.slab_slot = null;
     }
 
     /// A keep rolled `slot` back to `len` positions: rows past it were rejected drafts', no longer handed out.
@@ -122,6 +165,11 @@ pub const Taps = struct {
         if (t.n == 0) return error.NoTaps;
         const row = t.rowBytes(m);
         const f: lanes.backend.Features = .{ .buffer = 0, .rows = count, .row_bytes = @intCast(row), .space = .device, .dtype = .bf16 };
+        if (t.slab_slot == slot and start >= t.slab_from and start + count <= t.slab_to) {
+            var v = f;
+            v.buffer = t.slab.?.ptr + @as(usize, @intCast(start - t.slab_from)) * row;
+            return v;
+        }
         if (t.prompt) |p| if (p.slot == slot and start >= p.p0 and start + count <= p.p0 + p.tokens.len) {
             var v = f;
             v.buffer = m.tap_rows + (start - p.p0) * row;
@@ -193,8 +241,8 @@ test "prepare: a failed host allocation leaves no device allocation behind, the 
     try std.testing.expectError(error.OutOfMemory, t.prepare(fail.allocator(), &m, &.{ 1, 3 }));
     try std.testing.expectEqual(@as(usize, 0), Fake.live);
     try std.testing.expect(t.ring == null and t.rows == null and t.slots == 0 and t.n == 0);
-    try t.prepare(std.testing.allocator, &m, &.{ 1, 3 }); // the same call with room: rows and the ring made
-    try std.testing.expectEqual(@as(usize, 2), Fake.live);
+    try t.prepare(std.testing.allocator, &m, &.{ 1, 3 }); // the same call with room: rows, slab and ring made
+    try std.testing.expectEqual(@as(usize, 3), Fake.live);
     t.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), Fake.live);
 }

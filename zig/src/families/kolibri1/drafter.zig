@@ -336,7 +336,7 @@ pub const Drafter = struct {
         const x = cast(ptr);
         const costs: []const lanes.config.Cost = if (x.timed) x.costs[0..x.n_costs] else &.{};
         const holds: []const lanes.hold_price.HoldCost = if (x.timed) x.holds[0..x.n_holds] else &.{};
-        return .{ .limit_shared_drafts = true, .depth = x.depth, .step_ms = x.step_ms, .batched = true, .stream_bytes = x.e.dims.streamBytes(), .window_costs = costs, .lane_costs = costs, .hold_costs = holds, .lazy_rows = tap.mirror, .absorb_ms = if (x.timed) x.absorb_ms else 0 };
+        return .{ .limit_shared_drafts = true, .depth = x.depth, .step_ms = x.step_ms, .batched = true, .stream_bytes = x.e.dims.streamBytes(), .window_costs = costs, .lane_costs = costs, .hold_costs = holds, .lazy_rows = tap.mirror, .prompt_reach = if (x.e.dims.reach() < tap.slab_rows) @intCast(x.e.dims.reach()) else 0, .absorb_ms = if (x.timed) x.absorb_ms else 0 };
     }
 
     fn openFn(ptr: *anyopaque, s: *Stream) anyerror!void {
@@ -504,7 +504,7 @@ test "DrafterPastMemory: the target's tap ring for 64 paged slots and a prompt c
     // paged: the ring spans every slot a round can name (64), a forward's tap rows a prompt chunk (8,192)
     const rows = @import("taps.zig").heldRows(fwd.prompt_rows, fwd.round_rows);
     const ring: usize = 64 * (256 + 64) * 3 * 2560 * 2; // 314,572,800 B: 3 taps x 2,560 bf16, 256 + 64 rows a slot
-    const chunk: usize = 8192 * 3 * 2560 * 2; // 125,829,120 B
+    const chunk: usize = 8192 * 3 * 2560 * 2 + 2048 * 3 * 2560 * 2; // 125,829,120 B and the prompt slab's 31,457,280 B
     try std.testing.expectEqual(ring + chunk, rows * Drafter.tapRowBytes(c));
     const stream: usize = 2 * 2368 * 2560 * 2 + 2560 * 2;
     const window: u64 = 3 << 30;

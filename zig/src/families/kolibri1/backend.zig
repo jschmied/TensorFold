@@ -146,7 +146,7 @@ pub const Kolibri = struct {
         return .{ .ptr = x, .vtable = &vtable };
     }
 
-    const vtable: be.Backend.VTable = .{ .prefill = prefill, .prefill_step = prefillStep, .cancel_prefill = cancelPrefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release, .reports_fill = true, .prepare_features = prepareFeatures, .features = features };
+    const vtable: be.Backend.VTable = .{ .prefill = prefill, .prefill_step = prefillStep, .cancel_prefill = cancelPrefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release, .reports_fill = true, .prepare_features = prepareFeatures, .features = features, .prompt_held = promptHeld };
 
     /// The round loop's facts: no draft head; host copies verified in windows up to 16 rows, streams sharing a forward.
     pub fn facts(x: *const Kolibri) lanes.Model {
@@ -349,7 +349,7 @@ pub const Kolibri = struct {
         };
         const ch: fwd.Chain = .{ .slot = l.slot, .p0 = at, .tokens = p[at..end] };
         try x.m.forward(x.ops(), &.{ch}, true, null, l.last);
-        try x.taps.kept(x.gpa, x.m, x.s, &.{ch}, true);
+        try x.taps.keptPrompt(x.gpa, x.m, x.s, ch, p.len);
         s.fill_at.store(@intCast(end), .monotonic);
         const done = end == p.len;
         l.fill = if (done) null else end;
@@ -536,6 +536,13 @@ pub const Kolibri = struct {
         return x.taps.view(x.m, l.slot, start, count);
     }
 
+    /// The first prompt position whose taps wait for the stream's first draft (its slab's), else null.
+    fn promptHeld(ptr: *anyopaque, s: *Stream) ?u64 {
+        const x = self(ptr);
+        const l = x.lanes.getPtr(s) orelse return null;
+        return x.taps.slabFrom(l.slot);
+    }
+
     fn dropLane(x: *Kolibri, s: *const Stream) void {
         if (x.lanes.fetchRemove(s)) |entry| {
             var l = entry.value;
@@ -544,6 +551,7 @@ pub const Kolibri = struct {
                 x.m.unmapPages(l.slot);
             }
             x.free[l.slot] = true;
+            x.taps.drop(l.slot);
             l.rows.deinit(x.gpa);
             x.gpa.free(l.marks);
             if (x.lanes.count() == 0) x.report();

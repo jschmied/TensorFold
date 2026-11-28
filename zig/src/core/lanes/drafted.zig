@@ -161,6 +161,11 @@ pub const Drafted = struct {
         return @ptrCast(@alignCast(ptr));
     }
 
+    /// A reply of one token is the first token alone: no draft reads its prompt, so nothing is absorbed.
+    fn drafting(s: *const Stream) bool {
+        return s.max_new > 1;
+    }
+
     /// The target's prompt pass, then the drafter absorbs its rows but the last; a later failure releases both.
     fn prefill(ptr: *anyopaque, s: *Stream) anyerror!void {
         const x = self(ptr);
@@ -179,7 +184,7 @@ pub const Drafted = struct {
         x.lanes.putAssumeCapacity(s, .{});
         const ids = s.prompt();
         const from: usize = s.cached;
-        if (ids.len < from + 2) return;
+        if (ids.len < from + 2 or !drafting(s)) return;
         const n: u32 = @intCast(ids.len - 1 - from);
         if (x.drafter.facts().lazy_rows > 0) { // after the first token is out (first_before_draft): not in its latency
             x.lanes.getPtr(s).?.prompt_from = from;
@@ -205,10 +210,21 @@ pub const Drafted = struct {
         const from = lane.stepped orelse s.cached; // a resumed pass starts at its kept state
         const to: u64 = if (done) s.prompt().len else s.fill_at.load(.monotonic);
         lane.stepped = if (done) null else to;
-        if (to > from and done and x.drafter.facts().lazy_rows > 0) {
-            lane.prompt_from = from; // the last chunk's rows stay on the target until the next forward: the first draft's
+        if (!drafting(s)) return done;
+        if (to > from and x.waits(s, from, done)) {
+            if (lane.prompt_from == null) lane.prompt_from = from; // the first draft's, after the first token
         } else if (to > from) try take(x, s, try x.target.features(s, x.drafter.taps(), from, @intCast(to - from)), from);
         return done;
+    }
+
+    /// A lazy drafter's chunk rows wait for its first draft: the last chunk's, an earlier one's if prompt_held.
+    fn waits(x: *Drafted, s: *Stream, from: u64, done: bool) bool {
+        const d = x.drafter.facts();
+        if (d.lazy_rows == 0) return false;
+        if (done) return true;
+        const query = x.target.vtable.prompt_held orelse return false;
+        const kept = query(x.target.ptr, s) orelse return false;
+        return d.prompt_reach > 0 and kept <= @max(from, (s.prompt().len - 1) -| d.prompt_reach);
     }
 
     /// A prompt chunk's rows but the prompt's last (absorbed with the first token, as `prefill` leaves it).
@@ -216,7 +232,7 @@ pub const Drafted = struct {
         const x = self(ptr);
         const ids = s.prompt();
         const last = ids.len - 1;
-        if (start >= last) return;
+        if (start >= last or !drafting(s)) return;
         var rows = f;
         rows.rows = @intCast(@min(f.rows, last - start));
         try x.drafter.absorb(&.{.{ .stream = s, .features = rows, .start = start, .follow = ids[@intCast(start + 1)..][0..rows.rows] }});
@@ -347,7 +363,8 @@ pub const Drafted = struct {
                 };
                 pending = tok.*;
                 const last = r.stream.prompt_len - 1;
-                if (lane.prompt_from) |from| if (from < last) { // a lazy drafter's prompt rows before its last
+                if (lane.prompt_from) |kept_from| if (kept_from < last) { // a lazy drafter's prompt rows: those its reach reads
+                    const from = if (d.prompt_reach > 0) @max(kept_from, last -| d.prompt_reach) else kept_from;
                     const ids = r.stream.prompt();
                     const f = try x.target.features(r.stream, x.drafter.taps(), from, @intCast(last - from));
                     try x.absorbs.append(x.gpa, .{ .stream = r.stream, .features = f, .start = from, .follow = ids[@intCast(from + 1)..][0..@intCast(last - from)], .propose = r.depth > 0 });

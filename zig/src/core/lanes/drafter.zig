@@ -27,6 +27,7 @@ pub const Facts = struct {
     copy_first: bool = false, // a hold costs a pass of its own: none is asked for a stream with a copy ahead
     hold_costs: []const @import("hold_price.zig").HoldCost = &.{}, // that pass's ms by blocks and depth (timed at load)
     lazy_rows: u32 = 0, // kept rows a depth-0 stream may owe before the wrapper absorbs them (0: every round; at most owed_max)
+    prompt_reach: u32 = 0, // prompt rows before its last that later reads reach: all a lazy drafter absorbs
     absorb_ms: f64 = 0, // one absorb pass's ms (timed at load): with lazy_rows, a round pays it only when it holds drafts
 };
 

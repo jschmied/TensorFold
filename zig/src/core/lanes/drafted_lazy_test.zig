@@ -128,3 +128,86 @@ test "lazy absorb: through the engine, a lazy drafter's prompt rows at the first
     try std.testing.expectEqual(eager.accepted, lazy.accepted);
     try std.testing.expect(lazy.head.prompt_rows > 0); // the prompts' rows reached the drafter, at the first draft
 }
+
+/// Absorb calls of a 40-token prompt pass into an eager drafter for a reply of `max_new` tokens.
+fn promptAbsorbs(max_new: u32) !u32 {
+    var ring: Ring = .{};
+    for (&ring.tokens, 0..) |*t, p| t.* = @intCast((p * 7 + 3) % 97);
+    ring.written = 40;
+    var fd: FakeDrafter = .{};
+    defer fd.deinit();
+    var x = try Drafted.init(gpa, ring.backend(), fd.drafter());
+    defer x.deinit();
+    var s = try Stream.init(gpa, .{ .id = "one", .prompt = ring.tokens[0..40], .max_new = max_new });
+    defer s.deinit(gpa);
+    try x.backend().prefill(&s);
+    defer x.backend().release(&s);
+    return fd.absorbs;
+}
+
+test "lazy absorb: a one-token reply's prompt pass absorbs nothing, a two-token reply's absorbs its rows" {
+    try std.testing.expectEqual(@as(u32, 0), try promptAbsorbs(1));
+    try std.testing.expectEqual(@as(u32, 1), try promptAbsorbs(2));
+}
+
+/// A target filling a 600-token prompt 200 rows a step: the last step's rows whole, a slab's from `held` on.
+const Steps = struct {
+    ring: Ring = .{},
+    held: ?u64 = null,
+    chunk_from: u64 = 0,
+
+    fn cast(ptr: *anyopaque) *Steps {
+        return @ptrCast(@alignCast(ptr));
+    }
+    fn features(ptr: *anyopaque, s: *Stream, taps: []const u32, start: u64, n: u32) anyerror!be.Features {
+        const x = cast(ptr);
+        const whole = start >= x.chunk_from or (x.held != null and start >= x.held.?);
+        if (whole and start + n <= x.ring.written) return .{ .buffer = @intFromPtr(&x.ring.tokens), .offset = start * 4, .rows = n, .row_bytes = 4, .space = .host, .dtype = .u32 };
+        return Ring.features(&x.ring, s, taps, start, n);
+    }
+    fn step(ptr: *anyopaque, s: *Stream, _: u32) anyerror!bool {
+        const x = cast(ptr);
+        x.chunk_from = x.ring.written;
+        x.ring.written = @min(x.ring.written + 200, s.prompt().len);
+        s.fill_at.store(@intCast(x.ring.written), .monotonic);
+        return x.ring.written == s.prompt().len;
+    }
+    fn promptHeld(ptr: *anyopaque, _: *Stream) ?u64 {
+        return cast(ptr).held;
+    }
+    fn backend(x: *Steps) be.Backend {
+        return .{ .ptr = x, .vtable = &.{ .prefill = Ring.prefill, .prefill_step = step, .reports_fill = true, .features = features, .prompt_held = promptHeld, .first = Ring.first, .queue = Ring.queue, .read = Ring.read, .verify = Ring.verify, .keep = Ring.keepRows, .draft = Ring.draft, .release = Ring.release } };
+    }
+};
+
+/// Absorb calls during the stepped prompt pass, then what the first draft starts at, for a target holding from `held`.
+fn steppedRun(held: ?u64) !struct { during: u32, first: u64, refused: u32 } {
+    var t: Steps = .{ .held = held };
+    for (&t.ring.tokens, 0..) |*v, p| v.* = @intCast((p * 7 + 3) % 97);
+    var fd: FakeDrafter = .{};
+    defer fd.deinit();
+    fd.facts_.lazy_rows = dr.owed_max;
+    fd.facts_.prompt_reach = 200;
+    var x = try Drafted.init(gpa, t.backend(), fd.drafter());
+    defer x.deinit();
+    var s = try Stream.init(gpa, .{ .id = "steps", .prompt = t.ring.tokens[0..600], .max_new = 8 });
+    defer s.deinit(gpa);
+    const b = x.backend();
+    while (!try b.vtable.prefill_step.?(b.ptr, &s, 0)) {}
+    defer b.release(&s);
+    const during = fd.absorbs;
+    fd.first_start = null;
+    try b.draft(&.{.{ .stream = &s, .follow = &.{}, .first = .{ .value = t.ring.tokens[600] }, .rows = null, .start = 600, .position = 601, .depth = 1 }});
+    return .{ .during = during, .first = fd.first_start.?, .refused = t.ring.refused };
+}
+
+test "lazy absorb: earlier prompt chunks wait for the first draft only where the target holds their rows" {
+    const slab = try steppedRun(599 - 200); // a slab from the reach on: nothing absorbed before the first token
+    try std.testing.expectEqual(@as(u32, 0), slab.during);
+    try std.testing.expectEqual(@as(u64, 599 - 200), slab.first);
+    try std.testing.expectEqual(@as(u32, 0), slab.refused);
+    const none = try steppedRun(null); // no slab: earlier chunks absorbed at their pass, the last at the first draft
+    try std.testing.expectEqual(@as(u32, 2), none.during);
+    try std.testing.expectEqual(@as(u64, 400), none.first);
+    try std.testing.expectEqual(@as(u32, 0), none.refused);
+}
